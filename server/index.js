@@ -618,6 +618,7 @@ app.post('/api/admin/reset', async (req, res) => {
 
   try {
     // Clear all in-memory data
+    history.length = 0;
     contributions.clear();
     agents.clear();
     comments.clear();
