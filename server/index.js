@@ -142,7 +142,19 @@ wss.on('connection', (ws) => {
 });
 
 // Serve static files
-app.use('/canvas', express.static(CANVAS_DIR));
+// Canvas with restricted CSP for security
+app.use('/canvas', (req, res, next) => {
+  res.setHeader('Content-Security-Policy',
+    "default-src 'self'; " +
+    "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+    "style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data: https:; " +
+    "font-src 'self' https://fonts.gstatic.com; " +
+    "connect-src 'self';"
+  );
+  next();
+}, express.static(CANVAS_DIR));
+
 app.use(express.static(path.join(__dirname, '../public')));
 
 // Routes
@@ -477,25 +489,20 @@ init().then(() => {
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
-║     █████╗  ██████╗ ███████╗███╗   ██╗████████╗           ║
-║    ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝           ║
-║    ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║              ║
-║    ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║              ║
-║    ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║              ║
-║    ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝              ║
+║     █████╗ ██╗    ██████╗ ██╗   ██╗██╗██╗     ██████╗ ███████╗  ║
+║    ██╔══██╗██║    ██╔══██╗██║   ██║██║██║     ██╔══██╗██╔════╝  ║
+║    ███████║██║    ██████╔╝██║   ██║██║██║     ██║  ██║███████╗  ║
+║    ██╔══██║██║    ██╔══██╗██║   ██║██║██║     ██║  ██║╚════██║  ║
+║    ██║  ██║██║    ██████╔╝╚██████╔╝██║███████╗██████╔╝███████║  ║
+║    ╚═╝  ╚═╝╚═╝    ╚═════╝  ╚═════╝ ╚═╝╚══════╝╚═════╝ ╚══════╝  ║
 ║                                                           ║
-║    ██╗   ██╗███████╗██████╗ ███████╗███████╗              ║
-║    ██║   ██║██╔════╝██╔══██╗██╔════╝██╔════╝              ║
-║    ██║   ██║█████╗  ██████╔╝███████╗█████╗                ║
-║    ╚██╗ ██╔╝██╔══╝  ██╔══██╗╚════██║██╔══╝                ║
-║     ╚████╔╝ ███████╗██║  ██║███████║███████╗              ║
-║      ╚═══╝  ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝              ║
+║              AI builds the web. Humans watch.             ║
 ║                                                           ║
 ╠═══════════════════════════════════════════════════════════╣
-║  🚀 Server running on http://localhost:${PORT}              ║
-║  🤖 Agent API: POST /api/contribute                       ║
-║  👁️  Canvas: http://localhost:${PORT}/canvas               ║
-║  📡 WebSocket: ws://localhost:${PORT}                      ║
+║  Server:    http://localhost:${PORT}                        ║
+║  Dashboard: http://localhost:${PORT}/dashboard              ║
+║  Canvas:    http://localhost:${PORT}/canvas                 ║
+║  API:       POST /api/contribute                          ║
 ╚═══════════════════════════════════════════════════════════╝
     `);
   });

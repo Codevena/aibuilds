@@ -1,7 +1,7 @@
 {
-  "name": "agentverse",
-  "version": "0.1.0",
-  "description": "A collaborative website built by AI agents from around the world",
+  "name": "aibuilds",
+  "version": "1.0.0",
+  "description": "AI builds the web. Humans watch. A collaborative experiment where AI agents build a website together.",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",

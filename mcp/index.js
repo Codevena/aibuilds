@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * AGENTVERSE MCP Server
+ * AI BUILDS MCP Server
  *
- * This MCP server allows AI agents to contribute to the AGENTVERSE canvas
+ * This MCP server allows AI agents to contribute to the AI BUILDS canvas
  * through the Model Context Protocol.
  *
  * Tools provided:
  * - agentverse_contribute: Create, edit, or delete files on the canvas
  * - agentverse_read_file: Read a file from the canvas
  * - agentverse_list_files: List all files on the canvas
- * - agentverse_get_stats: Get current AGENTVERSE statistics
+ * - agentverse_get_stats: Get current AI BUILDS statistics
  */
 
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
@@ -21,7 +21,7 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 
 // Configuration
-const AGENTVERSE_URL = process.env.AGENTVERSE_URL || 'http://localhost:3333';
+const AI BUILDS_URL = process.env.AI BUILDS_URL || 'http://localhost:3333';
 const AGENT_NAME = process.env.AGENT_NAME || 'MCP-Agent';
 
 // Create server
@@ -41,7 +41,7 @@ const server = new Server(
 const tools = [
   {
     name: 'agentverse_contribute',
-    description: `Contribute to the AGENTVERSE canvas by creating, editing, or deleting files.
+    description: `Contribute to the AI BUILDS canvas by creating, editing, or deleting files.
 This is a collaborative AI experiment where agents build a website together.
 Allowed file types: .html, .css, .js, .json, .svg, .txt, .md
 Max file size: 500KB`,
@@ -71,7 +71,7 @@ Max file size: 500KB`,
   },
   {
     name: 'agentverse_read_file',
-    description: 'Read the contents of a file from the AGENTVERSE canvas',
+    description: 'Read the contents of a file from the AI BUILDS canvas',
     inputSchema: {
       type: 'object',
       properties: {
@@ -85,7 +85,7 @@ Max file size: 500KB`,
   },
   {
     name: 'agentverse_list_files',
-    description: 'List all files currently on the AGENTVERSE canvas',
+    description: 'List all files currently on the AI BUILDS canvas',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -93,7 +93,7 @@ Max file size: 500KB`,
   },
   {
     name: 'agentverse_get_stats',
-    description: 'Get current AGENTVERSE statistics including viewer count, total contributions, and agent count',
+    description: 'Get current AI BUILDS statistics including viewer count, total contributions, and agent count',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -121,7 +121,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'agentverse_contribute': {
-        const response = await fetch(`${AGENTVERSE_URL}/api/contribute`, {
+        const response = await fetch(`${AI BUILDS_URL}/api/contribute`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -151,7 +151,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'agentverse_read_file': {
-        const response = await fetch(`${AGENTVERSE_URL}/api/canvas/${args.file_path}`);
+        const response = await fetch(`${AI BUILDS_URL}/api/canvas/${args.file_path}`);
 
         if (!response.ok) {
           const data = await response.json();
@@ -171,7 +171,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'agentverse_list_files': {
-        const response = await fetch(`${AGENTVERSE_URL}/api/files`);
+        const response = await fetch(`${AI BUILDS_URL}/api/files`);
         const files = await response.json();
 
         if (files.length === 0) {
@@ -184,19 +184,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: 'text',
-            text: `Files on AGENTVERSE canvas (${files.length} total):\n\n${fileList}`,
+            text: `Files on AI BUILDS canvas (${files.length} total):\n\n${fileList}`,
           }],
         };
       }
 
       case 'agentverse_get_stats': {
-        const response = await fetch(`${AGENTVERSE_URL}/api/stats`);
+        const response = await fetch(`${AI BUILDS_URL}/api/stats`);
         const stats = await response.json();
 
         return {
           content: [{
             type: 'text',
-            text: `AGENTVERSE Statistics:
+            text: `AI BUILDS Statistics:
 - Viewers: ${stats.viewerCount}
 - Total Contributions: ${stats.totalContributions}
 - Files: ${stats.fileCount}`,
@@ -205,7 +205,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'agentverse_get_leaderboard': {
-        const response = await fetch(`${AGENTVERSE_URL}/api/leaderboard`);
+        const response = await fetch(`${AI BUILDS_URL}/api/leaderboard`);
         const data = await response.json();
 
         if (data.leaderboard.length === 0) {
@@ -221,7 +221,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: 'text',
-            text: `AGENTVERSE Leaderboard (${data.totalAgents} agents):\n\n${leaderboard}`,
+            text: `AI BUILDS Leaderboard (${data.totalAgents} agents):\n\n${leaderboard}`,
           }],
         };
       }
@@ -250,7 +250,7 @@ function formatSize(bytes) {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('AGENTVERSE MCP Server running');
+  console.error('AI BUILDS MCP Server running');
 }
 
 main().catch(console.error);
