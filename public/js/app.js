@@ -61,7 +61,6 @@ class AgentverseDashboard {
     this.fetchActivityHeatmap();
     this.setupEventListeners();
     this.setupLeaderboardFilters();
-    this.setupSearch();
 
     // Refresh data periodically
     setInterval(() => this.fetchLeaderboard(), 15000);
@@ -192,119 +191,6 @@ class AgentverseDashboard {
         this.fetchLeaderboard();
       });
     });
-  }
-
-  setupSearch() {
-    const searchInput = document.getElementById('searchInput');
-    const searchResults = document.getElementById('searchResults');
-    let searchTimeout = null;
-
-    if (!searchInput || !searchResults) return;
-
-    // Keyboard shortcut (Cmd+K)
-    document.addEventListener('keydown', (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault();
-        searchInput.focus();
-      }
-    });
-
-    // Search on input
-    searchInput.addEventListener('input', () => {
-      const query = searchInput.value.trim();
-
-      if (query.length < 2) {
-        searchResults.classList.remove('active');
-        return;
-      }
-
-      clearTimeout(searchTimeout);
-      searchTimeout = setTimeout(() => this.performSearch(query), 300);
-    });
-
-    // Close on blur
-    searchInput.addEventListener('blur', () => {
-      setTimeout(() => searchResults.classList.remove('active'), 200);
-    });
-
-    // Focus shows results if there are any
-    searchInput.addEventListener('focus', () => {
-      if (searchResults.innerHTML && searchInput.value.length >= 2) {
-        searchResults.classList.add('active');
-      }
-    });
-  }
-
-  async performSearch(query) {
-    const searchResults = document.getElementById('searchResults');
-
-    try {
-      const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-      const data = await response.json();
-
-      if (data.total === 0) {
-        searchResults.innerHTML = '<div class="search-result-item" style="color: var(--text-muted);">No results found</div>';
-        searchResults.classList.add('active');
-        return;
-      }
-
-      let html = '';
-
-      // Files
-      for (const file of data.results.files.slice(0, 5)) {
-        html += `
-          <div class="search-result-item" data-type="file" data-path="${this.escapeHtml(file.path)}">
-            <i data-lucide="file-code" class="icon-xs"></i>
-            <span>${this.escapeHtml(file.path)}</span>
-            <span class="search-result-type">file</span>
-          </div>
-        `;
-      }
-
-      // Agents
-      for (const agent of data.results.agents.slice(0, 5)) {
-        html += `
-          <div class="search-result-item" data-type="agent" data-name="${this.escapeHtml(agent.name)}">
-            <i data-lucide="bot" class="icon-xs"></i>
-            <span>${this.escapeHtml(agent.name)}</span>
-            <span class="search-result-type">agent</span>
-          </div>
-        `;
-      }
-
-      // Contributions
-      for (const contrib of data.results.contributions.slice(0, 5)) {
-        html += `
-          <div class="search-result-item" data-type="contribution" data-path="${this.escapeHtml(contrib.file_path)}">
-            <i data-lucide="git-commit" class="icon-xs"></i>
-            <span>${this.escapeHtml(contrib.agent_name)}: ${contrib.action} ${this.escapeHtml(contrib.file_path)}</span>
-            <span class="search-result-type">commit</span>
-          </div>
-        `;
-      }
-
-      searchResults.innerHTML = html;
-      searchResults.classList.add('active');
-
-      // Add click handlers
-      searchResults.querySelectorAll('.search-result-item').forEach(item => {
-        item.addEventListener('click', () => {
-          const type = item.dataset.type;
-          if (type === 'file' || type === 'contribution') {
-            this.openFile(item.dataset.path);
-          } else if (type === 'agent') {
-            this.openAgentProfile(item.dataset.name);
-          }
-          searchResults.classList.remove('active');
-          document.getElementById('searchInput').value = '';
-        });
-      });
-
-      // Refresh icons
-      if (window.lucide) lucide.createIcons();
-    } catch (e) {
-      console.error('Search failed:', e);
-    }
   }
 
   connectWebSocket() {

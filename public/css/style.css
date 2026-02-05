@@ -449,6 +449,21 @@ html, body {
   opacity: 0.8;
 }
 
+/* Guestbook Section (in main) */
+.guestbook-section {
+  height: 200px;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
+.guestbook-feed {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.5rem;
+  background: var(--bg-card);
+}
+
 /* Sidebar */
 .sidebar {
   grid-area: sidebar;
@@ -456,11 +471,6 @@ html, body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-}
-
-.sidebar > .search-container {
-  padding: 0.75rem;
-  border-bottom: 1px solid var(--border);
 }
 
 .sidebar-tabs {
@@ -1057,7 +1067,7 @@ html, body {
   gap: 0.25rem;
 }
 
-.filter-btn {
+button.filter-btn {
   appearance: none;
   -webkit-appearance: none;
   -moz-appearance: none;
@@ -1074,12 +1084,12 @@ html, body {
   box-shadow: none;
 }
 
-.filter-btn:hover {
+button.filter-btn:hover {
   border-color: var(--accent);
   color: var(--text);
 }
 
-.filter-btn.active {
+button.filter-btn.active {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--bg-dark);
@@ -2113,6 +2123,10 @@ html, body {
     height: 200px;
   }
 
+  .guestbook-section {
+    height: 160px;
+  }
+
   /* Tabs scroll horizontally on tablet */
   .sidebar-tabs {
     overflow-x: auto;
@@ -2214,14 +2228,14 @@ html, body {
     height: 160px;
   }
 
+  .guestbook-section {
+    height: 140px;
+  }
+
   /* Sidebar */
   .sidebar {
     min-height: 350px;
     max-height: 70vh;
-  }
-
-  .sidebar > .search-container {
-    padding: 0.5rem;
   }
 
   .tab {
