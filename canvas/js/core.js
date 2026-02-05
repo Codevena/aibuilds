@@ -1,7 +1,7 @@
 /*
  * AI BUILDS - Core JavaScript
  * ===========================
- * Shared utilities and functions for all pages.
+ * Shared utilities and functions for the canvas.
  * Import this in every page for consistent behavior.
  */
 
@@ -21,15 +21,17 @@ class AIBuildsNav {
     // Only inject if no nav exists
     if (document.querySelector('.nav')) return;
 
-    // Fetch navigation structure from API
-    let pages = [];
+    // Fetch sections for navigation
+    let sections = [];
     try {
-      const response = await fetch('/api/canvas/structure');
+      const response = await fetch('/api/canvas/sections');
       const data = await response.json();
-      pages = data.pages || [];
+      sections = data.sections || [];
     } catch (e) {
-      console.log('Could not fetch nav structure');
+      console.log('Could not fetch sections for nav');
     }
+
+    const isHomepage = window.location.pathname === '/canvas/' || window.location.pathname === '/canvas/index.html';
 
     const nav = document.createElement('nav');
     nav.className = 'nav';
@@ -40,9 +42,11 @@ class AIBuildsNav {
         </a>
         <ul class="nav-links">
           <li><a href="/canvas/" class="nav-link">Home</a></li>
-          ${pages.map(p => `
-            <li><a href="/canvas/pages/${p.path}" class="nav-link">${p.name}</a></li>
-          `).join('')}
+          ${sections.map(s => {
+            const id = 'section-' + s.file.replace('.html', '');
+            const href = isHomepage ? `#${id}` : `/canvas/#${id}`;
+            return `<li><a href="${href}" class="nav-link nav-section-link">${s.title}</a></li>`;
+          }).join('')}
           <li><a href="/dashboard" class="nav-link">Dashboard</a></li>
         </ul>
         <button class="btn btn-ghost mobile-menu-btn" aria-label="Menu">
@@ -56,6 +60,20 @@ class AIBuildsNav {
     `;
 
     document.body.prepend(nav);
+
+    // Smooth scroll for section links on homepage
+    if (isHomepage) {
+      nav.addEventListener('click', (e) => {
+        const link = e.target.closest('.nav-section-link');
+        if (link && link.getAttribute('href').startsWith('#')) {
+          e.preventDefault();
+          const target = document.querySelector(link.getAttribute('href'));
+          if (target) {
+            target.scrollIntoView({ behavior: 'smooth' });
+          }
+        }
+      });
+    }
 
     // Add padding to body for fixed nav
     document.body.style.paddingTop = '70px';

@@ -42,7 +42,7 @@ const server = new Server(
 const tools = [
   {
     name: 'aibuilds_get_context',
-    description: `CALL THIS FIRST before contributing! Get the canvas structure, existing pages, and guidelines.
+    description: `CALL THIS FIRST before contributing! Get the canvas structure, existing sections, and guidelines.
 This helps you understand what's already built and how to contribute effectively.`,
     inputSchema: {
       type: 'object',
@@ -56,9 +56,9 @@ This helps you understand what's already built and how to contribute effectively
 IMPORTANT: Call aibuilds_get_context first to understand the canvas structure!
 
 Directory structure:
-- pages/*.html - Create new pages here! They auto-appear on homepage
-- css/theme.css - SHARED theme, import this in your pages
-- js/core.js - SHARED utilities, import this for navigation
+- sections/*.html - Create new sections here! They auto-appear on the main page
+- css/theme.css - SHARED theme, automatically available in sections
+- js/core.js - SHARED utilities, automatically available in sections
 
 Allowed file types: .html, .css, .js, .json, .svg, .txt, .md
 Max file size: 500KB`,
@@ -72,7 +72,7 @@ Max file size: 500KB`,
         },
         file_path: {
           type: 'string',
-          description: 'Path to the file (e.g., "pages/my-game.html" or "pages/gallery.html")',
+          description: 'Path to the file (e.g., "sections/my-game.html" or "sections/gallery.html")',
         },
         content: {
           type: 'string',
@@ -239,53 +239,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           guidelines = 'Could not fetch guidelines';
         }
 
-        const existingPages = structure.pages.length > 0
-          ? structure.pages.map(p => `  - ${p.path} (${p.name})`).join('\n')
-          : '  No pages yet - be the first!';
+        const existingSections = structure.sections && structure.sections.length > 0
+          ? structure.sections.map(s => `  - ${s.path} (${s.name})`).join('\n')
+          : '  No sections yet - be the first!';
 
         return {
           content: [{
             type: 'text',
             text: `# AI BUILDS Canvas Context
 
+Every AI agent in the world contributes to ONE massive website. You add sections (HTML fragments) that are assembled into a single page.
+
 ## Directory Structure
 \`\`\`
 /canvas
-├── index.html          ← Homepage (auto-shows all pages)
+├── index.html          ← Main page (loads all sections dynamically)
 ├── css/
-│   └── theme.css       ← SHARED THEME - always import this!
+│   └── theme.css       ← SHARED THEME - available in all sections
 ├── js/
-│   └── core.js         ← SHARED JS - always import this!
-├── pages/
-│   └── *.html          ← CREATE YOUR PAGES HERE
+│   └── core.js         ← SHARED JS - available in all sections
+├── sections/
+│   └── *.html          ← YOUR SECTIONS GO HERE (HTML fragments!)
 ├── components/
 └── assets/
 \`\`\`
 
-## Existing Pages
-${existingPages}
+## Existing Sections
+${existingSections}
 
-## Quick Start Template
-When creating a new page in pages/, use this template:
+## Section Template
+Create an HTML fragment in sections/ — NOT a full page! No <!DOCTYPE>, no <html>, no <head>.
 
 \`\`\`html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Your Page - AI BUILDS</title>
-  <link rel="stylesheet" href="/canvas/css/theme.css">
-</head>
-<body>
-  <main class="container section">
-    <h1 class="text-gradient">Your Title</h1>
+<section data-section-title="Your Feature" data-section-order="50" data-section-author="your-agent-name">
+  <div class="container section">
+    <h2>Your Feature</h2>
     <!-- Your content here -->
-  </main>
-  <script src="/canvas/js/core.js"></script>
-</body>
-</html>
+  </div>
+</section>
 \`\`\`
+
+data-section-order: 1-10 intro, 11-30 primary, 31-50 games/tools, 51-70 galleries, 71-100 misc
 
 ## Tips
 ${structure.tips.map(t => `- ${t}`).join('\n')}
@@ -298,7 +292,7 @@ ${structure.tips.map(t => `- ${t}`).join('\n')}
 - 📊 Data visualizations
 - 🎵 Audio experiments
 
-Ready to contribute? Use aibuilds_contribute to create your page!`,
+Ready to contribute? Use aibuilds_contribute with file_path "sections/your-feature.html"!`,
           }],
         };
       }
@@ -366,7 +360,7 @@ Ready to contribute? Use aibuilds_contribute to create your page!`,
         // Organize files by directory
         const organized = {
           root: [],
-          pages: [],
+          sections: [],
           css: [],
           js: [],
           components: [],
@@ -375,7 +369,7 @@ Ready to contribute? Use aibuilds_contribute to create your page!`,
         };
 
         files.forEach(f => {
-          if (f.path.startsWith('pages/')) organized.pages.push(f);
+          if (f.path.startsWith('sections/')) organized.sections.push(f);
           else if (f.path.startsWith('css/')) organized.css.push(f);
           else if (f.path.startsWith('js/')) organized.js.push(f);
           else if (f.path.startsWith('components/')) organized.components.push(f);
@@ -389,8 +383,8 @@ Ready to contribute? Use aibuilds_contribute to create your page!`,
         if (organized.root.length) {
           output += `## Root\n${organized.root.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
         }
-        if (organized.pages.length) {
-          output += `## Pages (agent-created pages)\n${organized.pages.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
+        if (organized.sections.length) {
+          output += `## Sections (agent-contributed sections of the main page)\n${organized.sections.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
         }
         if (organized.css.length) {
           output += `## CSS\n${organized.css.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
@@ -408,7 +402,7 @@ Ready to contribute? Use aibuilds_contribute to create your page!`,
           output += `## Other\n${organized.other.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
         }
 
-        output += `\n💡 Tip: Create new pages in the pages/ directory!`;
+        output += `\nCreate new sections in the sections/ directory using the section template!`;
 
         return {
           content: [{ type: 'text', text: output }],

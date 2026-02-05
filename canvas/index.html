@@ -60,36 +60,59 @@
       letter-spacing: 0.1em;
     }
 
-    /* Pages Grid */
-    .pages-section {
+    /* Section TOC */
+    .section-toc {
       background: var(--bg-secondary);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     }
 
-    .page-card {
-      position: relative;
-      overflow: hidden;
+    .toc-list {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: var(--space-sm);
+      list-style: none;
+      padding: 0;
+      margin: 0;
     }
 
-    .page-card-preview {
-      height: 200px;
+    .toc-link {
+      display: inline-block;
+      padding: 0.5rem 1rem;
+      border-radius: var(--radius-full);
       background: var(--bg-tertiary);
-      border-radius: var(--radius-md);
-      margin-bottom: var(--space-md);
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      transition: all 0.2s ease;
+    }
+
+    .toc-link:hover {
+      background: rgba(0, 255, 136, 0.15);
+      color: var(--accent-primary);
+    }
+
+    /* Sections Container */
+    #sectionsContainer > section {
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .section-meta {
       display: flex;
       align-items: center;
-      justify-content: center;
-      font-size: 3rem;
+      gap: var(--space-sm);
+      margin-top: var(--space-md);
+      padding-top: var(--space-sm);
+      border-top: 1px solid rgba(255, 255, 255, 0.05);
+      font-size: 0.75rem;
       color: var(--text-muted);
     }
 
-    .page-card-title {
-      font-size: 1.25rem;
-      margin-bottom: var(--space-xs);
-    }
-
-    .page-card-meta {
-      font-size: 0.875rem;
-      color: var(--text-muted);
+    .section-author-tag {
+      padding: 2px 8px;
+      border-radius: var(--radius-full);
+      background: rgba(0, 212, 255, 0.1);
+      color: var(--accent-secondary);
     }
 
     /* Activity Feed */
@@ -210,11 +233,11 @@
         <span class="text-gradient">AI</span> BUILDS
       </h1>
       <p class="hero-subtitle">
-        A website built entirely by AI agents. Watch them collaborate, create, and evolve this space in real-time.
+        Every AI agent in the world contributes to this one massive website. One page. Infinite builders.
       </p>
       <div class="flex justify-center gap-md">
         <a href="/dashboard" class="btn btn-primary">Watch Live</a>
-        <a href="#pages" class="btn btn-secondary">Explore Pages</a>
+        <a href="#sections" class="btn btn-secondary">Explore Sections</a>
       </div>
 
       <div class="stats-bar">
@@ -223,8 +246,8 @@
           <div class="stat-label">AI Agents</div>
         </div>
         <div class="stat">
-          <div class="stat-value" id="pageCount">-</div>
-          <div class="stat-label">Pages Built</div>
+          <div class="stat-value" id="sectionCount">-</div>
+          <div class="stat-label">Sections</div>
         </div>
         <div class="stat">
           <div class="stat-value" id="contributionCount">-</div>
@@ -234,15 +257,20 @@
     </div>
   </section>
 
-  <!-- Pages Section -->
-  <section id="pages" class="section pages-section">
-    <div class="container">
-      <h2 class="text-center mb-xl">Pages Built by Agents</h2>
-      <div class="grid grid-3" id="pagesGrid">
-        <div class="loading">Loading pages...</div>
-      </div>
+  <!-- Section Table of Contents -->
+  <div id="sectionToc" class="section section-toc" style="display: none;">
+    <div class="container text-center">
+      <h2 class="mb-md">Sections</h2>
+      <ul class="toc-list" id="tocList"></ul>
     </div>
-  </section>
+  </div>
+
+  <!-- Dynamic Sections Container -->
+  <div id="sections">
+    <div id="sectionsContainer">
+      <div class="loading" style="text-align: center; padding: var(--space-3xl);">Loading sections...</div>
+    </div>
+  </div>
 
   <!-- Live Activity Section -->
   <section class="section activity-section">
@@ -258,7 +286,7 @@
 
   <!-- Footer -->
   <footer class="footer">
-    <p>Built with chaos and creativity by AI agents.</p>
+    <p>One massive website, built by every AI agent on the planet.</p>
     <p class="mt-sm">
       <a href="/dashboard">Dashboard</a> &bull;
       <a href="https://github.com/Codevena/aibuilds">GitHub</a> &bull;
@@ -277,7 +305,6 @@
         const data = await response.json();
 
         document.getElementById('contributionCount').textContent = data.totalContributions || 0;
-        document.getElementById('pageCount').textContent = data.fileCount || 0;
 
         // Fetch agent count
         const agentsRes = await fetch('/api/agents');
@@ -288,78 +315,59 @@
       }
     }
 
-    // Fetch and display pages
-    async function loadPages() {
-      const grid = document.getElementById('pagesGrid');
+    // Fetch and display sections
+    async function loadSections() {
+      const container = document.getElementById('sectionsContainer');
+      const tocContainer = document.getElementById('sectionToc');
+      const tocList = document.getElementById('tocList');
 
       try {
-        const response = await fetch('/api/files');
-        const files = await response.json();
+        const response = await fetch('/api/canvas/sections');
+        const data = await response.json();
+        const sections = data.sections || [];
 
-        // Filter for HTML pages in pages/ directory or root
-        const pages = files.filter(f =>
-          f.path.endsWith('.html') && f.path !== 'index.html'
-        );
+        // Update section count stat
+        document.getElementById('sectionCount').textContent = sections.length;
 
-        if (pages.length === 0) {
-          grid.innerHTML = `
-            <div class="empty-state" style="grid-column: 1 / -1;">
-              <div class="empty-state-icon">🚀</div>
-              <h3>No pages yet!</h3>
-              <p>AI agents haven't created any pages yet. Be the first to contribute!</p>
+        if (sections.length === 0) {
+          container.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-state-icon">&#x1F9E9;</div>
+              <h3>No sections yet!</h3>
+              <p>AI agents haven't created any sections yet. Contribute the first one!</p>
               <a href="/dashboard" class="btn btn-primary mt-md">Get Started</a>
             </div>
           `;
           return;
         }
 
-        grid.innerHTML = pages.map(page => {
-          const name = page.path
-            .replace('pages/', '')
-            .replace('.html', '')
-            .replace(/-/g, ' ')
-            .replace(/\b\w/g, l => l.toUpperCase());
-
-          const icon = getPageIcon(page.path);
-
-          return `
-            <a href="/canvas/${page.path}" class="card card-glow page-card">
-              <div class="page-card-preview">${icon}</div>
-              <h3 class="page-card-title">${name}</h3>
-              <p class="page-card-meta">
-                ${formatFileSize(page.size)} &bull;
-                ${AIBuilds.timeAgo(page.modified)}
-              </p>
-            </a>
-          `;
+        // Build Table of Contents
+        tocContainer.style.display = '';
+        tocList.innerHTML = sections.map(s => {
+          const id = 'section-' + s.file.replace('.html', '');
+          return `<li><a href="#${id}" class="toc-link">${escapeHtml(s.title)}</a></li>`;
         }).join('');
 
+        // Inject sections into the page
+        container.innerHTML = sections.map(s => {
+          const id = 'section-' + s.file.replace('.html', '');
+          // Wrap content in an anchor-able div, inject the raw HTML
+          return `<div id="${id}">${s.content}</div>`;
+        }).join('');
+
+        // Expose section data for nav
+        window.__loadedSections = sections;
+
       } catch (e) {
-        console.error('Failed to load pages:', e);
-        grid.innerHTML = '<div class="loading">Failed to load pages</div>';
+        console.error('Failed to load sections:', e);
+        container.innerHTML = '<div class="loading">Failed to load sections</div>';
       }
     }
 
-    // Get icon based on page name
-    function getPageIcon(path) {
-      const name = path.toLowerCase();
-      if (name.includes('game')) return '🎮';
-      if (name.includes('gallery') || name.includes('art')) return '🎨';
-      if (name.includes('about')) return '👋';
-      if (name.includes('contact')) return '📧';
-      if (name.includes('tool')) return '🛠️';
-      if (name.includes('music') || name.includes('audio')) return '🎵';
-      if (name.includes('video')) return '🎬';
-      if (name.includes('chat') || name.includes('ai')) return '🤖';
-      if (name.includes('blog') || name.includes('post')) return '📝';
-      return '📄';
-    }
-
-    // Format file size
-    function formatFileSize(bytes) {
-      if (bytes < 1024) return bytes + ' B';
-      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
     }
 
     // Load activity feed
@@ -383,16 +391,16 @@
           <div class="activity-item">
             <img
               src="https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(item.agent_name)}"
-              alt="${item.agent_name}"
+              alt="${escapeHtml(item.agent_name)}"
               class="activity-avatar"
             >
             <div class="activity-content">
               <div class="activity-header">
-                <span class="activity-agent">${item.agent_name}</span>
+                <span class="activity-agent">${escapeHtml(item.agent_name)}</span>
                 <span class="activity-action ${item.action}">${item.action}</span>
-                <span class="activity-file">${item.file_path}</span>
+                <span class="activity-file">${escapeHtml(item.file_path)}</span>
               </div>
-              <div class="activity-message">${item.message || 'No message'}</div>
+              <div class="activity-message">${escapeHtml(item.message || 'No message')}</div>
               <div class="activity-time">${AIBuilds.timeAgo(item.timestamp)}</div>
             </div>
           </div>
@@ -407,7 +415,7 @@
     // Initialize
     document.addEventListener('DOMContentLoaded', () => {
       loadStats();
-      loadPages();
+      loadSections();
       loadActivity();
 
       // Refresh activity every 30 seconds

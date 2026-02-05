@@ -21,8 +21,13 @@ const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.m
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 1000;
 
-// Git setup for history
-const git = simpleGit(path.join(__dirname, '..'));
+// Git setup for history - detect git binary location
+const gitBinary = (() => {
+  try {
+    return require('child_process').execSync('which git', { encoding: 'utf-8' }).trim();
+  } catch { return 'git'; }
+})();
+const git = simpleGit(path.join(__dirname, '..'), { binary: gitBinary });
 
 // Middleware
 app.use(cors());
@@ -443,7 +448,7 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
         canvas_structure: {
           method: 'GET',
           path: '/api/canvas/structure',
-          description: 'Get organized canvas structure with pages, components, assets, and tips',
+          description: 'Get organized canvas structure with sections, components, assets, and tips',
         },
         canvas_guidelines: {
           method: 'GET',
@@ -1545,6 +1550,14 @@ app.get('/api/canvas/structure', async (req, res) => {
       theme: '/canvas/css/theme.css',
       coreJs: '/canvas/js/core.js',
       guidelines: '/canvas/CANVAS.md',
+      sections: files
+        .filter(f => f.path.startsWith('sections/') && f.path.endsWith('.html'))
+        .map(f => ({
+          path: f.path,
+          name: f.path.replace('sections/', '').replace('.html', '').replace(/-/g, ' '),
+          size: f.size,
+          modified: f.modified,
+        })),
       pages: files
         .filter(f => f.path.startsWith('pages/') && f.path.endsWith('.html'))
         .map(f => ({
@@ -1558,10 +1571,10 @@ app.get('/api/canvas/structure', async (req, res) => {
       rootFiles: files.filter(f => !f.path.includes('/')),
       tips: [
         'Use the shared theme.css for consistent styling',
-        'Create new pages in the pages/ directory',
-        'Import core.js for navigation and utilities',
-        'Check existing pages before creating similar ones',
-        'Build on others work - improve existing pages!',
+        'Create new sections in the sections/ directory',
+        'Sections are HTML fragments with a <section> wrapper',
+        'Use data-section-order to control position on the page',
+        'Build on others work - improve existing sections!',
       ],
     };
 
@@ -1579,6 +1592,54 @@ app.get('/api/canvas/guidelines', async (req, res) => {
     res.json({ content });
   } catch (error) {
     res.status(404).json({ error: 'Guidelines not found' });
+  }
+});
+
+// API: Get all canvas sections (HTML fragments from sections/)
+app.get('/api/canvas/sections', async (req, res) => {
+  try {
+    const sectionsDir = path.join(CANVAS_DIR, 'sections');
+    let sectionFiles = [];
+    try {
+      const entries = await fs.readdir(sectionsDir, { withFileTypes: true });
+      sectionFiles = entries.filter(e => !e.isDirectory() && e.name.endsWith('.html'));
+    } catch (e) {
+      // sections/ directory might not exist yet
+    }
+
+    const sections = [];
+    for (const file of sectionFiles) {
+      const filePath = path.join(sectionsDir, file.name);
+      const content = await fs.readFile(filePath, 'utf-8');
+      const stats = await fs.stat(filePath);
+
+      // Extract data-* attributes from the <section> tag
+      const sectionMatch = content.match(/<section[^>]*>/i);
+      const tag = sectionMatch ? sectionMatch[0] : '';
+
+      const title = (tag.match(/data-section-title="([^"]*)"/i) || [])[1] || file.name.replace('.html', '').replace(/-/g, ' ');
+      const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
+      const author = (tag.match(/data-section-author="([^"]*)"/i) || [])[1] || 'unknown';
+
+      sections.push({
+        file: file.name,
+        path: `sections/${file.name}`,
+        title,
+        order,
+        author,
+        content,
+        size: stats.size,
+        modified: stats.mtime,
+      });
+    }
+
+    // Sort by order, then by title
+    sections.sort((a, b) => a.order - b.order || a.title.localeCompare(b.title));
+
+    res.json({ sections, total: sections.length });
+  } catch (error) {
+    console.error('Sections error:', error);
+    res.status(500).json({ error: 'Failed to load sections' });
   }
 });
 
