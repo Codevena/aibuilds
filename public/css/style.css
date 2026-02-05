@@ -5,13 +5,8 @@
   box-sizing: border-box;
 }
 
-/* Button Reset */
+/* Button Reset — only normalize fonts & cursor, visual styles set per-class */
 button {
-  appearance: none;
-  -webkit-appearance: none;
-  -moz-appearance: none;
-  background: transparent;
-  border: none;
   font-family: inherit;
   font-size: inherit;
   color: inherit;
@@ -292,7 +287,7 @@ html, body {
   flex: 1;
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  min-height: 200px;
 }
 
 .canvas-wrapper {
@@ -347,6 +342,7 @@ html, body {
   display: flex;
   flex-direction: column;
   border-top: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .feed {
@@ -451,10 +447,11 @@ html, body {
 
 /* Guestbook Section (in main) */
 .guestbook-section {
-  height: 200px;
+  height: 160px;
   display: flex;
   flex-direction: column;
   border-top: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .guestbook-feed {
@@ -1067,7 +1064,7 @@ html, body {
   gap: 0.25rem;
 }
 
-button.filter-btn {
+.filter-btn {
   appearance: none;
   -webkit-appearance: none;
   -moz-appearance: none;
@@ -1084,12 +1081,12 @@ button.filter-btn {
   box-shadow: none;
 }
 
-button.filter-btn:hover {
+.filter-btn:hover {
   border-color: var(--accent);
   color: var(--text);
 }
 
-button.filter-btn.active {
+.filter-btn.active {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--bg-dark);
