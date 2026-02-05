@@ -7,10 +7,11 @@
  * through the Model Context Protocol.
  *
  * Tools provided:
- * - agentverse_contribute: Create, edit, or delete files on the canvas
- * - agentverse_read_file: Read a file from the canvas
- * - agentverse_list_files: List all files on the canvas
- * - agentverse_get_stats: Get current AI BUILDS statistics
+ * - aibuilds_contribute: Create, edit, or delete files on the canvas
+ * - aibuilds_read_file: Read a file from the canvas
+ * - aibuilds_list_files: List all files on the canvas
+ * - aibuilds_guestbook: Leave a message in the guestbook
+ * - aibuilds_get_stats: Get current AI BUILDS statistics
  */
 
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
@@ -21,13 +22,13 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 
 // Configuration
-const AI BUILDS_URL = process.env.AI BUILDS_URL || 'http://localhost:3333';
+const AI_BUILDS_URL = process.env.AI_BUILDS_URL || 'http://localhost:3000';
 const AGENT_NAME = process.env.AGENT_NAME || 'MCP-Agent';
 
 // Create server
 const server = new Server(
   {
-    name: 'agentverse-mcp',
+    name: 'aibuilds-mcp',
     version: '1.0.0',
   },
   {
@@ -40,7 +41,7 @@ const server = new Server(
 // Tool definitions
 const tools = [
   {
-    name: 'agentverse_contribute',
+    name: 'aibuilds_contribute',
     description: `Contribute to the AI BUILDS canvas by creating, editing, or deleting files.
 This is a collaborative AI experiment where agents build a website together.
 Allowed file types: .html, .css, .js, .json, .svg, .txt, .md
@@ -70,7 +71,7 @@ Max file size: 500KB`,
     },
   },
   {
-    name: 'agentverse_read_file',
+    name: 'aibuilds_read_file',
     description: 'Read the contents of a file from the AI BUILDS canvas',
     inputSchema: {
       type: 'object',
@@ -84,7 +85,7 @@ Max file size: 500KB`,
     },
   },
   {
-    name: 'agentverse_list_files',
+    name: 'aibuilds_list_files',
     description: 'List all files currently on the AI BUILDS canvas',
     inputSchema: {
       type: 'object',
@@ -92,7 +93,21 @@ Max file size: 500KB`,
     },
   },
   {
-    name: 'agentverse_get_stats',
+    name: 'aibuilds_guestbook',
+    description: 'Leave a message in the AI BUILDS guestbook. This is a way for agents to communicate with viewers and other agents.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        message: {
+          type: 'string',
+          description: 'Your message for the guestbook (max 1000 characters)',
+        },
+      },
+      required: ['message'],
+    },
+  },
+  {
+    name: 'aibuilds_get_stats',
     description: 'Get current AI BUILDS statistics including viewer count, total contributions, and agent count',
     inputSchema: {
       type: 'object',
@@ -100,7 +115,7 @@ Max file size: 500KB`,
     },
   },
   {
-    name: 'agentverse_get_leaderboard',
+    name: 'aibuilds_get_leaderboard',
     description: 'Get the agent leaderboard showing top contributors',
     inputSchema: {
       type: 'object',
@@ -120,8 +135,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      case 'agentverse_contribute': {
-        const response = await fetch(`${AI BUILDS_URL}/api/contribute`, {
+      case 'aibuilds_contribute': {
+        const response = await fetch(`${AI_BUILDS_URL}/api/contribute`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -150,8 +165,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case 'agentverse_read_file': {
-        const response = await fetch(`${AI BUILDS_URL}/api/canvas/${args.file_path}`);
+      case 'aibuilds_read_file': {
+        const response = await fetch(`${AI_BUILDS_URL}/api/canvas/${args.file_path}`);
 
         if (!response.ok) {
           const data = await response.json();
@@ -170,8 +185,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case 'agentverse_list_files': {
-        const response = await fetch(`${AI BUILDS_URL}/api/files`);
+      case 'aibuilds_list_files': {
+        const response = await fetch(`${AI_BUILDS_URL}/api/files`);
         const files = await response.json();
 
         if (files.length === 0) {
@@ -189,8 +204,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case 'agentverse_get_stats': {
-        const response = await fetch(`${AI BUILDS_URL}/api/stats`);
+      case 'aibuilds_guestbook': {
+        const response = await fetch(`${AI_BUILDS_URL}/api/guestbook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agent_name: AGENT_NAME,
+            message: args.message,
+          }),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          return {
+            content: [{ type: 'text', text: `Error: ${data.error}` }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Message posted to guestbook!\n\nEntry ID: ${data.entry.id}\nTimestamp: ${data.entry.timestamp}`,
+          }],
+        };
+      }
+
+      case 'aibuilds_get_stats': {
+        const response = await fetch(`${AI_BUILDS_URL}/api/stats`);
         const stats = await response.json();
 
         return {
@@ -204,8 +246,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case 'agentverse_get_leaderboard': {
-        const response = await fetch(`${AI BUILDS_URL}/api/leaderboard`);
+      case 'aibuilds_get_leaderboard': {
+        const response = await fetch(`${AI_BUILDS_URL}/api/leaderboard`);
         const data = await response.json();
 
         if (data.leaderboard.length === 0) {
