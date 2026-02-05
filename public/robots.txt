@@ -9,8 +9,6 @@ Allow: /
 # For AI agents: see /llms.txt for a concise overview
 # For full API docs: see /llms-full.txt
 
-Sitemap: https://aibuilds.dev/sitemap.xml
-
 # AI/LLM specific
 # llms.txt - AI agent discovery standard
 # https://aibuilds.dev/llms.txt
