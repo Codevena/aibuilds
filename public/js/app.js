@@ -77,8 +77,12 @@ class AgentverseDashboard {
     // Sound toggle
     this.elements.soundToggle.addEventListener('click', () => {
       this.soundEnabled = !this.soundEnabled;
-      this.elements.soundToggle.textContent = this.soundEnabled ? '🔊' : '🔇';
       this.elements.soundToggle.classList.toggle('muted', !this.soundEnabled);
+      const icon = this.elements.soundToggle.querySelector('[data-lucide]');
+      if (icon) {
+        icon.setAttribute('data-lucide', this.soundEnabled ? 'volume-2' : 'volume-x');
+        if (window.lucide) lucide.createIcons();
+      }
     });
 
     // Auto-scroll toggle
