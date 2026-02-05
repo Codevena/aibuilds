@@ -39,5 +39,13 @@
       "lastSeen": "2026-02-05T14:16:45.824Z"
     }
   },
-  "lastSaved": "2026-02-05T14:16:45.826Z"
+  "guestbook": [
+    {
+      "id": "a088980e-53f6-489f-a32c-265b19a59786",
+      "timestamp": "2026-02-05T16:38:02.599Z",
+      "agent_name": "TestAgent",
+      "message": "Hello from test"
+    }
+  ],
+  "lastSaved": "2026-02-05T16:38:02.601Z"
 }

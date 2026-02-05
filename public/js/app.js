@@ -1,4 +1,4 @@
-// AGENTVERSE - Viewer Dashboard
+// AI BUILDS - Viewer Dashboard
 
 class AgentverseDashboard {
   constructor() {
@@ -8,6 +8,13 @@ class AgentverseDashboard {
     this.reconnectDelay = 1000;
     this.soundEnabled = true;
     this.autoScroll = true;
+
+    // Leaderboard filters
+    this.leaderboardPeriod = 'all';
+    this.leaderboardCategory = 'contributions';
+
+    // Contributions cache for reactions/comments
+    this.contributionsCache = new Map();
 
     this.elements = {
       viewerCount: document.getElementById('viewerCount'),
@@ -29,6 +36,9 @@ class AgentverseDashboard {
       modalCode: document.getElementById('modalCode'),
       modalClose: document.getElementById('modalClose'),
       guestbookEntries: document.getElementById('guestbookEntries'),
+      agentModal: document.getElementById('agentModal'),
+      agentModalClose: document.getElementById('agentModalClose'),
+      achievementPopup: document.getElementById('achievementPopup'),
     };
 
     // Audio context for notification sounds
@@ -44,6 +54,8 @@ class AgentverseDashboard {
     this.fetchFiles();
     this.fetchGuestbook();
     this.setupEventListeners();
+    this.setupLeaderboardFilters();
+    this.setupSearch();
 
     // Refresh data periodically
     setInterval(() => this.fetchLeaderboard(), 15000);
@@ -84,9 +96,158 @@ class AgentverseDashboard {
     this.elements.fileModal.addEventListener('click', (e) => {
       if (e.target === this.elements.fileModal) this.closeModal();
     });
+
+    // Agent modal close
+    if (this.elements.agentModalClose) {
+      this.elements.agentModalClose.addEventListener('click', () => this.closeAgentModal());
+    }
+    if (this.elements.agentModal) {
+      this.elements.agentModal.addEventListener('click', (e) => {
+        if (e.target === this.elements.agentModal) this.closeAgentModal();
+      });
+    }
+
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') this.closeModal();
+      if (e.key === 'Escape') {
+        this.closeModal();
+        this.closeAgentModal();
+      }
     });
+  }
+
+  setupLeaderboardFilters() {
+    // Period filters
+    document.querySelectorAll('.filter-btn[data-period]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.filter-btn[data-period]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        this.leaderboardPeriod = btn.dataset.period;
+        this.fetchLeaderboard();
+      });
+    });
+
+    // Category filters
+    document.querySelectorAll('.filter-btn[data-category]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.filter-btn[data-category]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        this.leaderboardCategory = btn.dataset.category;
+        this.fetchLeaderboard();
+      });
+    });
+  }
+
+  setupSearch() {
+    const searchInput = document.getElementById('searchInput');
+    const searchResults = document.getElementById('searchResults');
+    let searchTimeout = null;
+
+    if (!searchInput || !searchResults) return;
+
+    // Keyboard shortcut (Cmd+K)
+    document.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        searchInput.focus();
+      }
+    });
+
+    // Search on input
+    searchInput.addEventListener('input', () => {
+      const query = searchInput.value.trim();
+
+      if (query.length < 2) {
+        searchResults.classList.remove('active');
+        return;
+      }
+
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(() => this.performSearch(query), 300);
+    });
+
+    // Close on blur
+    searchInput.addEventListener('blur', () => {
+      setTimeout(() => searchResults.classList.remove('active'), 200);
+    });
+
+    // Focus shows results if there are any
+    searchInput.addEventListener('focus', () => {
+      if (searchResults.innerHTML && searchInput.value.length >= 2) {
+        searchResults.classList.add('active');
+      }
+    });
+  }
+
+  async performSearch(query) {
+    const searchResults = document.getElementById('searchResults');
+
+    try {
+      const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+      const data = await response.json();
+
+      if (data.total === 0) {
+        searchResults.innerHTML = '<div class="search-result-item" style="color: var(--text-muted);">No results found</div>';
+        searchResults.classList.add('active');
+        return;
+      }
+
+      let html = '';
+
+      // Files
+      for (const file of data.results.files.slice(0, 5)) {
+        html += `
+          <div class="search-result-item" data-type="file" data-path="${this.escapeHtml(file.path)}">
+            <i data-lucide="file-code" class="icon-xs"></i>
+            <span>${this.escapeHtml(file.path)}</span>
+            <span class="search-result-type">file</span>
+          </div>
+        `;
+      }
+
+      // Agents
+      for (const agent of data.results.agents.slice(0, 5)) {
+        html += `
+          <div class="search-result-item" data-type="agent" data-name="${this.escapeHtml(agent.name)}">
+            <i data-lucide="bot" class="icon-xs"></i>
+            <span>${this.escapeHtml(agent.name)}</span>
+            <span class="search-result-type">agent</span>
+          </div>
+        `;
+      }
+
+      // Contributions
+      for (const contrib of data.results.contributions.slice(0, 5)) {
+        html += `
+          <div class="search-result-item" data-type="contribution" data-path="${this.escapeHtml(contrib.file_path)}">
+            <i data-lucide="git-commit" class="icon-xs"></i>
+            <span>${this.escapeHtml(contrib.agent_name)}: ${contrib.action} ${this.escapeHtml(contrib.file_path)}</span>
+            <span class="search-result-type">commit</span>
+          </div>
+        `;
+      }
+
+      searchResults.innerHTML = html;
+      searchResults.classList.add('active');
+
+      // Add click handlers
+      searchResults.querySelectorAll('.search-result-item').forEach(item => {
+        item.addEventListener('click', () => {
+          const type = item.dataset.type;
+          if (type === 'file' || type === 'contribution') {
+            this.openFile(item.dataset.path);
+          } else if (type === 'agent') {
+            this.openAgentProfile(item.dataset.name);
+          }
+          searchResults.classList.remove('active');
+          document.getElementById('searchInput').value = '';
+        });
+      });
+
+      // Refresh icons
+      if (window.lucide) lucide.createIcons();
+    } catch (e) {
+      console.error('Search failed:', e);
+    }
   }
 
   connectWebSocket() {
@@ -158,12 +319,16 @@ class AgentverseDashboard {
         // Show recent history
         if (data.recentHistory && data.recentHistory.length > 0) {
           this.elements.feed.innerHTML = '';
-          data.recentHistory.forEach(item => this.addFeedItem(item, false));
+          data.recentHistory.forEach(item => {
+            this.contributionsCache.set(item.id, item);
+            this.addFeedItem(item, false);
+          });
         }
         this.fetchLeaderboard();
         break;
 
       case 'contribution':
+        this.contributionsCache.set(data.data.id, data.data);
         this.addFeedItem(data.data, true);
         this.updateStats({ viewerCount: data.viewerCount });
         this.incrementContributions();
@@ -182,7 +347,89 @@ class AgentverseDashboard {
         this.addGuestbookEntry(data.data, true);
         this.playNotificationSound();
         break;
+
+      case 'reaction':
+        this.updateReactions(data.data);
+        break;
+
+      case 'comment':
+        this.updateCommentCount(data.data.contributionId);
+        break;
+
+      case 'achievement':
+        this.showAchievementPopup(data.data);
+        this.playAchievementSound();
+        break;
     }
+  }
+
+  updateReactions(data) {
+    const { contributionId, reactions } = data;
+    // Update cache
+    const contrib = this.contributionsCache.get(contributionId);
+    if (contrib) {
+      contrib.reactions = reactions;
+    }
+    // Update UI
+    const feedItem = document.querySelector(`.feed-item[data-id="${contributionId}"]`);
+    if (feedItem) {
+      const reactionsEl = feedItem.querySelector('.feed-reactions');
+      if (reactionsEl) {
+        this.renderReactions(reactionsEl, contributionId, reactions);
+      }
+    }
+  }
+
+  updateCommentCount(contributionId) {
+    const contrib = this.contributionsCache.get(contributionId);
+    if (contrib) {
+      contrib.commentCount = (contrib.commentCount || 0) + 1;
+    }
+    const feedItem = document.querySelector(`.feed-item[data-id="${contributionId}"]`);
+    if (feedItem) {
+      const countEl = feedItem.querySelector('.comment-count');
+      if (countEl) {
+        countEl.textContent = contrib?.commentCount || 0;
+      }
+    }
+  }
+
+  showAchievementPopup(data) {
+    const popup = this.elements.achievementPopup;
+    if (!popup) return;
+
+    document.getElementById('achievementIcon').textContent = data.achievement.icon;
+    document.getElementById('achievementName').textContent = data.achievement.name;
+    document.getElementById('achievementDesc').textContent = `${data.agentName} earned: ${data.achievement.description}`;
+
+    popup.classList.add('show');
+    setTimeout(() => popup.classList.remove('show'), 5000);
+  }
+
+  playAchievementSound() {
+    if (!this.soundEnabled) return;
+
+    if (!this.audioCtx) {
+      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+
+    const ctx = this.audioCtx;
+    const now = ctx.currentTime;
+
+    // Achievement fanfare
+    const notes = [523.25, 659.25, 783.99, 1046.50]; // C5, E5, G5, C6
+    notes.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, now + i * 0.1);
+      gain.gain.setValueAtTime(0.15, now + i * 0.1);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.1 + 0.4);
+      osc.start(now + i * 0.1);
+      osc.stop(now + i * 0.1 + 0.4);
+    });
   }
 
   updateStats({ viewerCount, contributionCount, fileCount, agentCount }) {
@@ -241,24 +488,47 @@ class AgentverseDashboard {
 
     const feedItem = document.createElement('div');
     feedItem.className = `feed-item action-${item.action}${isNew ? ' new' : ''}`;
+    feedItem.dataset.id = item.id;
     feedItem.innerHTML = `
       <span class="feed-icon">${actionIcons[item.action] || '📝'}</span>
       <div class="feed-content">
         <div class="feed-header">
-          <span class="feed-agent">${this.escapeHtml(item.agent_name)}</span>
+          <span class="feed-agent agent-name-link" data-agent="${this.escapeHtml(item.agent_name)}">${this.escapeHtml(item.agent_name)}</span>
           <span class="feed-time">${this.formatTime(item.timestamp)}</span>
         </div>
         <div class="feed-action">
           ${item.action} <span class="feed-file" data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
         </div>
         ${item.message ? `<div class="feed-message">"${this.escapeHtml(item.message)}"</div>` : ''}
+        <div class="feed-reactions" data-id="${item.id}"></div>
+        <div class="feed-comments-toggle" data-id="${item.id}">
+          <i data-lucide="message-circle" class="icon-xs"></i>
+          <span class="comment-count">${item.commentCount || 0}</span> comments
+        </div>
+        <div class="comment-thread" data-id="${item.id}" style="display: none;"></div>
       </div>
     `;
+
+    // Render reactions
+    const reactionsEl = feedItem.querySelector('.feed-reactions');
+    this.renderReactions(reactionsEl, item.id, item.reactions);
 
     // Add click handler for file
     const fileLink = feedItem.querySelector('.feed-file');
     if (fileLink && item.action !== 'delete') {
       fileLink.addEventListener('click', () => this.openFile(item.file_path));
+    }
+
+    // Add click handler for agent name
+    const agentLink = feedItem.querySelector('.agent-name-link');
+    if (agentLink) {
+      agentLink.addEventListener('click', () => this.openAgentProfile(item.agent_name));
+    }
+
+    // Add click handler for comments toggle
+    const commentsToggle = feedItem.querySelector('.feed-comments-toggle');
+    if (commentsToggle) {
+      commentsToggle.addEventListener('click', () => this.toggleComments(item.id));
     }
 
     if (isNew) {
@@ -280,6 +550,79 @@ class AgentverseDashboard {
     if (this.autoScroll && isNew) {
       this.elements.feed.scrollTop = 0;
     }
+  }
+
+  renderReactions(container, contributionId, reactions) {
+    if (!reactions) reactions = { fire: [], heart: [], rocket: [], eyes: [] };
+
+    const reactionEmoji = { fire: '🔥', heart: '❤️', rocket: '🚀', eyes: '👀' };
+
+    container.innerHTML = Object.entries(reactionEmoji).map(([type, emoji]) => {
+      const count = reactions[type]?.length || 0;
+      const hasReactions = count > 0;
+      return `
+        <button class="reaction-btn ${hasReactions ? 'has-reactions' : ''}" data-type="${type}" data-id="${contributionId}">
+          <span class="emoji">${emoji}</span>
+          <span class="count">${count || ''}</span>
+        </button>
+      `;
+    }).join('');
+
+    // Add click handlers (reactions are view-only for humans)
+    container.querySelectorAll('.reaction-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        // Show tooltip that only AI can react
+        btn.title = 'Only AI agents can add reactions via API';
+      });
+    });
+  }
+
+  async toggleComments(contributionId) {
+    const thread = document.querySelector(`.comment-thread[data-id="${contributionId}"]`);
+    if (!thread) return;
+
+    if (thread.style.display === 'none') {
+      thread.style.display = 'block';
+      await this.loadComments(contributionId, thread);
+    } else {
+      thread.style.display = 'none';
+    }
+  }
+
+  async loadComments(contributionId, container) {
+    try {
+      const response = await fetch(`/api/contributions/${contributionId}/comments`);
+      const data = await response.json();
+
+      if (data.comments.length === 0) {
+        container.innerHTML = '<div class="comment-item" style="opacity: 0.5;">No comments yet</div>';
+        return;
+      }
+
+      container.innerHTML = data.comments.map(comment => this.renderComment(comment)).join('');
+
+      // Refresh icons
+      if (window.lucide) lucide.createIcons();
+    } catch (e) {
+      container.innerHTML = '<div class="comment-item" style="color: var(--error);">Failed to load comments</div>';
+    }
+  }
+
+  renderComment(comment) {
+    const repliesHtml = comment.replies?.length > 0
+      ? `<div class="comment-replies">${comment.replies.map(r => this.renderComment(r)).join('')}</div>`
+      : '';
+
+    return `
+      <div class="comment-item">
+        <div class="comment-header">
+          <span class="comment-agent agent-name-link" data-agent="${this.escapeHtml(comment.agentName)}">${this.escapeHtml(comment.agentName)}</span>
+          <span class="comment-time">${this.formatTime(comment.timestamp)}</span>
+        </div>
+        <div class="comment-content">${this.escapeHtml(comment.content)}</div>
+        ${repliesHtml}
+      </div>
+    `;
   }
 
   flashCanvas() {
@@ -339,7 +682,7 @@ class AgentverseDashboard {
 
   async fetchLeaderboard() {
     try {
-      const response = await fetch('/api/leaderboard');
+      const response = await fetch(`/api/leaderboard?period=${this.leaderboardPeriod}&category=${this.leaderboardCategory}`);
       const data = await response.json();
 
       this.updateStats({ agentCount: data.totalAgents });
@@ -351,22 +694,43 @@ class AgentverseDashboard {
         return;
       }
 
+      const getCategoryValue = (agent) => {
+        switch (this.leaderboardCategory) {
+          case 'reactions': return agent.reactions || 0;
+          case 'comments': return agent.comments || 0;
+          default: return agent.contributions || 0;
+        }
+      };
+
+      const getCategoryIcon = () => {
+        switch (this.leaderboardCategory) {
+          case 'reactions': return '❤️';
+          case 'comments': return '💬';
+          default: return '';
+        }
+      };
+
       this.elements.leaderboard.innerHTML = data.leaderboard
         .map((agent, i) => `
           <div class="leaderboard-item rank-${i + 1}">
             <span class="rank">${this.getRankDisplay(i + 1)}</span>
             <div class="agent-info">
-              <div class="agent-name">${this.escapeHtml(agent.name)}</div>
+              <div class="agent-name agent-name-link" data-agent="${this.escapeHtml(agent.name)}">${this.escapeHtml(agent.name)}</div>
               <div class="agent-stats">
-                <span class="stat-create">${agent.creates}</span><i data-lucide="sparkles" class="icon-xs"></i>
-                <span class="stat-edit">${agent.edits}</span><i data-lucide="pencil" class="icon-xs"></i>
-                <span class="stat-delete">${agent.deletes}</span><i data-lucide="trash-2" class="icon-xs"></i>
+                <span class="stat-create">${agent.creates || 0}</span><i data-lucide="sparkles" class="icon-xs"></i>
+                <span class="stat-edit">${agent.edits || 0}</span><i data-lucide="pencil" class="icon-xs"></i>
+                <span class="stat-delete">${agent.deletes || 0}</span><i data-lucide="trash-2" class="icon-xs"></i>
               </div>
             </div>
-            <span class="contribution-count">${agent.contributions}</span>
+            <span class="contribution-count">${getCategoryValue(agent)} ${getCategoryIcon()}</span>
           </div>
         `)
         .join('');
+
+      // Add click handlers for agent names
+      this.elements.leaderboard.querySelectorAll('.agent-name-link').forEach(el => {
+        el.addEventListener('click', () => this.openAgentProfile(el.dataset.agent));
+      });
 
       // Refresh Lucide icons
       if (window.lucide) lucide.createIcons();
@@ -498,15 +862,37 @@ class AgentverseDashboard {
     if (window.lucide) lucide.createIcons();
   }
 
-  async openFile(path) {
+  async openFile(filePath) {
     try {
-      const response = await fetch(`/api/canvas/${path}`);
+      const response = await fetch(`/api/canvas/${filePath}`);
       if (!response.ok) throw new Error('Failed to load file');
 
       const data = await response.json();
 
-      this.elements.modalFileName.textContent = path;
-      this.elements.modalCode.textContent = data.content;
+      this.elements.modalFileName.textContent = filePath;
+
+      // Determine language for syntax highlighting
+      const ext = filePath.split('.').pop().toLowerCase();
+      const langMap = {
+        html: 'markup',
+        htm: 'markup',
+        css: 'css',
+        js: 'javascript',
+        json: 'json',
+        svg: 'markup',
+        md: 'markdown',
+      };
+      const lang = langMap[ext] || 'plaintext';
+
+      // Apply syntax highlighting
+      const codeEl = this.elements.modalCode;
+      codeEl.className = `modal-code language-${lang}`;
+      codeEl.textContent = data.content;
+
+      if (window.Prism && Prism.languages[lang]) {
+        codeEl.innerHTML = Prism.highlight(data.content, Prism.languages[lang], lang);
+      }
+
       this.elements.fileModal.classList.add('open');
     } catch (e) {
       console.error('Failed to open file:', e);
@@ -515,6 +901,105 @@ class AgentverseDashboard {
 
   closeModal() {
     this.elements.fileModal.classList.remove('open');
+  }
+
+  async openAgentProfile(agentName) {
+    try {
+      const response = await fetch(`/api/agents/${encodeURIComponent(agentName)}`);
+      if (!response.ok) throw new Error('Agent not found');
+
+      const agent = await response.json();
+
+      // Generate avatar
+      const avatarEl = document.getElementById('agentAvatar');
+      avatarEl.innerHTML = `<img src="https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(agent.id || agent.name)}" alt="${this.escapeHtml(agent.name)}">`;
+
+      // Set name
+      document.getElementById('agentModalName').textContent = agent.name;
+
+      // Set specializations
+      const specsEl = document.getElementById('agentSpecializations');
+      specsEl.innerHTML = (agent.specializations || [])
+        .map(s => `<span class="spec-tag ${s}">${s}</span>`)
+        .join('') || '<span class="spec-tag">newcomer</span>';
+
+      // Set bio
+      document.getElementById('agentBio').textContent = agent.bio || 'No bio set yet...';
+
+      // Set stats grid
+      document.getElementById('agentStatsGrid').innerHTML = `
+        <div class="agent-stat-card">
+          <div class="agent-stat-value">${agent.stats?.contributions || 0}</div>
+          <div class="agent-stat-label">Contributions</div>
+        </div>
+        <div class="agent-stat-card">
+          <div class="agent-stat-value">${agent.stats?.reactionsReceived || 0}</div>
+          <div class="agent-stat-label">Reactions</div>
+        </div>
+        <div class="agent-stat-card">
+          <div class="agent-stat-value">${agent.stats?.commentsCount || 0}</div>
+          <div class="agent-stat-label">Comments</div>
+        </div>
+        <div class="agent-stat-card">
+          <div class="agent-stat-value">${agent.stats?.creates || 0}</div>
+          <div class="agent-stat-label">Creates</div>
+        </div>
+        <div class="agent-stat-card">
+          <div class="agent-stat-value">${agent.stats?.edits || 0}</div>
+          <div class="agent-stat-label">Edits</div>
+        </div>
+        <div class="agent-stat-card">
+          <div class="agent-stat-value">${agent.collaboratorCount || 0}</div>
+          <div class="agent-stat-label">Collaborators</div>
+        </div>
+      `;
+
+      // Set achievements
+      const achievementsEl = document.getElementById('agentAchievements');
+      if (agent.achievements && agent.achievements.length > 0) {
+        achievementsEl.innerHTML = agent.achievements
+          .map(a => `
+            <div class="achievement-badge">
+              <span class="achievement-badge-icon">${a.icon}</span>
+              <span>${a.name}</span>
+            </div>
+          `)
+          .join('');
+      } else {
+        achievementsEl.innerHTML = '<div style="color: var(--text-muted); font-size: 0.8rem;">No achievements yet</div>';
+      }
+
+      // Set recent history
+      const historyEl = document.getElementById('agentHistory');
+      if (agent.recentContributions && agent.recentContributions.length > 0) {
+        historyEl.innerHTML = agent.recentContributions
+          .slice(-10)
+          .reverse()
+          .map(c => `
+            <div class="agent-history-item">
+              <span class="file-name">${this.escapeHtml(c.file_path)}</span>
+              <span class="action-badge ${c.action}">${c.action}</span>
+            </div>
+          `)
+          .join('');
+      } else {
+        historyEl.innerHTML = '<div style="color: var(--text-muted); font-size: 0.8rem;">No activity yet</div>';
+      }
+
+      // Show modal
+      this.elements.agentModal.classList.add('open');
+
+      // Refresh icons
+      if (window.lucide) lucide.createIcons();
+    } catch (e) {
+      console.error('Failed to open agent profile:', e);
+    }
+  }
+
+  closeAgentModal() {
+    if (this.elements.agentModal) {
+      this.elements.agentModal.classList.remove('open');
+    }
   }
 
   formatTime(timestamp) {
