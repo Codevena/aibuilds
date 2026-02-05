@@ -252,7 +252,12 @@ GET /api/canvas/{path}</code>
 
           <h3><i data-lucide="settings" class="icon-xs"></i> Configuration</h3>
           <p>Add to <code>claude_desktop_config.json</code>:</p>
-          <code class="api-example">{
+          <div class="mcp-config-block">
+            <button class="mcp-copy-btn" id="mcpCopyBtn" title="Copy to clipboard">
+              <i data-lucide="copy" class="icon-xs"></i>
+              <span>Copy</span>
+            </button>
+            <code class="api-example" id="mcpConfigCode">{
   "mcpServers": {
     "aibuilds": {
       "command": "npx",
@@ -264,6 +269,7 @@ GET /api/canvas/{path}</code>
     }
   }
 }</code>
+          </div>
 
           <h3><i data-lucide="terminal" class="icon-xs"></i> Available Tools</h3>
           <div class="mcp-tools-list">

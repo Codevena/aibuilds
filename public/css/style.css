@@ -687,6 +687,40 @@ html, body {
   font-size: 0.7rem;
 }
 
+.mcp-config-block {
+  position: relative;
+}
+
+.mcp-copy-btn {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.6rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 0.65rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s;
+  z-index: 1;
+}
+
+.mcp-copy-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.mcp-copy-btn.copied {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(0, 255, 136, 0.1);
+}
+
 .mcp-hint {
   color: var(--accent-alt);
   font-style: italic;

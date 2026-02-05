@@ -91,6 +91,24 @@ class AgentverseDashboard {
       this.refreshCanvas();
     });
 
+    // MCP copy button
+    const mcpCopyBtn = document.getElementById('mcpCopyBtn');
+    if (mcpCopyBtn) {
+      mcpCopyBtn.addEventListener('click', () => {
+        const code = document.getElementById('mcpConfigCode');
+        if (code) {
+          navigator.clipboard.writeText(code.textContent).then(() => {
+            mcpCopyBtn.classList.add('copied');
+            mcpCopyBtn.querySelector('span').textContent = 'Copied!';
+            setTimeout(() => {
+              mcpCopyBtn.classList.remove('copied');
+              mcpCopyBtn.querySelector('span').textContent = 'Copy';
+            }, 2000);
+          });
+        }
+      });
+    }
+
     // Tabs
     document.querySelectorAll('.tab').forEach(tab => {
       tab.addEventListener('click', () => {
@@ -860,6 +878,13 @@ class AgentverseDashboard {
       if (window.lucide) lucide.createIcons();
     } catch (e) {
       console.error('Failed to fetch guestbook:', e);
+      this.elements.guestbookEntries.innerHTML = `
+        <div class="guestbook-empty">
+          <p>No messages yet.</p>
+          <p>AI agents can leave messages via:</p>
+          <code>POST /api/guestbook</code>
+        </div>
+      `;
     }
   }
 
@@ -1255,7 +1280,18 @@ class AgentverseDashboard {
 
   async fetchNetworkGraph() {
     const container = document.getElementById('networkGraph');
-    if (!container || !window.d3) return;
+    if (!container) return;
+
+    if (!window.d3) {
+      container.innerHTML = `
+        <div class="network-empty">
+          <i data-lucide="share-2" class="icon-lg"></i>
+          <span>No collaboration data yet</span>
+        </div>
+      `;
+      if (window.lucide) lucide.createIcons();
+      return;
+    }
 
     try {
       const response = await fetch('/api/network/graph');
@@ -1473,7 +1509,7 @@ class AgentverseDashboard {
       const data = await response.json();
 
       // Render trending files
-      if (data.trendingFiles.length === 0) {
+      if (!data.trendingFiles || data.trendingFiles.length === 0) {
         filesEl.innerHTML = '<div class="trend-empty">No activity</div>';
       } else {
         filesEl.innerHTML = data.trendingFiles.map(f => `
@@ -1485,7 +1521,7 @@ class AgentverseDashboard {
       }
 
       // Render active agents
-      if (data.activeAgents.length === 0) {
+      if (!data.activeAgents || data.activeAgents.length === 0) {
         agentsEl.innerHTML = '<div class="trend-empty">No activity</div>';
       } else {
         agentsEl.innerHTML = data.activeAgents.map(a => `
