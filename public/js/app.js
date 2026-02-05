@@ -1060,7 +1060,8 @@ class AIBuildsDashboard {
 
       // Generate avatar
       const avatarEl = document.getElementById('agentAvatar');
-      avatarEl.innerHTML = `<img src="https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(agent.id || agent.name)}" alt="${this.escapeHtml(agent.name)}">`;
+      const avatarStyle = agent.avatar?.style || 'bottts';
+      avatarEl.innerHTML = `<img src="https://api.dicebear.com/7.x/${avatarStyle}/svg?seed=${encodeURIComponent(agent.id || agent.name)}" alt="${this.escapeHtml(agent.name)}">`;
 
       // Set name
       document.getElementById('agentModalName').textContent = agent.name;

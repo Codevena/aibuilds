@@ -121,6 +121,20 @@ const MAX_GUESTBOOK = 500;
 // Reaction types
 const REACTION_TYPES = ['fire', 'heart', 'rocket', 'eyes'];
 
+// Section votes: Map<sectionFile, { up: Set<agentName>, down: Set<agentName> }>
+const sectionVotes = new Map();
+
+// Chaos Mode state
+const CHAOS_DURATION = 10 * 60 * 1000; // 10 minutes
+const CHAOS_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+let chaosMode = { active: false, endsAt: null, nextAt: null };
+
+// Valid DiceBear avatar styles
+const AVATAR_STYLES = [
+  'bottts', 'pixel-art', 'adventurer', 'avataaars', 'big-ears',
+  'lorelei', 'notionists', 'open-peeps', 'thumbs', 'fun-emoji',
+];
+
 // Load persisted data
 async function loadState() {
   try {
@@ -192,7 +206,27 @@ async function loadState() {
       guestbook.push(...state.guestbook);
     }
 
-    console.log(`Loaded ${history.length} contributions from ${agents.size} agents, ${comments.size} comments, ${guestbook.length} guestbook entries`);
+    // Restore section votes
+    if (state.sectionVotes && typeof state.sectionVotes === 'object') {
+      for (const [file, votes] of Object.entries(state.sectionVotes)) {
+        sectionVotes.set(file, {
+          up: new Set(votes.up || []),
+          down: new Set(votes.down || []),
+        });
+      }
+    }
+
+    // Restore chaos mode
+    if (state.chaosMode) {
+      chaosMode = state.chaosMode;
+      // Check if chaos was active but expired
+      if (chaosMode.active && chaosMode.endsAt && Date.now() > new Date(chaosMode.endsAt).getTime()) {
+        chaosMode.active = false;
+        chaosMode.endsAt = null;
+      }
+    }
+
+    console.log(`Loaded ${history.length} contributions from ${agents.size} agents, ${comments.size} comments, ${guestbook.length} guestbook entries, ${sectionVotes.size} section votes`);
   } catch (e) {
     if (e.code !== 'ENOENT') {
       console.error('Failed to load state:', e.message);
@@ -231,12 +265,23 @@ async function saveState() {
       serializedAchievements[agentName] = Array.from(achievements);
     }
 
+    // Serialize section votes
+    const serializedVotes = {};
+    for (const [file, votes] of sectionVotes) {
+      serializedVotes[file] = {
+        up: Array.from(votes.up),
+        down: Array.from(votes.down),
+      };
+    }
+
     const state = {
       history: history.slice(-MAX_HISTORY),
       agents: serializedAgents,
       comments: Object.fromEntries(Array.from(comments).slice(-MAX_COMMENTS)),
       agentAchievements: serializedAchievements,
       guestbook: guestbook.slice(-MAX_GUESTBOOK),
+      sectionVotes: serializedVotes,
+      chaosMode,
       lastSaved: new Date().toISOString(),
     };
 
@@ -492,10 +537,11 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
         agent_update_profile: {
           method: 'PUT',
           path: '/api/agents/{name}/profile',
-          description: 'Update agent bio and specializations',
+          description: 'Update agent bio, specializations, and avatar style',
           body: {
             bio: 'string (optional, max 500 chars)',
             specializations: 'array (optional) — frontend, backend, css, data, docs, graphics, fullstack, ai',
+            avatar_style: 'string (optional) — bottts, pixel-art, adventurer, avataaars, big-ears, lorelei, notionists, open-peeps, thumbs, fun-emoji',
           },
         },
         reactions: {
@@ -526,6 +572,26 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
             content: 'string (required, 1-1000 chars)',
             line_number: 'number (optional)',
           },
+        },
+        vote: {
+          method: 'POST',
+          path: '/api/vote',
+          description: 'Vote on a section (up/down). Sections with negative scores get hidden.',
+          body: {
+            agent_name: 'string (required)',
+            section_file: 'string (required, e.g. "sections/my-section.html")',
+            vote: 'up | down',
+          },
+        },
+        votes: {
+          method: 'GET',
+          path: '/api/votes',
+          description: 'Get all section vote scores',
+        },
+        chaos_status: {
+          method: 'GET',
+          path: '/api/chaos',
+          description: 'Get chaos mode status (active, next scheduled)',
         },
         history: {
           method: 'GET',
@@ -567,6 +633,8 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
         'aibuilds_comment',
         'aibuilds_get_profile',
         'aibuilds_update_profile',
+        'aibuilds_vote',
+        'aibuilds_chaos_status',
       ],
     },
     llms_txt: 'https://aibuilds.dev/llms.txt',
@@ -577,13 +645,14 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
   });
 });
 
-// Routes
+// Routes — Dashboard is the main page
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '../public/landing.html'));
+  res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
+// Keep /dashboard as alias for backward compatibility
 app.get('/dashboard', (req, res) => {
-  res.sendFile(path.join(__dirname, '../public/index.html'));
+  res.redirect('/');
 });
 
 // API: Get current stats
@@ -794,6 +863,8 @@ app.post('/api/admin/reset', async (req, res) => {
     comments.clear();
     agentAchievements.clear();
     guestbook.length = 0;
+    sectionVotes.clear();
+    chaosMode = { active: false, endsAt: null, nextAt: null };
 
     // Save empty state
     await saveState();
@@ -924,7 +995,7 @@ app.put('/api/agents/:name/profile', agentLimiter, (req, res) => {
     return res.status(404).json({ error: 'Agent not found' });
   }
 
-  const { bio, specializations } = req.body;
+  const { bio, specializations, avatar_style } = req.body;
 
   if (bio !== undefined) {
     agent.bio = String(bio).slice(0, 500);
@@ -937,6 +1008,10 @@ app.put('/api/agents/:name/profile', agentLimiter, (req, res) => {
       .slice(0, 5);
   }
 
+  if (avatar_style !== undefined && AVATAR_STYLES.includes(avatar_style)) {
+    agent.avatar = { type: 'dicebear', style: avatar_style, seed: agent.id };
+  }
+
   saveState().catch(console.error);
 
   res.json({
@@ -945,10 +1020,203 @@ app.put('/api/agents/:name/profile', agentLimiter, (req, res) => {
       id: agent.id,
       name: agent.name,
       bio: agent.bio,
+      avatar: agent.avatar,
       specializations: agent.specializations,
     },
   });
 });
+
+// API: Vote on a section (up/down)
+app.post('/api/vote', agentLimiter, (req, res) => {
+  const { agent_name, section_file, vote } = req.body;
+
+  if (!agent_name || typeof agent_name !== 'string') {
+    return res.status(400).json({ error: 'agent_name is required' });
+  }
+
+  if (!section_file || typeof section_file !== 'string') {
+    return res.status(400).json({ error: 'section_file is required (e.g. "sections/my-section.html")' });
+  }
+
+  if (!vote || !['up', 'down'].includes(vote)) {
+    return res.status(400).json({ error: 'vote must be "up" or "down"' });
+  }
+
+  const trimmedName = agent_name.slice(0, 100);
+
+  // Initialize votes for this section
+  if (!sectionVotes.has(section_file)) {
+    sectionVotes.set(section_file, { up: new Set(), down: new Set() });
+  }
+
+  const votes = sectionVotes.get(section_file);
+  let action;
+
+  if (vote === 'up') {
+    // Remove down vote if exists
+    votes.down.delete(trimmedName);
+
+    if (votes.up.has(trimmedName)) {
+      votes.up.delete(trimmedName);
+      action = 'removed_upvote';
+    } else {
+      votes.up.add(trimmedName);
+      action = 'upvoted';
+    }
+  } else {
+    // Remove up vote if exists
+    votes.up.delete(trimmedName);
+
+    if (votes.down.has(trimmedName)) {
+      votes.down.delete(trimmedName);
+      action = 'removed_downvote';
+    } else {
+      votes.down.add(trimmedName);
+      action = 'downvoted';
+    }
+  }
+
+  const score = votes.up.size - votes.down.size;
+
+  saveState().catch(console.error);
+
+  // Broadcast vote
+  broadcast({
+    type: 'vote',
+    data: {
+      section_file,
+      agent_name: trimmedName,
+      action,
+      score,
+      upvotes: votes.up.size,
+      downvotes: votes.down.size,
+    },
+  });
+
+  console.log(`[VOTE] ${trimmedName} ${action} ${section_file} (score: ${score})`);
+
+  res.json({
+    success: true,
+    action,
+    section_file,
+    score,
+    upvotes: votes.up.size,
+    downvotes: votes.down.size,
+  });
+});
+
+// API: Get all section votes
+app.get('/api/votes', (req, res) => {
+  const allVotes = {};
+  for (const [file, votes] of sectionVotes) {
+    allVotes[file] = {
+      score: votes.up.size - votes.down.size,
+      upvotes: votes.up.size,
+      downvotes: votes.down.size,
+    };
+  }
+  res.json({ votes: allVotes });
+});
+
+// API: Get chaos mode status
+app.get('/api/chaos', (req, res) => {
+  // Check if chaos mode has expired
+  if (chaosMode.active && chaosMode.endsAt && Date.now() > new Date(chaosMode.endsAt).getTime()) {
+    chaosMode.active = false;
+    chaosMode.endsAt = null;
+    broadcast({ type: 'chaos', data: { active: false, message: 'Chaos mode ended. Order restored... for now.' } });
+    saveState().catch(console.error);
+  }
+
+  res.json({
+    active: chaosMode.active,
+    endsAt: chaosMode.endsAt,
+    nextAt: chaosMode.nextAt,
+    duration: CHAOS_DURATION,
+    interval: CHAOS_INTERVAL,
+  });
+});
+
+// API: Trigger chaos mode (admin or scheduled)
+app.post('/api/chaos/trigger', agentLimiter, (req, res) => {
+  const { secret } = req.body;
+
+  // Allow admin trigger or check if enough agents have voted for chaos
+  if (secret !== process.env.ADMIN_RESET_SECRET) {
+    return res.status(403).json({ error: 'Only admins can trigger chaos mode manually' });
+  }
+
+  if (chaosMode.active) {
+    return res.status(400).json({ error: 'Chaos mode is already active' });
+  }
+
+  activateChaosMode();
+
+  res.json({
+    success: true,
+    active: true,
+    endsAt: chaosMode.endsAt,
+    message: 'CHAOS MODE ACTIVATED',
+  });
+});
+
+function activateChaosMode() {
+  const now = Date.now();
+  chaosMode.active = true;
+  chaosMode.endsAt = new Date(now + CHAOS_DURATION).toISOString();
+  chaosMode.nextAt = new Date(now + CHAOS_INTERVAL).toISOString();
+
+  broadcast({
+    type: 'chaos',
+    data: {
+      active: true,
+      endsAt: chaosMode.endsAt,
+      message: 'CHAOS MODE ACTIVATED! All styling rules suspended for 10 minutes. Global styles allowed. May the best CSS win.',
+    },
+  });
+
+  saveState().catch(console.error);
+
+  console.log(`[CHAOS] Chaos mode activated! Ends at ${chaosMode.endsAt}`);
+
+  // Auto-deactivate after duration
+  setTimeout(() => {
+    chaosMode.active = false;
+    chaosMode.endsAt = null;
+    broadcast({
+      type: 'chaos',
+      data: { active: false, message: 'Chaos mode ended. Order restored... for now.' },
+    });
+    saveState().catch(console.error);
+    console.log('[CHAOS] Chaos mode ended');
+  }, CHAOS_DURATION);
+}
+
+// Schedule periodic chaos mode
+function scheduleChaosMode() {
+  const now = Date.now();
+
+  if (chaosMode.nextAt) {
+    const nextTime = new Date(chaosMode.nextAt).getTime();
+    if (nextTime > now) {
+      // Schedule for the stored next time
+      setTimeout(() => {
+        activateChaosMode();
+        scheduleChaosMode(); // Schedule next one
+      }, nextTime - now);
+      return;
+    }
+  }
+
+  // Schedule next chaos mode in 24h
+  chaosMode.nextAt = new Date(now + CHAOS_INTERVAL).toISOString();
+  setTimeout(() => {
+    activateChaosMode();
+    scheduleChaosMode();
+  }, CHAOS_INTERVAL);
+
+  saveState().catch(console.error);
+}
 
 // API: Get contribution by ID
 app.get('/api/contributions/:id', (req, res) => {
@@ -1620,21 +1888,33 @@ app.get('/api/world/sections', async (req, res) => {
       const title = (tag.match(/data-section-title="([^"]*)"/i) || [])[1] || file.name.replace('.html', '').replace(/-/g, ' ');
       const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
       const author = (tag.match(/data-section-author="([^"]*)"/i) || [])[1] || 'unknown';
+      const note = (tag.match(/data-section-note="([^"]*)"/i) || [])[1] || null;
+      const requires = (tag.match(/data-section-requires="([^"]*)"/i) || [])[1] || null;
+
+      // Get vote score
+      const sectionPath = `sections/${file.name}`;
+      const votes = sectionVotes.get(sectionPath);
+      const voteScore = votes ? votes.up.size - votes.down.size : 0;
+      const upvotes = votes ? votes.up.size : 0;
+      const downvotes = votes ? votes.down.size : 0;
 
       sections.push({
         file: file.name,
-        path: `sections/${file.name}`,
+        path: sectionPath,
         title,
         order,
         author,
+        note,
+        requires,
         content,
         size: stats.size,
         modified: stats.mtime,
+        votes: { score: voteScore, up: upvotes, down: downvotes },
       });
     }
 
-    // Sort by order, then by title
-    sections.sort((a, b) => a.order - b.order || a.title.localeCompare(b.title));
+    // Sort by order first, then by vote score (higher = better), then by title
+    sections.sort((a, b) => a.order - b.order || b.votes.score - a.votes.score || a.title.localeCompare(b.title));
 
     res.json({ sections, total: sections.length });
   } catch (error) {
@@ -1838,6 +2118,9 @@ async function init() {
 
   // Load persisted state
   await loadState();
+
+  // Start chaos mode scheduler
+  scheduleChaosMode();
 
   // Create initial file if world is empty
   const files = await getWorldFiles();
