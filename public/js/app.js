@@ -226,9 +226,9 @@ class AgentverseDashboard {
     }
 
     const actionIcons = {
-      create: '✨',
-      edit: '✏️',
-      delete: '🗑️',
+      create: '<i data-lucide="sparkles"></i>',
+      edit: '<i data-lucide="pencil"></i>',
+      delete: '<i data-lucide="trash-2"></i>',
     };
 
     const feedItem = document.createElement('div');
@@ -261,6 +261,11 @@ class AgentverseDashboard {
       }
     } else {
       this.elements.feed.appendChild(feedItem);
+    }
+
+    // Refresh Lucide icons
+    if (window.lucide) {
+      lucide.createIcons();
     }
 
     // Auto-scroll
@@ -345,22 +350,27 @@ class AgentverseDashboard {
             <div class="agent-info">
               <div class="agent-name">${this.escapeHtml(agent.name)}</div>
               <div class="agent-stats">
-                ${agent.creates}✨ ${agent.edits}✏️ ${agent.deletes}🗑️
+                <span class="stat-create">${agent.creates}</span><i data-lucide="sparkles" class="icon-xs"></i>
+                <span class="stat-edit">${agent.edits}</span><i data-lucide="pencil" class="icon-xs"></i>
+                <span class="stat-delete">${agent.deletes}</span><i data-lucide="trash-2" class="icon-xs"></i>
               </div>
             </div>
             <span class="contribution-count">${agent.contributions}</span>
           </div>
         `)
         .join('');
+
+      // Refresh Lucide icons
+      if (window.lucide) lucide.createIcons();
     } catch (e) {
       console.error('Failed to fetch leaderboard:', e);
     }
   }
 
   getRankDisplay(rank) {
-    if (rank === 1) return '🥇';
-    if (rank === 2) return '🥈';
-    if (rank === 3) return '🥉';
+    if (rank === 1) return '<i data-lucide="crown" class="rank-gold"></i>';
+    if (rank === 2) return '<i data-lucide="medal" class="rank-silver"></i>';
+    if (rank === 3) return '<i data-lucide="award" class="rank-bronze"></i>';
     return rank;
   }
 
@@ -392,6 +402,9 @@ class AgentverseDashboard {
           this.openFile(item.dataset.path);
         });
       });
+
+      // Refresh Lucide icons
+      if (window.lucide) lucide.createIcons();
     } catch (e) {
       console.error('Failed to fetch files:', e);
     }
@@ -400,15 +413,15 @@ class AgentverseDashboard {
   getFileIcon(path) {
     const ext = path.split('.').pop().toLowerCase();
     const icons = {
-      html: '📄',
-      css: '🎨',
-      js: '⚡',
-      json: '📋',
-      svg: '🖼️',
-      md: '📝',
-      txt: '📃',
+      html: 'file-code',
+      css: 'palette',
+      js: 'file-json',
+      json: 'braces',
+      svg: 'image',
+      md: 'file-text',
+      txt: 'file',
     };
-    return icons[ext] || '📁';
+    return `<i data-lucide="${icons[ext] || 'file'}" class="icon-sm"></i>`;
   }
 
   async openFile(path) {

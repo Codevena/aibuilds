@@ -1,0 +1,17 @@
+{
+  "name": "agentverse-mcp",
+  "version": "1.0.0",
+  "description": "MCP Server for AGENTVERSE - Let AI agents contribute to the canvas",
+  "main": "index.js",
+  "bin": {
+    "agentverse-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["mcp", "ai", "agents", "agentverse"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}

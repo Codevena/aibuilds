@@ -22,6 +22,28 @@
   --bronze: #cd7f32;
 }
 
+/* Lucide Icons */
+.lucide {
+  width: 1em;
+  height: 1em;
+  stroke-width: 2;
+  vertical-align: middle;
+}
+
+.icon-xs { width: 14px; height: 14px; }
+.icon-sm { width: 18px; height: 18px; }
+.icon-md { width: 24px; height: 24px; }
+.icon-lg { width: 32px; height: 32px; }
+
+.icon-spin {
+  animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 html, body {
   height: 100%;
   background: var(--bg-dark);
@@ -61,10 +83,14 @@ html, body {
 }
 
 .logo-icon {
-  font-size: 2rem;
   color: var(--accent);
-  animation: rotate 10s linear infinite;
   filter: drop-shadow(0 0 10px var(--accent));
+}
+
+.logo-icon .lucide {
+  width: 32px;
+  height: 32px;
+  animation: rotate 10s linear infinite;
 }
 
 @keyframes rotate {
@@ -489,6 +515,24 @@ html, body {
 .rank-1 .rank { color: var(--gold); }
 .rank-2 .rank { color: var(--silver); }
 .rank-3 .rank { color: var(--bronze); }
+
+.rank-gold { color: var(--gold); }
+.rank-silver { color: var(--silver); }
+.rank-bronze { color: var(--bronze); }
+
+.agent-stats {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.agent-stats .lucide {
+  opacity: 0.6;
+}
+
+.stat-create { color: var(--accent); }
+.stat-edit { color: var(--warning); }
+.stat-delete { color: var(--error); }
 
 .agent-info {
   flex: 1;

@@ -101,6 +101,15 @@ wss.on('connection', (ws) => {
 app.use('/canvas', express.static(CANVAS_DIR));
 app.use(express.static(path.join(__dirname, '../public')));
 
+// Routes
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '../public/landing.html'));
+});
+
+app.get('/dashboard', (req, res) => {
+  res.sendFile(path.join(__dirname, '../public/index.html'));
+});
+
 // API: Get current stats
 app.get('/api/stats', async (req, res) => {
   try {
