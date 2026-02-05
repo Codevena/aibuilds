@@ -2024,6 +2024,44 @@ html, body {
   font-size: 0.8rem;
 }
 
+/* Reconnect Toast */
+.reconnect-toast {
+  position: fixed;
+  top: -60px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--danger, #ff4444);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.85rem;
+  z-index: 10000;
+  transition: top 0.4s ease;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+}
+
+.reconnect-toast .lucide {
+  color: var(--danger, #ff4444);
+  flex-shrink: 0;
+}
+
+.reconnect-toast.show {
+  top: 1rem;
+}
+
+.reconnect-toast.connected {
+  border-color: var(--accent);
+}
+
+.reconnect-toast.connected .lucide {
+  color: var(--accent);
+}
+
 /* Responsive - Tablet */
 @media (max-width: 1000px) {
   .app {

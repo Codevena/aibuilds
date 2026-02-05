@@ -42,6 +42,8 @@ class AgentverseDashboard {
       diffModal: document.getElementById('diffModal'),
       diffModalClose: document.getElementById('diffModalClose'),
       diffView: document.getElementById('diffView'),
+      reconnectToast: document.getElementById('reconnectToast'),
+      reconnectMessage: document.getElementById('reconnectMessage'),
     };
 
     // Audio context for notification sounds
@@ -114,12 +116,24 @@ class AgentverseDashboard {
     });
 
     // Tabs
-    document.querySelectorAll('.tab').forEach(tab => {
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-        tab.classList.add('active');
-        document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+    const tabs = document.querySelectorAll('.tab');
+    const switchTab = (tab) => {
+      tabs.forEach(t => {
+        t.classList.remove('active');
+        t.setAttribute('aria-selected', 'false');
+      });
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      tab.classList.add('active');
+      tab.setAttribute('aria-selected', 'true');
+      document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+    };
+    tabs.forEach((tab, i) => {
+      tab.addEventListener('click', () => switchTab(tab));
+      tab.addEventListener('keydown', (e) => {
+        let target;
+        if (e.key === 'ArrowRight') target = tabs[(i + 1) % tabs.length];
+        else if (e.key === 'ArrowLeft') target = tabs[(i - 1 + tabs.length) % tabs.length];
+        if (target) { e.preventDefault(); target.focus(); switchTab(target); }
       });
     });
 
@@ -301,8 +315,25 @@ class AgentverseDashboard {
 
     this.ws.onopen = () => {
       console.log('Connected to AGENTVERSE');
+      const wasReconnect = this.reconnectAttempts > 0;
       this.reconnectAttempts = 0;
       this.updateConnectionStatus('connected');
+      if (wasReconnect && this.elements.reconnectToast && this.elements.reconnectMessage) {
+        this.elements.reconnectMessage.textContent = 'Reconnected!';
+        this.elements.reconnectToast.classList.add('connected', 'show');
+        const icon = this.elements.reconnectToast.querySelector('[data-lucide]');
+        if (icon) {
+          icon.setAttribute('data-lucide', 'wifi');
+          if (window.lucide) lucide.createIcons();
+        }
+        setTimeout(() => {
+          this.elements.reconnectToast.classList.remove('show', 'connected');
+          if (icon) {
+            icon.setAttribute('data-lucide', 'wifi-off');
+            if (window.lucide) lucide.createIcons();
+          }
+        }, 3000);
+      }
     };
 
     this.ws.onclose = () => {
@@ -335,17 +366,26 @@ class AgentverseDashboard {
   }
 
   updateConnectionStatus(status) {
-    const { statusDot, connectionStatus } = this.elements;
+    const { statusDot, connectionStatus, reconnectToast, reconnectMessage } = this.elements;
     statusDot.className = 'status-dot';
 
     switch (status) {
       case 'connected':
         statusDot.classList.add('connected');
         connectionStatus.textContent = 'Live';
+        if (reconnectToast) {
+          reconnectToast.classList.remove('show');
+          reconnectToast.classList.remove('connected');
+        }
         break;
       case 'disconnected':
         statusDot.classList.add('disconnected');
         connectionStatus.textContent = 'Reconnecting...';
+        if (reconnectToast && reconnectMessage) {
+          reconnectMessage.textContent = `Connection lost. Reconnecting (${this.reconnectAttempts + 1}/${this.maxReconnectAttempts})...`;
+          reconnectToast.classList.remove('connected');
+          reconnectToast.classList.add('show');
+        }
         break;
       default:
         connectionStatus.textContent = 'Connecting...';
@@ -965,6 +1005,8 @@ class AgentverseDashboard {
       }
 
       this.elements.fileModal.classList.add('open');
+      this._lastFocused = document.activeElement;
+      this.elements.modalClose?.focus();
 
       // Load file comments
       this.loadFileComments(filePath);
@@ -1119,6 +1161,7 @@ class AgentverseDashboard {
 
   closeModal() {
     this.elements.fileModal.classList.remove('open');
+    if (this._lastFocused) this._lastFocused.focus();
   }
 
   async openAgentProfile(agentName) {
@@ -1206,6 +1249,8 @@ class AgentverseDashboard {
 
       // Show modal
       this.elements.agentModal.classList.add('open');
+      this._lastFocused = document.activeElement;
+      this.elements.agentModalClose?.focus();
 
       // Refresh icons
       if (window.lucide) lucide.createIcons();
@@ -1217,6 +1262,7 @@ class AgentverseDashboard {
   closeAgentModal() {
     if (this.elements.agentModal) {
       this.elements.agentModal.classList.remove('open');
+      if (this._lastFocused) this._lastFocused.focus();
     }
   }
 
@@ -1280,6 +1326,7 @@ class AgentverseDashboard {
   closeDiffModal() {
     if (this.elements.diffModal) {
       this.elements.diffModal.classList.remove('open');
+      if (this._lastFocused) this._lastFocused.focus();
     }
   }
 
