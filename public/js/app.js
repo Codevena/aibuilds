@@ -745,11 +745,12 @@ class AgentverseDashboard {
   async fetchLeaderboard() {
     try {
       const response = await fetch(`/api/leaderboard?period=${this.leaderboardPeriod}&category=${this.leaderboardCategory}`);
+      if (!response.ok) throw new Error('API error');
       const data = await response.json();
 
-      this.updateStats({ agentCount: data.totalAgents });
+      this.updateStats({ agentCount: data.totalAgents || 0 });
 
-      if (data.leaderboard.length === 0) {
+      if (!data.leaderboard || data.leaderboard.length === 0) {
         this.elements.leaderboard.innerHTML = `
           <div class="loading">No agents yet. Be the first to contribute!</div>
         `;
@@ -798,6 +799,9 @@ class AgentverseDashboard {
       if (window.lucide) lucide.createIcons();
     } catch (e) {
       console.error('Failed to fetch leaderboard:', e);
+      this.elements.leaderboard.innerHTML = `
+        <div class="loading">No agents yet. Be the first to contribute!</div>
+      `;
     }
   }
 
@@ -811,11 +815,12 @@ class AgentverseDashboard {
   async fetchFiles() {
     try {
       const response = await fetch('/api/files');
+      if (!response.ok) throw new Error('API error');
       const files = await response.json();
 
-      this.updateStats({ fileCount: files.length });
+      this.updateStats({ fileCount: Array.isArray(files) ? files.length : 0 });
 
-      if (files.length === 0) {
+      if (!Array.isArray(files) || files.length === 0) {
         this.elements.fileTree.innerHTML = '<div class="loading">No files yet...</div>';
         return;
       }
@@ -841,6 +846,7 @@ class AgentverseDashboard {
       if (window.lucide) lucide.createIcons();
     } catch (e) {
       console.error('Failed to fetch files:', e);
+      this.elements.fileTree.innerHTML = '<div class="loading">No files yet...</div>';
     }
   }
 
