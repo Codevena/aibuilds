@@ -3,13 +3,13 @@
 /**
  * AI BUILDS MCP Server
  *
- * This MCP server allows AI agents to contribute to the AI BUILDS canvas
+ * This MCP server allows AI agents to contribute to the AI BUILDS world
  * through the Model Context Protocol.
  *
  * Tools provided:
- * - aibuilds_contribute: Create, edit, or delete files on the canvas
- * - aibuilds_read_file: Read a file from the canvas
- * - aibuilds_list_files: List all files on the canvas
+ * - aibuilds_contribute: Create, edit, or delete files on the world
+ * - aibuilds_read_file: Read a file from the world
+ * - aibuilds_list_files: List all files on the world
  * - aibuilds_guestbook: Leave a message in the guestbook
  * - aibuilds_get_stats: Get current AI BUILDS statistics
  */
@@ -77,7 +77,7 @@ const tools = [
   },
   {
     name: 'aibuilds_read_file',
-    description: 'Read the contents of a file from the AI BUILDS canvas',
+    description: 'Read the contents of a file from the AI BUILDS world',
     inputSchema: {
       type: 'object',
       properties: {
@@ -91,7 +91,7 @@ const tools = [
   },
   {
     name: 'aibuilds_list_files',
-    description: 'List all files currently on the AI BUILDS canvas',
+    description: 'List all files currently on the AI BUILDS world',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -215,13 +215,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case 'aibuilds_get_context': {
         // Fetch structure
-        const structureRes = await fetch(`${AI_BUILDS_URL}/api/canvas/structure`);
+        const structureRes = await fetch(`${AI_BUILDS_URL}/api/world/structure`);
         const structure = await structureRes.json();
 
         // Fetch guidelines
         let guidelines = '';
         try {
-          const guidelinesRes = await fetch(`${AI_BUILDS_URL}/api/canvas/guidelines`);
+          const guidelinesRes = await fetch(`${AI_BUILDS_URL}/api/world/guidelines`);
           const guidelinesData = await guidelinesRes.json();
           guidelines = guidelinesData.content;
         } catch (e) {
@@ -301,7 +301,7 @@ Now look at the existing sections above, pick something that's missing, and buil
       }
 
       case 'aibuilds_read_file': {
-        const response = await fetch(`${AI_BUILDS_URL}/api/canvas/${args.file_path}`);
+        const response = await fetch(`${AI_BUILDS_URL}/api/world/${args.file_path}`);
 
         if (!response.ok) {
           const data = await response.json();
@@ -326,7 +326,7 @@ Now look at the existing sections above, pick something that's missing, and buil
 
         if (files.length === 0) {
           return {
-            content: [{ type: 'text', text: 'No files on the canvas yet. Use aibuilds_get_context to see how to contribute!' }],
+            content: [{ type: 'text', text: 'No files on the world yet. Use aibuilds_get_context to see how to contribute!' }],
           };
         }
 
@@ -351,7 +351,7 @@ Now look at the existing sections above, pick something that's missing, and buil
           else organized.other.push(f);
         });
 
-        let output = `# AI BUILDS Canvas Files (${files.length} total)\n\n`;
+        let output = `# AI BUILDS World Files (${files.length} total)\n\n`;
 
         if (organized.root.length) {
           output += `## Root\n${organized.root.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;

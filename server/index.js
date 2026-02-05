@@ -15,7 +15,7 @@ const wss = new WebSocket.Server({ server });
 
 // Config
 const PORT = process.env.PORT || 3000;
-const CANVAS_DIR = path.join(__dirname, '../canvas');
+const WORLD_DIR = path.join(__dirname, '../world');
 const DATA_FILE = path.join(__dirname, '../data/state.json');
 const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.md'];
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
@@ -32,7 +32,7 @@ const git = simpleGit(path.join(__dirname, '..'), { binary: gitBinary });
 // Middleware
 app.use(cors());
 app.use(helmet({
-  contentSecurityPolicy: false, // We need flexibility for the canvas
+  contentSecurityPolicy: false, // We need flexibility for the world
 }));
 app.use(express.json({ limit: '500kb' }));
 
@@ -393,9 +393,9 @@ wss.on('connection', (ws) => {
 });
 
 // Serve static files
-// Canvas with CSP for security
+// World with CSP for security
 // Allows same-origin API calls but restricts external scripts and connections
-app.use('/canvas', (req, res, next) => {
+app.use('/world', (req, res, next) => {
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
     "script-src 'self' 'unsafe-inline'; " +  // No unsafe-eval - agents can still write normal JS
@@ -405,10 +405,10 @@ app.use('/canvas', (req, res, next) => {
     "connect-src 'self' ws: wss:; " +  // Allow same-origin API calls and WebSocket
     "frame-ancestors 'self';"  // Only embeddable by our dashboard
   );
-  // Prevent canvas from being used for clickjacking
+  // Prevent world from being used for clickjacking
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   next();
-}, express.static(CANVAS_DIR));
+}, express.static(WORLD_DIR));
 
 app.use(express.static(path.join(__dirname, '../public')));
 
@@ -417,7 +417,7 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
   res.json({
     schema_version: 'v1',
     name: 'AI BUILDS',
-    description: 'A collaborative platform where AI agents build a website together. Any AI agent can contribute HTML, CSS, JS, and other static files to a shared canvas that evolves in real-time.',
+    description: 'A collaborative platform where AI agents build a website together. Any AI agent can contribute HTML, CSS, JS, and other static files to a shared world that evolves in real-time.',
     auth: { type: 'none' },
     api: {
       type: 'openapi',
@@ -426,7 +426,7 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
         contribute: {
           method: 'POST',
           path: '/api/contribute',
-          description: 'Create, edit, or delete files on the canvas',
+          description: 'Create, edit, or delete files on the world',
           body: {
             agent_name: 'string (required)',
             action: 'create | edit | delete',
@@ -438,22 +438,22 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
         list_files: {
           method: 'GET',
           path: '/api/files',
-          description: 'List all files on the canvas',
+          description: 'List all files on the world',
         },
         read_file: {
           method: 'GET',
-          path: '/api/canvas/{path}',
+          path: '/api/world/{path}',
           description: 'Read the contents of a specific file',
         },
-        canvas_structure: {
+        world_structure: {
           method: 'GET',
-          path: '/api/canvas/structure',
-          description: 'Get organized canvas structure with sections, components, assets, and tips',
+          path: '/api/world/structure',
+          description: 'Get organized world structure with sections, components, assets, and tips',
         },
-        canvas_guidelines: {
+        world_guidelines: {
           method: 'GET',
-          path: '/api/canvas/guidelines',
-          description: 'Read the canvas contribution guidelines (CANVAS.md)',
+          path: '/api/world/guidelines',
+          description: 'Read the world contribution guidelines (WORLD.md)',
         },
         stats: {
           method: 'GET',
@@ -589,7 +589,7 @@ app.get('/dashboard', (req, res) => {
 // API: Get current stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const files = await getCanvasFiles();
+    const files = await getWorldFiles();
     res.json({
       viewerCount: viewers.size,
       totalContributions: history.length,
@@ -1236,7 +1236,7 @@ app.get('/api/contributions/:id/diff', async (req, res) => {
     }
 
     // Get diff for the specific commit
-    const diff = await git.diff([`${commit.hash}^`, commit.hash, '--', `canvas/${contribution.file_path}`]);
+    const diff = await git.diff([`${commit.hash}^`, commit.hash, '--', `world/${contribution.file_path}`]);
 
     // Parse diff to get additions/deletions
     const lines = diff.split('\n');
@@ -1540,16 +1540,16 @@ app.get('/api/search', (req, res) => {
   });
 });
 
-// API: Get canvas structure for agents
-app.get('/api/canvas/structure', async (req, res) => {
+// API: Get world structure for agents
+app.get('/api/world/structure', async (req, res) => {
   try {
-    const files = await getCanvasFiles();
+    const files = await getWorldFiles();
 
     // Categorize files
     const structure = {
-      theme: '/canvas/css/theme.css',
-      coreJs: '/canvas/js/core.js',
-      guidelines: '/canvas/CANVAS.md',
+      theme: '/world/css/theme.css',
+      coreJs: '/world/js/core.js',
+      guidelines: '/world/WORLD.md',
       sections: files
         .filter(f => f.path.startsWith('sections/') && f.path.endsWith('.html'))
         .map(f => ({
@@ -1584,10 +1584,10 @@ app.get('/api/canvas/structure', async (req, res) => {
   }
 });
 
-// API: Get canvas guidelines
-app.get('/api/canvas/guidelines', async (req, res) => {
+// API: Get world guidelines
+app.get('/api/world/guidelines', async (req, res) => {
   try {
-    const guidelinesPath = path.join(CANVAS_DIR, 'CANVAS.md');
+    const guidelinesPath = path.join(WORLD_DIR, 'WORLD.md');
     const content = await fs.readFile(guidelinesPath, 'utf-8');
     res.json({ content });
   } catch (error) {
@@ -1595,10 +1595,10 @@ app.get('/api/canvas/guidelines', async (req, res) => {
   }
 });
 
-// API: Get all canvas sections (HTML fragments from sections/)
-app.get('/api/canvas/sections', async (req, res) => {
+// API: Get all world sections (HTML fragments from sections/)
+app.get('/api/world/sections', async (req, res) => {
   try {
-    const sectionsDir = path.join(CANVAS_DIR, 'sections');
+    const sectionsDir = path.join(WORLD_DIR, 'sections');
     let sectionFiles = [];
     try {
       const entries = await fs.readdir(sectionsDir, { withFileTypes: true });
@@ -1643,14 +1643,14 @@ app.get('/api/canvas/sections', async (req, res) => {
   }
 });
 
-// API: Read a canvas file
-app.get('/api/canvas/*', async (req, res) => {
+// API: Read a world file
+app.get('/api/world/*', async (req, res) => {
   try {
     const filePath = req.params[0];
-    const fullPath = path.join(CANVAS_DIR, filePath);
+    const fullPath = path.join(WORLD_DIR, filePath);
 
-    // Security: ensure path is within canvas
-    if (!fullPath.startsWith(CANVAS_DIR)) {
+    // Security: ensure path is within world
+    if (!fullPath.startsWith(WORLD_DIR)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -1665,10 +1665,10 @@ app.get('/api/canvas/*', async (req, res) => {
   }
 });
 
-// API: List all canvas files
+// API: List all world files
 app.get('/api/files', async (req, res) => {
   try {
-    const files = await getCanvasFiles();
+    const files = await getWorldFiles();
     res.json(files);
   } catch (error) {
     res.status(500).json({ error: 'Failed to list files' });
@@ -1703,10 +1703,10 @@ app.post('/api/contribute', agentLimiter, async (req, res) => {
       });
     }
 
-    const fullPath = path.join(CANVAS_DIR, sanitizedPath);
+    const fullPath = path.join(WORLD_DIR, sanitizedPath);
 
-    // Security: ensure path is within canvas
-    if (!fullPath.startsWith(CANVAS_DIR)) {
+    // Security: ensure path is within world
+    if (!fullPath.startsWith(WORLD_DIR)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -1718,7 +1718,7 @@ app.post('/api/contribute', agentLimiter, async (req, res) => {
     }
 
     // Check max files
-    const currentFiles = await getCanvasFiles();
+    const currentFiles = await getWorldFiles();
     if (action === 'create' && currentFiles.length >= MAX_FILES) {
       return res.status(400).json({ error: `Max file limit reached: ${MAX_FILES}` });
     }
@@ -1795,8 +1795,8 @@ app.post('/api/contribute', agentLimiter, async (req, res) => {
   }
 });
 
-// Helper: Get all files in canvas
-async function getCanvasFiles(dir = CANVAS_DIR, prefix = '') {
+// Helper: Get all files in world
+async function getWorldFiles(dir = WORLD_DIR, prefix = '') {
   const files = [];
   try {
     const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -1804,7 +1804,7 @@ async function getCanvasFiles(dir = CANVAS_DIR, prefix = '') {
       const fullPath = path.join(dir, entry.name);
       const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        files.push(...await getCanvasFiles(fullPath, relativePath));
+        files.push(...await getWorldFiles(fullPath, relativePath));
       } else {
         const stats = await fs.stat(fullPath);
         files.push({
@@ -1823,7 +1823,7 @@ async function getCanvasFiles(dir = CANVAS_DIR, prefix = '') {
 // Helper: Git commit
 async function gitCommit(contribution) {
   try {
-    await git.add('canvas/*');
+    await git.add('world/*');
     await git.commit(
       `[${contribution.agent_name}] ${contribution.action}: ${contribution.file_path}\n\n${contribution.message || 'No message'}`
     );
@@ -1832,15 +1832,15 @@ async function gitCommit(contribution) {
   }
 }
 
-// Initialize canvas directory
+// Initialize world directory
 async function init() {
-  await fs.mkdir(CANVAS_DIR, { recursive: true });
+  await fs.mkdir(WORLD_DIR, { recursive: true });
 
   // Load persisted state
   await loadState();
 
-  // Create initial file if canvas is empty
-  const files = await getCanvasFiles();
+  // Create initial file if world is empty
+  const files = await getWorldFiles();
   if (files.length === 0) {
     const welcomeHtml = `<!DOCTYPE html>
 <html lang="en">
@@ -1892,8 +1892,8 @@ async function init() {
 </body>
 </html>`;
 
-    await fs.writeFile(path.join(CANVAS_DIR, 'index.html'), welcomeHtml);
-    console.log('Created initial canvas/index.html');
+    await fs.writeFile(path.join(WORLD_DIR, 'index.html'), welcomeHtml);
+    console.log('Created initial world/index.html');
   }
 
   // Try to init git
@@ -1924,7 +1924,7 @@ init().then(() => {
 ╠═══════════════════════════════════════════════════════════╣
 ║  Server:    http://localhost:${PORT}                        ║
 ║  Dashboard: http://localhost:${PORT}/dashboard              ║
-║  Canvas:    http://localhost:${PORT}/canvas                 ║
+║  World:     http://localhost:${PORT}/world                  ║
 ║  API:       POST /api/contribute                          ║
 ╚═══════════════════════════════════════════════════════════╝
     `);

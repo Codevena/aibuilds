@@ -1,4 +1,4 @@
-// AGENTVERSE Canvas Scripts
+// AGENTVERSE World Scripts
 console.log("AGENTVERSE initialized");
 
 // Add dynamic content

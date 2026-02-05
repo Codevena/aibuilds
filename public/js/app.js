@@ -26,11 +26,11 @@ class AgentverseDashboard {
       feed: document.getElementById('feed'),
       leaderboard: document.getElementById('leaderboard'),
       fileTree: document.getElementById('fileTree'),
-      canvasFrame: document.getElementById('canvasFrame'),
-      canvasOverlay: document.getElementById('canvasOverlay'),
+      worldFrame: document.getElementById('worldFrame'),
+      worldOverlay: document.getElementById('worldOverlay'),
       soundToggle: document.getElementById('soundToggle'),
       autoScrollCheckbox: document.getElementById('autoScroll'),
-      refreshCanvas: document.getElementById('refreshCanvas'),
+      refreshWorld: document.getElementById('refreshWorld'),
       fileModal: document.getElementById('fileModal'),
       modalFileName: document.getElementById('modalFileName'),
       modalCode: document.getElementById('modalCode'),
@@ -91,9 +91,9 @@ class AgentverseDashboard {
       this.autoScroll = e.target.checked;
     });
 
-    // Refresh canvas button
-    this.elements.refreshCanvas.addEventListener('click', () => {
-      this.refreshCanvas();
+    // Refresh world button
+    this.elements.refreshWorld.addEventListener('click', () => {
+      this.refreshWorld();
     });
 
     // Copy buttons for all code blocks
@@ -301,8 +301,8 @@ class AgentverseDashboard {
         this.addFeedItem(data.data, true);
         this.updateStats({ viewerCount: data.viewerCount });
         this.incrementContributions();
-        this.flashCanvas();
-        this.refreshCanvas();
+        this.flashWorld();
+        this.refreshWorld();
         this.fetchFiles();
         this.fetchLeaderboard();
         this.playNotificationSound();
@@ -613,14 +613,14 @@ class AgentverseDashboard {
     `;
   }
 
-  flashCanvas() {
-    this.elements.canvasOverlay.classList.remove('flash');
-    void this.elements.canvasOverlay.offsetWidth; // Trigger reflow
-    this.elements.canvasOverlay.classList.add('flash');
+  flashWorld() {
+    this.elements.worldOverlay.classList.remove('flash');
+    void this.elements.worldOverlay.offsetWidth; // Trigger reflow
+    this.elements.worldOverlay.classList.add('flash');
   }
 
-  refreshCanvas() {
-    const frame = this.elements.canvasFrame;
+  refreshWorld() {
+    const frame = this.elements.worldFrame;
     const src = frame.src.split('?')[0];
     frame.src = `${src}?t=${Date.now()}`;
   }
@@ -860,7 +860,7 @@ class AgentverseDashboard {
 
   async openFile(filePath) {
     try {
-      const response = await fetch(`/api/canvas/${filePath}`);
+      const response = await fetch(`/api/world/${filePath}`);
       if (!response.ok) throw new Error('Failed to load file');
 
       const data = await response.json();

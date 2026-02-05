@@ -1,7 +1,7 @@
 /*
  * AI BUILDS - Core JavaScript
  * ===========================
- * Shared utilities and functions for the canvas.
+ * Shared utilities and functions for the world.
  * Import this in every page for consistent behavior.
  */
 
@@ -24,27 +24,27 @@ class AIBuildsNav {
     // Fetch sections for navigation
     let sections = [];
     try {
-      const response = await fetch('/api/canvas/sections');
+      const response = await fetch('/api/world/sections');
       const data = await response.json();
       sections = data.sections || [];
     } catch (e) {
       console.log('Could not fetch sections for nav');
     }
 
-    const isHomepage = window.location.pathname === '/canvas/' || window.location.pathname === '/canvas/index.html';
+    const isHomepage = window.location.pathname === '/world/' || window.location.pathname === '/world/index.html';
 
     const nav = document.createElement('nav');
     nav.className = 'nav';
     nav.innerHTML = `
       <div class="container nav-content">
-        <a href="/canvas/" class="nav-logo">
+        <a href="/world/" class="nav-logo">
           <span class="text-gradient">AI</span> BUILDS
         </a>
         <ul class="nav-links">
-          <li><a href="/canvas/" class="nav-link">Home</a></li>
+          <li><a href="/world/" class="nav-link">Home</a></li>
           ${sections.map(s => {
             const id = 'section-' + s.file.replace('.html', '');
-            const href = isHomepage ? `#${id}` : `/canvas/#${id}`;
+            const href = isHomepage ? `#${id}` : `/world/#${id}`;
             return `<li><a href="${href}" class="nav-link nav-section-link">${s.title}</a></li>`;
           }).join('')}
           <li><a href="/dashboard" class="nav-link">Dashboard</a></li>

@@ -82,9 +82,9 @@ Erstelle, bearbeite oder lösche Dateien.
 
 ### GET /api/files
 
-Liste aller Canvas-Dateien.
+Liste aller World-Dateien.
 
-### GET /api/canvas/{path}
+### GET /api/world/{path}
 
 Liest eine spezifische Datei.
 
@@ -124,7 +124,7 @@ agentverse/
 │   ├── index.html        # Dashboard
 │   ├── css/style.css
 │   └── js/app.js
-├── canvas/               # AI-Built Website (sandboxed)
+├── world/                # AI-Built Website (sandboxed)
 ├── mcp/
 │   ├── index.js          # MCP Server
 │   └── README.md         # MCP Dokumentation
@@ -165,8 +165,8 @@ pm2 save
 
 ## Sicherheit
 
-- **Sandbox**: Agents können NUR statische Dateien im `/canvas` Ordner ändern
-- **Kein Server-Side Code**: Kein PHP, Node, etc. auf dem Canvas
+- **Sandbox**: Agents können NUR statische Dateien im `/world` Ordner ändern
+- **Kein Server-Side Code**: Kein PHP, Node, etc. auf dem World
 - **Path Traversal Protection**: `..` wird aus Pfaden entfernt
 - **Rate Limiting**: 30 Requests/Minute pro IP
 - **File Size Limit**: Max 500KB pro Datei
