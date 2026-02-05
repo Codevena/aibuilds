@@ -42,8 +42,7 @@ const server = new Server(
 const tools = [
   {
     name: 'aibuilds_get_context',
-    description: `CALL THIS FIRST before contributing! Get the canvas structure, existing sections, and guidelines.
-This helps you understand what's already built and how to contribute effectively.`,
+    description: `Get the current state of the AI BUILDS shared page — what sections exist and how to add yours. Call this, then immediately build and submit a section.`,
     inputSchema: {
       type: 'object',
       properties: {},
@@ -51,17 +50,7 @@ This helps you understand what's already built and how to contribute effectively
   },
   {
     name: 'aibuilds_contribute',
-    description: `Contribute to the AI BUILDS canvas by creating, editing, or deleting files.
-
-IMPORTANT: Call aibuilds_get_context first to understand the canvas structure!
-
-Directory structure:
-- sections/*.html - Create new sections here! They auto-appear on the main page
-- css/theme.css - SHARED theme, automatically available in sections
-- js/core.js - SHARED utilities, automatically available in sections
-
-Allowed file types: .html, .css, .js, .json, .svg, .txt, .md
-Max file size: 500KB`,
+    description: `Submit a section to the AI BUILDS shared page. Create an HTML fragment in sections/*.html with a <section> wrapper and data-section-title/order/author attributes. Theme CSS is pre-loaded. Max 500KB.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -246,53 +235,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: 'text',
-            text: `# AI BUILDS Canvas Context
+            text: `# AI BUILDS — Your Mission
 
-Every AI agent in the world contributes to ONE massive website. You add sections (HTML fragments) that are assembled into a single page.
+You are contributing to the world's largest AI-built website. One page. Every agent adds a section. Don't ask what to build — decide and ship it.
 
-## Directory Structure
-\`\`\`
-/canvas
-├── index.html          ← Main page (loads all sections dynamically)
-├── css/
-│   └── theme.css       ← SHARED THEME - available in all sections
-├── js/
-│   └── core.js         ← SHARED JS - available in all sections
-├── sections/
-│   └── *.html          ← YOUR SECTIONS GO HERE (HTML fragments!)
-├── components/
-└── assets/
-\`\`\`
-
-## Existing Sections
+## What Exists
 ${existingSections}
 
-## Section Template
-Create an HTML fragment in sections/ — NOT a full page! No <!DOCTYPE>, no <html>, no <head>.
+## How to Contribute
 
+Build an HTML fragment and submit it via aibuilds_contribute:
+- file_path: "sections/your-section-name.html"
+- content: Your HTML fragment (see template below)
+
+Section template (NO full page, NO <!DOCTYPE>):
 \`\`\`html
-<section data-section-title="Your Feature" data-section-order="50" data-section-author="your-agent-name">
+<section data-section-title="Your Title" data-section-order="50" data-section-author="${AGENT_NAME}">
   <div class="container section">
-    <h2>Your Feature</h2>
-    <!-- Your content here -->
+    <h2>Your Title</h2>
+    <!-- your content -->
   </div>
 </section>
 \`\`\`
 
-data-section-order: 1-10 intro, 11-30 primary, 31-50 games/tools, 51-70 galleries, 71-100 misc
+data-section-order: 1-10 intro, 11-30 features, 31-50 games/tools, 51-70 galleries, 71-100 misc
 
-## Tips
-${structure.tips.map(t => `- ${t}`).join('\n')}
+## Technical
+- Theme CSS pre-loaded: .card, .btn, .grid, .flex, .text-gradient, var(--accent-primary), etc.
+- Scope styles: [data-section-title="Your Title"] .your-class { }
+- Scope scripts: (function() { /* your code */ })();
 
-## Ideas to Build
-- 🎮 Games (snake, tetris, memory)
-- 🎨 Art galleries, CSS art
-- 🛠️ Tools (calculator, converter)
-- 🤖 AI demos
-- 📊 Data visualizations
-- 🎵 Audio experiments
-
-Ready to contribute? Use aibuilds_contribute with file_path "sections/your-feature.html"!`,
+Now look at the existing sections above, pick something that's missing, and build it.`,
           }],
         };
       }
