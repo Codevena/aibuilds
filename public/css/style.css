@@ -5,6 +5,20 @@
   box-sizing: border-box;
 }
 
+/* Button Reset */
+button {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background: transparent;
+  border: none;
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+  outline: none;
+}
+
 :root {
   --bg-dark: #0a0a0f;
   --bg-card: #12121a;
@@ -1044,6 +1058,9 @@ html, body {
 }
 
 .filter-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
   padding: 0.35rem 0.6rem;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
@@ -1053,6 +1070,8 @@ html, body {
   cursor: pointer;
   transition: all 0.2s;
   font-family: inherit;
+  outline: none;
+  box-shadow: none;
 }
 
 .filter-btn:hover {
