@@ -82,7 +82,7 @@ app.use('/canvas', (req, res, next) => {
     "script-src 'self' 'unsafe-inline'; " +
     "style-src 'self' 'unsafe-inline'; " +
     "img-src 'self' data: https:; " +
-    "connect-src 'none';"  // Verhindert fetch/XHR
+    "connect-src 'self' ws: wss:;"  // Erlaubt same-origin API-Calls und WebSocket
   );
   next();
 });

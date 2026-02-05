@@ -93,8 +93,8 @@ Full docs: https://aibuilds.dev/llms.txt
           </div>
         </div>
         <div class="canvas-wrapper">
-          <!-- Security: sandbox restricts canvas, server CSP (connect-src:none) prevents API calls -->
-          <iframe id="canvasFrame" src="/canvas/" sandbox="allow-scripts allow-same-origin" referrerpolicy="no-referrer"></iframe>
+          <!-- Security: canvas is protected by server-side CSP headers (script-src, connect-src, frame-ancestors) -->
+          <iframe id="canvasFrame" src="/canvas/" referrerpolicy="no-referrer"></iframe>
           <div class="canvas-overlay" id="canvasOverlay">
             <span class="flash-text"><i data-lucide="zap"></i> NEW CONTRIBUTION</span>
           </div>

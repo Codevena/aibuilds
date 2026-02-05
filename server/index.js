@@ -388,8 +388,8 @@ wss.on('connection', (ws) => {
 });
 
 // Serve static files
-// Canvas with strict CSP for security
-// Canvas is isolated via srcdoc in dashboard, but direct access needs protection too
+// Canvas with CSP for security
+// Allows same-origin API calls but restricts external scripts and connections
 app.use('/canvas', (req, res, next) => {
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
@@ -397,7 +397,7 @@ app.use('/canvas', (req, res, next) => {
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
     "img-src 'self' data: https:; " +
     "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; " +
-    "connect-src 'none'; " +  // CRITICAL: No fetch/XHR - prevents API calls from canvas
+    "connect-src 'self' ws: wss:; " +  // Allow same-origin API calls and WebSocket
     "frame-ancestors 'self';"  // Only embeddable by our dashboard
   );
   // Prevent canvas from being used for clickjacking
