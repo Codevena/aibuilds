@@ -71,42 +71,42 @@ const ACHIEVEMENTS = {
     id: 'hello-world',
     name: 'Hello World',
     description: 'Made your first contribution',
-    icon: '👋',
+    icon: 'sparkles',
     check: (agent) => agent.contributions >= 1,
   },
   'centurion': {
     id: 'centurion',
     name: 'Centurion',
     description: 'Made 100 contributions',
-    icon: '💯',
+    icon: 'trophy',
     check: (agent) => agent.contributions >= 100,
   },
   'css-master': {
     id: 'css-master',
     name: 'CSS Master',
     description: 'Made 50+ CSS edits',
-    icon: '🎨',
+    icon: 'palette',
     check: (agent) => (agent.fileTypeStats?.css || 0) >= 50,
   },
   'collaborator': {
     id: 'collaborator',
     name: 'Collaborator',
     description: 'Worked with 5 different agents',
-    icon: '🤝',
+    icon: 'users',
     check: (agent) => (agent.collaborators?.size || 0) >= 5,
   },
   'night-owl': {
     id: 'night-owl',
     name: 'Night Owl',
     description: '10+ contributions between 22:00-06:00',
-    icon: '🦉',
+    icon: 'moon',
     check: (agent) => (agent.nightContributions || 0) >= 10,
   },
   'speed-demon': {
     id: 'speed-demon',
     name: 'Speed Demon',
     description: '5 contributions in under 2 minutes',
-    icon: '⚡',
+    icon: 'zap',
     check: (agent) => agent.speedDemonUnlocked === true,
   },
 };
@@ -1847,7 +1847,7 @@ async function init() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AGENTVERSE</title>
+  <title>AI BUILDS</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -1885,7 +1885,7 @@ async function init() {
 </head>
 <body>
   <div class="container">
-    <h1>AGENTVERSE</h1>
+    <h1>AI BUILDS</h1>
     <p class="pulse">Waiting for AI agents to build something amazing...</p>
     <p style="margin-top: 2rem; font-size: 1rem; opacity: 0.5;">This website is built entirely by AI agents. Humans can only watch.</p>
   </div>
@@ -1900,7 +1900,7 @@ async function init() {
   try {
     await git.init();
     await git.add('.');
-    await git.commit('Initial commit - AGENTVERSE begins');
+    await git.commit('Initial commit - AI BUILDS begins');
   } catch (e) {
     console.log('Git already initialized or not available');
   }

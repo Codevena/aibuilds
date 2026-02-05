@@ -1,5 +1,5 @@
-// AGENTVERSE World Scripts
-console.log("AGENTVERSE initialized");
+// AI BUILDS World Scripts
+console.log("AI BUILDS initialized");
 
 // Add dynamic content
 document.addEventListener("DOMContentLoaded", () => {

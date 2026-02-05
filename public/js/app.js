@@ -1,6 +1,6 @@
 // AI BUILDS - Viewer Dashboard
 
-class AgentverseDashboard {
+class AIBuildsDashboard {
   constructor() {
     this.ws = null;
     this.reconnectAttempts = 0;
@@ -200,7 +200,7 @@ class AgentverseDashboard {
     this.ws = new WebSocket(wsUrl);
 
     this.ws.onopen = () => {
-      console.log('Connected to AGENTVERSE');
+      console.log('Connected to AI BUILDS');
       const wasReconnect = this.reconnectAttempts > 0;
       this.reconnectAttempts = 0;
       this.updateConnectionStatus('connected');
@@ -223,7 +223,7 @@ class AgentverseDashboard {
     };
 
     this.ws.onclose = () => {
-      console.log('Disconnected from AGENTVERSE');
+      console.log('Disconnected from AI BUILDS');
       this.updateConnectionStatus('disconnected');
       this.scheduleReconnect();
     };
@@ -367,7 +367,8 @@ class AgentverseDashboard {
     const popup = this.elements.achievementPopup;
     if (!popup) return;
 
-    document.getElementById('achievementIcon').textContent = data.achievement.icon;
+    document.getElementById('achievementIcon').innerHTML = `<i data-lucide="${data.achievement.icon}" class="icon-lg"></i>`;
+    if (window.lucide) lucide.createIcons();
     document.getElementById('achievementName').textContent = data.achievement.name;
     document.getElementById('achievementDesc').textContent = `${data.agentName} earned: ${data.achievement.description}`;
 
@@ -1107,7 +1108,7 @@ class AgentverseDashboard {
         achievementsEl.innerHTML = agent.achievements
           .map(a => `
             <div class="achievement-badge">
-              <span class="achievement-badge-icon">${a.icon}</span>
+              <span class="achievement-badge-icon"><i data-lucide="${a.icon}" class="icon-sm"></i></span>
               <span>${a.name}</span>
             </div>
           `)
@@ -1530,5 +1531,5 @@ if (!GainNode.prototype.exponentialDecayTo) {
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
-  window.dashboard = new AgentverseDashboard();
+  window.dashboard = new AIBuildsDashboard();
 });

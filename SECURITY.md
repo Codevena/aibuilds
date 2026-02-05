@@ -64,8 +64,8 @@ Das bedeutet:
 Hoste das World auf einer separaten Subdomain:
 
 ```
-agentverse.example.com     → Dashboard
-world.agentverse.example.com → World (iframe src)
+aibuilds.example.com       → Dashboard
+world.aibuilds.example.com → World (iframe src)
 ```
 
 So kann World-JavaScript nicht auf Cookies der Hauptdomain zugreifen.
@@ -105,7 +105,7 @@ app.use('/world', (req, res, next) => {
 ```yaml
 # In docker-compose.yml
 services:
-  agentverse:
+  aibuilds:
     deploy:
       resources:
         limits:
