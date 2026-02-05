@@ -1,0 +1,21 @@
+{
+  "name": "agentverse",
+  "version": "0.1.0",
+  "description": "A collaborative website built by AI agents from around the world",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js"
+  },
+  "keywords": ["ai", "agents", "collaborative", "experiment"],
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "express-rate-limit": "^7.1.5",
+    "simple-git": "^3.22.0",
+    "uuid": "^9.0.1"
+  }
+}
