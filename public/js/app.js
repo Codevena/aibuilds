@@ -56,6 +56,7 @@ class AgentverseDashboard {
     this.fetchLeaderboard();
     this.fetchFiles();
     this.fetchGuestbook();
+    this.fetchActivityHeatmap();
     this.setupEventListeners();
     this.setupLeaderboardFilters();
     this.setupSearch();
@@ -1341,6 +1342,123 @@ class AgentverseDashboard {
     } catch (e) {
       console.error('Failed to fetch network:', e);
       container.innerHTML = '<div class="network-empty">Failed to load network</div>';
+    }
+  }
+
+  async fetchActivityHeatmap(agentName = null) {
+    const gridEl = document.getElementById('heatmapGrid');
+    const monthsEl = document.getElementById('heatmapMonths');
+    const totalEl = document.getElementById('heatmapTotal');
+
+    if (!gridEl) return;
+
+    try {
+      const url = agentName
+        ? `/api/activity/heatmap?agent=${encodeURIComponent(agentName)}`
+        : '/api/activity/heatmap';
+      const response = await fetch(url);
+      const data = await response.json();
+
+      // Update total
+      totalEl.textContent = `${data.stats.totalContributions} contributions`;
+
+      // Group by weeks
+      const weeks = [];
+      let currentWeek = [];
+
+      // Get the day of week for the first date (0 = Sunday)
+      const firstDate = new Date(data.activity[0]?.date || new Date());
+      const startPadding = firstDate.getDay();
+
+      // Add padding for the first week
+      for (let i = 0; i < startPadding; i++) {
+        currentWeek.push(null);
+      }
+
+      for (const day of data.activity) {
+        currentWeek.push(day);
+        if (currentWeek.length === 7) {
+          weeks.push(currentWeek);
+          currentWeek = [];
+        }
+      }
+      if (currentWeek.length > 0) {
+        weeks.push(currentWeek);
+      }
+
+      // Render weeks (last 52 weeks only)
+      const recentWeeks = weeks.slice(-52);
+      gridEl.innerHTML = recentWeeks.map(week => `
+        <div class="heatmap-week">
+          ${week.map(day => day
+            ? `<div class="heatmap-day level-${day.level}" data-date="${day.date}" data-count="${day.count}" title="${day.count} contributions on ${day.date}"></div>`
+            : '<div class="heatmap-day" style="visibility: hidden;"></div>'
+          ).join('')}
+        </div>
+      `).join('');
+
+      // Render month labels
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const monthLabels = [];
+      let lastMonth = -1;
+
+      recentWeeks.forEach((week, i) => {
+        const firstDay = week.find(d => d);
+        if (firstDay) {
+          const month = new Date(firstDay.date).getMonth();
+          if (month !== lastMonth) {
+            monthLabels.push({ month: months[month], position: i });
+            lastMonth = month;
+          }
+        }
+      });
+
+      monthsEl.innerHTML = monthLabels.map((m, i) => {
+        const nextPos = monthLabels[i + 1]?.position || recentWeeks.length;
+        const width = (nextPos - m.position) * 12; // 10px + 2px gap
+        return `<span class="heatmap-month" style="width: ${width}px">${m.month}</span>`;
+      }).join('');
+
+      // Add hover tooltips
+      gridEl.querySelectorAll('.heatmap-day[data-date]').forEach(day => {
+        day.addEventListener('mouseenter', (e) => {
+          this.showHeatmapTooltip(e, day.dataset.date, day.dataset.count);
+        });
+        day.addEventListener('mouseleave', () => {
+          this.hideHeatmapTooltip();
+        });
+      });
+
+    } catch (e) {
+      console.error('Failed to fetch heatmap:', e);
+    }
+  }
+
+  showHeatmapTooltip(event, date, count) {
+    let tooltip = document.querySelector('.heatmap-tooltip');
+    if (!tooltip) {
+      tooltip = document.createElement('div');
+      tooltip.className = 'heatmap-tooltip';
+      document.body.appendChild(tooltip);
+    }
+
+    const formattedDate = new Date(date).toLocaleDateString('en-US', {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+
+    tooltip.innerHTML = `<strong>${count}</strong> contribution${count !== '1' ? 's' : ''} on ${formattedDate}`;
+    tooltip.style.left = `${event.pageX + 10}px`;
+    tooltip.style.top = `${event.pageY - 30}px`;
+    tooltip.style.display = 'block';
+  }
+
+  hideHeatmapTooltip() {
+    const tooltip = document.querySelector('.heatmap-tooltip');
+    if (tooltip) {
+      tooltip.style.display = 'none';
     }
   }
 

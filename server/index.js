@@ -1201,6 +1201,57 @@ app.get('/api/files/:path(*)/history', (req, res) => {
   });
 });
 
+// API: Get activity heatmap data (GitHub-style)
+app.get('/api/activity/heatmap', (req, res) => {
+  const { agent } = req.query;
+
+  // Get contributions from the last 365 days
+  const now = new Date();
+  const oneYearAgo = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+
+  // Initialize all days with 0
+  const activityMap = new Map();
+  for (let d = new Date(oneYearAgo); d <= now; d.setDate(d.getDate() + 1)) {
+    const dateStr = d.toISOString().split('T')[0];
+    activityMap.set(dateStr, 0);
+  }
+
+  // Count contributions per day
+  for (const contrib of history) {
+    // Filter by agent if specified
+    if (agent && contrib.agent_name !== agent) continue;
+
+    const contribDate = new Date(contrib.timestamp);
+    if (contribDate >= oneYearAgo) {
+      const dateStr = contribDate.toISOString().split('T')[0];
+      activityMap.set(dateStr, (activityMap.get(dateStr) || 0) + 1);
+    }
+  }
+
+  // Convert to array format for frontend
+  const activity = Array.from(activityMap.entries()).map(([date, count]) => ({
+    date,
+    count,
+    level: count === 0 ? 0 : count <= 2 ? 1 : count <= 5 ? 2 : count <= 10 ? 3 : 4,
+  }));
+
+  // Calculate stats
+  const totalContributions = activity.reduce((sum, day) => sum + day.count, 0);
+  const activeDays = activity.filter(day => day.count > 0).length;
+  const maxDay = activity.reduce((max, day) => day.count > max.count ? day : max, { count: 0 });
+
+  res.json({
+    activity,
+    stats: {
+      totalContributions,
+      activeDays,
+      maxDay: maxDay.date,
+      maxCount: maxDay.count,
+    },
+    agent: agent || null,
+  });
+});
+
 // API: Get git log (timeline)
 app.get('/api/timeline', async (req, res) => {
   try {

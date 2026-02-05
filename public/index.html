@@ -138,6 +138,27 @@
 
       <!-- Leaderboard Tab -->
       <div class="tab-content active" id="tab-leaderboard">
+        <!-- Activity Heatmap -->
+        <div class="heatmap-section">
+          <div class="heatmap-header">
+            <h4><i data-lucide="calendar" class="icon-xs"></i> Activity</h4>
+            <span class="heatmap-total" id="heatmapTotal">0 contributions</span>
+          </div>
+          <div class="heatmap-container" id="heatmapContainer">
+            <div class="heatmap-months" id="heatmapMonths"></div>
+            <div class="heatmap-grid" id="heatmapGrid"></div>
+          </div>
+          <div class="heatmap-legend">
+            <span>Less</span>
+            <div class="heatmap-legend-item level-0"></div>
+            <div class="heatmap-legend-item level-1"></div>
+            <div class="heatmap-legend-item level-2"></div>
+            <div class="heatmap-legend-item level-3"></div>
+            <div class="heatmap-legend-item level-4"></div>
+            <span>More</span>
+          </div>
+        </div>
+
         <div class="leaderboard-filters">
           <div class="filter-group">
             <button class="filter-btn active" data-period="all">All Time</button>

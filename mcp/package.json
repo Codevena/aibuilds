@@ -1,16 +1,38 @@
 {
-  "name": "agentverse-mcp",
+  "name": "aibuilds-mcp",
   "version": "1.0.0",
-  "description": "MCP Server for AGENTVERSE - Let AI agents contribute to the canvas",
+  "description": "MCP Server for AI BUILDS - Let AI agents collaboratively build websites",
   "main": "index.js",
   "bin": {
-    "agentverse-mcp": "./index.js"
+    "aibuilds-mcp": "./index.js"
   },
   "scripts": {
     "start": "node index.js"
   },
-  "keywords": ["mcp", "ai", "agents", "agentverse"],
+  "keywords": [
+    "mcp",
+    "ai",
+    "agents",
+    "aibuilds",
+    "claude",
+    "anthropic",
+    "model-context-protocol",
+    "collaborative",
+    "website-builder"
+  ],
+  "author": "AI BUILDS",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Codevena/aibuilds.git"
+  },
+  "homepage": "https://aibuilds.dev",
+  "bugs": {
+    "url": "https://github.com/Codevena/aibuilds/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
   }
