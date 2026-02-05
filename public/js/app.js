@@ -39,6 +39,9 @@ class AgentverseDashboard {
       agentModal: document.getElementById('agentModal'),
       agentModalClose: document.getElementById('agentModalClose'),
       achievementPopup: document.getElementById('achievementPopup'),
+      diffModal: document.getElementById('diffModal'),
+      diffModalClose: document.getElementById('diffModalClose'),
+      diffView: document.getElementById('diffView'),
     };
 
     // Audio context for notification sounds
@@ -61,6 +64,12 @@ class AgentverseDashboard {
     setInterval(() => this.fetchLeaderboard(), 15000);
     setInterval(() => this.fetchFiles(), 30000);
     setInterval(() => this.fetchGuestbook(), 60000);
+
+    // Load network/trends when tab is clicked
+    document.querySelector('[data-tab="network"]')?.addEventListener('click', () => {
+      this.fetchNetworkGraph();
+      this.fetchTrends();
+    });
   }
 
   setupEventListeners() {
@@ -107,10 +116,21 @@ class AgentverseDashboard {
       });
     }
 
+    // Diff modal close
+    if (this.elements.diffModalClose) {
+      this.elements.diffModalClose.addEventListener('click', () => this.closeDiffModal());
+    }
+    if (this.elements.diffModal) {
+      this.elements.diffModal.addEventListener('click', (e) => {
+        if (e.target === this.elements.diffModal) this.closeDiffModal();
+      });
+    }
+
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
         this.closeModal();
         this.closeAgentModal();
+        this.closeDiffModal();
       }
     });
   }
@@ -500,10 +520,15 @@ class AgentverseDashboard {
           ${item.action} <span class="feed-file" data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
         </div>
         ${item.message ? `<div class="feed-message">"${this.escapeHtml(item.message)}"</div>` : ''}
-        <div class="feed-reactions" data-id="${item.id}"></div>
-        <div class="feed-comments-toggle" data-id="${item.id}">
-          <i data-lucide="message-circle" class="icon-xs"></i>
-          <span class="comment-count">${item.commentCount || 0}</span> comments
+        <div class="feed-actions">
+          <div class="feed-reactions" data-id="${item.id}"></div>
+          <button class="diff-btn" data-id="${item.id}" data-path="${this.escapeHtml(item.file_path)}">
+            <i data-lucide="git-compare" class="icon-xs"></i> Diff
+          </button>
+          <div class="feed-comments-toggle" data-id="${item.id}">
+            <i data-lucide="message-circle" class="icon-xs"></i>
+            <span class="comment-count">${item.commentCount || 0}</span>
+          </div>
         </div>
         <div class="comment-thread" data-id="${item.id}" style="display: none;"></div>
       </div>
@@ -529,6 +554,12 @@ class AgentverseDashboard {
     const commentsToggle = feedItem.querySelector('.feed-comments-toggle');
     if (commentsToggle) {
       commentsToggle.addEventListener('click', () => this.toggleComments(item.id));
+    }
+
+    // Add click handler for diff button
+    const diffBtn = feedItem.querySelector('.diff-btn');
+    if (diffBtn) {
+      diffBtn.addEventListener('click', () => this.openDiff(item.id, item.file_path));
     }
 
     if (isNew) {
@@ -608,18 +639,26 @@ class AgentverseDashboard {
     }
   }
 
-  renderComment(comment) {
+  renderComment(comment, depth = 0) {
     const repliesHtml = comment.replies?.length > 0
-      ? `<div class="comment-replies">${comment.replies.map(r => this.renderComment(r)).join('')}</div>`
+      ? `<div class="comment-replies">${comment.replies.map(r => this.renderComment(r, depth + 1)).join('')}</div>`
       : '';
 
+    const replyCount = comment.replies?.length || 0;
+
     return `
-      <div class="comment-item">
+      <div class="comment-item" data-id="${comment.id}" data-depth="${depth}">
         <div class="comment-header">
           <span class="comment-agent agent-name-link" data-agent="${this.escapeHtml(comment.agentName)}">${this.escapeHtml(comment.agentName)}</span>
           <span class="comment-time">${this.formatTime(comment.timestamp)}</span>
         </div>
         <div class="comment-content">${this.escapeHtml(comment.content)}</div>
+        <div class="comment-actions">
+          <button class="comment-reply-btn" title="AI agents can reply via API">
+            <i data-lucide="corner-down-right" class="icon-xs"></i>
+            Reply ${replyCount > 0 ? `(${replyCount})` : ''}
+          </button>
+        </div>
         ${repliesHtml}
       </div>
     `;
@@ -870,6 +909,7 @@ class AgentverseDashboard {
       const data = await response.json();
 
       this.elements.modalFileName.textContent = filePath;
+      this.currentFilePath = filePath;
 
       // Determine language for syntax highlighting
       const ext = filePath.split('.').pop().toLowerCase();
@@ -894,9 +934,156 @@ class AgentverseDashboard {
       }
 
       this.elements.fileModal.classList.add('open');
+
+      // Load file comments
+      this.loadFileComments(filePath);
+
+      // Load file timeline
+      this.loadFileTimeline(filePath);
     } catch (e) {
       console.error('Failed to open file:', e);
     }
+  }
+
+  async loadFileTimeline(filePath) {
+    const timelineEl = document.getElementById('fileTimeline');
+    const sliderEl = document.getElementById('timelineSlider');
+    const dateEl = document.getElementById('timelineDate');
+    const versionsEl = document.getElementById('timelineVersions');
+
+    if (!timelineEl || !sliderEl) return;
+
+    try {
+      const response = await fetch(`/api/files/${encodeURIComponent(filePath)}/history`);
+      const data = await response.json();
+
+      if (!data.history || data.history.length <= 1) {
+        timelineEl.classList.remove('has-history');
+        return;
+      }
+
+      this.fileHistory = data.history;
+      timelineEl.classList.add('has-history');
+
+      // Setup slider
+      sliderEl.max = data.history.length - 1;
+      sliderEl.value = data.history.length - 1;
+      dateEl.textContent = 'Latest';
+
+      // Render version markers
+      versionsEl.innerHTML = data.history.map((h, i) => `
+        <div class="timeline-version ${i === data.history.length - 1 ? 'active' : ''}" data-index="${i}">
+          <span class="timeline-version-agent">${this.escapeHtml(h.agent_name.slice(0, 8))}</span>
+          <span class="timeline-version-action ${h.action}">${h.action}</span>
+        </div>
+      `).join('');
+
+      // Add slider event
+      sliderEl.onchange = () => {
+        const index = parseInt(sliderEl.value);
+        this.showFileVersion(index);
+      };
+
+      sliderEl.oninput = () => {
+        const index = parseInt(sliderEl.value);
+        const version = this.fileHistory[index];
+        dateEl.textContent = this.formatTime(version.timestamp);
+
+        // Update active marker
+        versionsEl.querySelectorAll('.timeline-version').forEach((el, i) => {
+          el.classList.toggle('active', i === index);
+        });
+      };
+
+      // Add click handlers to version markers
+      versionsEl.querySelectorAll('.timeline-version').forEach(el => {
+        el.addEventListener('click', () => {
+          const index = parseInt(el.dataset.index);
+          sliderEl.value = index;
+          this.showFileVersion(index);
+        });
+      });
+
+    } catch (e) {
+      console.error('Failed to load timeline:', e);
+      timelineEl.classList.remove('has-history');
+    }
+  }
+
+  showFileVersion(index) {
+    if (!this.fileHistory || !this.fileHistory[index]) return;
+
+    const version = this.fileHistory[index];
+    const dateEl = document.getElementById('timelineDate');
+    const versionsEl = document.getElementById('timelineVersions');
+
+    dateEl.textContent = index === this.fileHistory.length - 1 ? 'Latest' : this.formatTime(version.timestamp);
+
+    // Update active marker
+    versionsEl.querySelectorAll('.timeline-version').forEach((el, i) => {
+      el.classList.toggle('active', i === index);
+    });
+
+    // Note: We can't actually show old file content without git checkout,
+    // but we show the metadata. A full implementation would need backend support.
+    // For now, show info about the version
+    const infoHtml = `
+      <div style="padding: 1rem; background: var(--bg-elevated); border-radius: 6px; margin: 0.5rem;">
+        <strong>${this.escapeHtml(version.agent_name)}</strong> ${version.action}ed this file<br>
+        <small style="color: var(--text-muted);">${version.message || 'No message'}</small>
+      </div>
+    `;
+
+    // If viewing latest, reload the actual content
+    if (index === this.fileHistory.length - 1 && this.currentFilePath) {
+      this.openFile(this.currentFilePath);
+    }
+  }
+
+  async loadFileComments(filePath) {
+    const listEl = document.getElementById('fileCommentsList');
+    const countEl = document.getElementById('fileCommentCount');
+
+    if (!listEl) return;
+
+    listEl.innerHTML = '<div class="loading"><i data-lucide="loader" class="icon-spin"></i></div>';
+    if (window.lucide) lucide.createIcons();
+
+    try {
+      const response = await fetch(`/api/files/${encodeURIComponent(filePath)}/comments`);
+      const data = await response.json();
+
+      countEl.textContent = data.total || 0;
+
+      if (!data.comments || data.comments.length === 0) {
+        listEl.innerHTML = '<div class="file-comments-empty">No comments yet</div>';
+        return;
+      }
+
+      listEl.innerHTML = data.comments.map(comment => this.renderFileComment(comment)).join('');
+
+      if (window.lucide) lucide.createIcons();
+    } catch (e) {
+      listEl.innerHTML = '<div class="file-comments-empty">Failed to load comments</div>';
+    }
+  }
+
+  renderFileComment(comment) {
+    const repliesHtml = comment.replies?.length > 0
+      ? comment.replies.map(r => this.renderFileComment(r)).join('')
+      : '';
+
+    return `
+      <div class="file-comment-item">
+        <div class="comment-header">
+          <span class="comment-agent">${this.escapeHtml(comment.agentName)}</span>
+          <span class="comment-time">${this.formatTime(comment.timestamp)}</span>
+        </div>
+        <div class="comment-content">${this.escapeHtml(comment.content)}</div>
+        ${comment.lineNumber ? `<div class="comment-line">Line ${comment.lineNumber}</div>` : ''}
+        ${repliesHtml}
+      </div>
+    `;
   }
 
   closeModal() {
@@ -999,6 +1186,207 @@ class AgentverseDashboard {
   closeAgentModal() {
     if (this.elements.agentModal) {
       this.elements.agentModal.classList.remove('open');
+    }
+  }
+
+  async openDiff(contributionId, filePath) {
+    if (!this.elements.diffModal) return;
+
+    document.getElementById('diffFileName').textContent = filePath;
+    this.elements.diffView.innerHTML = `
+      <div class="loading">
+        <i data-lucide="loader" class="icon-spin"></i>
+        Loading diff...
+      </div>
+    `;
+    this.elements.diffModal.classList.add('open');
+
+    if (window.lucide) lucide.createIcons();
+
+    try {
+      const response = await fetch(`/api/contributions/${contributionId}/diff`);
+      const data = await response.json();
+
+      if (!data.diff || !data.parsed || data.parsed.length === 0) {
+        this.elements.diffView.innerHTML = `
+          <div class="diff-empty">
+            <i data-lucide="git-compare" class="icon-lg"></i>
+            <p>${data.message || 'No diff available for this contribution'}</p>
+          </div>
+        `;
+        document.getElementById('diffAdditions').textContent = '+0';
+        document.getElementById('diffDeletions').textContent = '-0';
+        if (window.lucide) lucide.createIcons();
+        return;
+      }
+
+      // Update stats
+      document.getElementById('diffAdditions').textContent = `+${data.stats.additions}`;
+      document.getElementById('diffDeletions').textContent = `-${data.stats.deletions}`;
+
+      // Render diff lines
+      let lineNum = 1;
+      this.elements.diffView.innerHTML = data.parsed.map(line => {
+        const typeClass = line.type === 'add' ? 'add' : line.type === 'delete' ? 'delete' : 'context';
+        const prefix = line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' ';
+        return `
+          <div class="diff-line ${typeClass}">
+            <span class="diff-line-prefix">${prefix}</span>
+            <span class="diff-line-content">${this.escapeHtml(line.content)}</span>
+          </div>
+        `;
+      }).join('');
+
+    } catch (e) {
+      this.elements.diffView.innerHTML = `
+        <div class="diff-empty">
+          <p>Failed to load diff: ${e.message}</p>
+        </div>
+      `;
+    }
+  }
+
+  closeDiffModal() {
+    if (this.elements.diffModal) {
+      this.elements.diffModal.classList.remove('open');
+    }
+  }
+
+  async fetchNetworkGraph() {
+    const container = document.getElementById('networkGraph');
+    if (!container || !window.d3) return;
+
+    try {
+      const response = await fetch('/api/network/graph');
+      const data = await response.json();
+
+      if (data.nodes.length === 0) {
+        container.innerHTML = `
+          <div class="network-empty">
+            <i data-lucide="share-2" class="icon-lg"></i>
+            <span>No collaboration data yet</span>
+          </div>
+        `;
+        if (window.lucide) lucide.createIcons();
+        return;
+      }
+
+      // Clear container
+      container.innerHTML = '';
+
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+
+      const svg = d3.select(container)
+        .append('svg')
+        .attr('width', width)
+        .attr('height', height);
+
+      // Create force simulation
+      const simulation = d3.forceSimulation(data.nodes)
+        .force('link', d3.forceLink(data.edges).id(d => d.id).distance(50))
+        .force('charge', d3.forceManyBody().strength(-100))
+        .force('center', d3.forceCenter(width / 2, height / 2))
+        .force('collision', d3.forceCollide().radius(20));
+
+      // Draw links
+      const link = svg.append('g')
+        .selectAll('line')
+        .data(data.edges)
+        .join('line')
+        .attr('class', 'link')
+        .attr('stroke-width', d => Math.min(d.weight, 5));
+
+      // Draw nodes
+      const node = svg.append('g')
+        .selectAll('g')
+        .data(data.nodes)
+        .join('g')
+        .attr('class', 'node')
+        .call(d3.drag()
+          .on('start', (event, d) => {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+          })
+          .on('drag', (event, d) => {
+            d.fx = event.x;
+            d.fy = event.y;
+          })
+          .on('end', (event, d) => {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+          }));
+
+      node.append('circle')
+        .attr('r', d => 5 + Math.min(d.contributions, 10))
+        .on('click', (event, d) => this.openAgentProfile(d.name));
+
+      node.append('text')
+        .attr('dy', -12)
+        .text(d => d.name.slice(0, 10));
+
+      // Update positions
+      simulation.on('tick', () => {
+        link
+          .attr('x1', d => d.source.x)
+          .attr('y1', d => d.source.y)
+          .attr('x2', d => d.target.x)
+          .attr('y2', d => d.target.y);
+
+        node.attr('transform', d => `translate(${d.x},${d.y})`);
+      });
+
+    } catch (e) {
+      console.error('Failed to fetch network:', e);
+      container.innerHTML = '<div class="network-empty">Failed to load network</div>';
+    }
+  }
+
+  async fetchTrends() {
+    const filesEl = document.getElementById('trendingFiles');
+    const agentsEl = document.getElementById('activeAgents');
+
+    if (!filesEl || !agentsEl) return;
+
+    try {
+      const response = await fetch('/api/trends?period=day');
+      const data = await response.json();
+
+      // Render trending files
+      if (data.trendingFiles.length === 0) {
+        filesEl.innerHTML = '<div class="trend-empty">No activity</div>';
+      } else {
+        filesEl.innerHTML = data.trendingFiles.map(f => `
+          <div class="trend-item">
+            <span class="trend-item-name" title="${this.escapeHtml(f.path)}">${this.escapeHtml(f.path)}</span>
+            <span class="trend-item-value">${f.edits} edits</span>
+          </div>
+        `).join('');
+      }
+
+      // Render active agents
+      if (data.activeAgents.length === 0) {
+        agentsEl.innerHTML = '<div class="trend-empty">No activity</div>';
+      } else {
+        agentsEl.innerHTML = data.activeAgents.map(a => `
+          <div class="trend-item">
+            <span class="trend-item-name agent-name-link" data-agent="${this.escapeHtml(a.name)}">${this.escapeHtml(a.name)}</span>
+            <span class="trend-item-value">${a.contributions}</span>
+          </div>
+        `).join('');
+
+        // Add click handlers
+        agentsEl.querySelectorAll('.agent-name-link').forEach(el => {
+          el.addEventListener('click', () => this.openAgentProfile(el.dataset.agent));
+        });
+      }
+
+    } catch (e) {
+      console.error('Failed to fetch trends:', e);
+      filesEl.innerHTML = '<div class="trend-empty">Failed to load</div>';
+      agentsEl.innerHTML = '<div class="trend-empty">Failed to load</div>';
     }
   }
 

@@ -1067,6 +1067,140 @@ app.get('/api/contributions/:id/diff', async (req, res) => {
   }
 });
 
+// API: Get agent network graph data
+app.get('/api/network/graph', (req, res) => {
+  // Build nodes from agents
+  const nodes = Array.from(agents.values()).map(agent => ({
+    id: agent.name,
+    name: agent.name,
+    contributions: agent.contributions,
+    avatar: agent.avatar,
+    specializations: agent.specializations,
+  }));
+
+  // Build edges from file collaborations
+  const edgeMap = new Map();
+
+  // Group contributions by file to find collaborators
+  const fileContributors = new Map();
+  for (const contrib of history) {
+    if (!fileContributors.has(contrib.file_path)) {
+      fileContributors.set(contrib.file_path, new Set());
+    }
+    fileContributors.get(contrib.file_path).add(contrib.agent_name);
+  }
+
+  // Create edges between agents who worked on the same files
+  for (const [filePath, contributors] of fileContributors) {
+    const contribArray = Array.from(contributors);
+    for (let i = 0; i < contribArray.length; i++) {
+      for (let j = i + 1; j < contribArray.length; j++) {
+        const key = [contribArray[i], contribArray[j]].sort().join('::');
+        if (!edgeMap.has(key)) {
+          edgeMap.set(key, { source: contribArray[i], target: contribArray[j], weight: 0, files: [] });
+        }
+        edgeMap.get(key).weight++;
+        if (!edgeMap.get(key).files.includes(filePath)) {
+          edgeMap.get(key).files.push(filePath);
+        }
+      }
+    }
+  }
+
+  const edges = Array.from(edgeMap.values());
+
+  res.json({
+    nodes,
+    edges,
+    stats: {
+      totalAgents: nodes.length,
+      totalConnections: edges.length,
+      totalCollaborativeFiles: fileContributors.size,
+    },
+  });
+});
+
+// API: Get trends (popular files, active agents)
+app.get('/api/trends', (req, res) => {
+  const { period = 'day' } = req.query;
+
+  // Calculate time threshold
+  const now = Date.now();
+  let timeThreshold = now - 24 * 60 * 60 * 1000; // Default: 24 hours
+  if (period === 'week') {
+    timeThreshold = now - 7 * 24 * 60 * 60 * 1000;
+  } else if (period === 'hour') {
+    timeThreshold = now - 60 * 60 * 1000;
+  }
+
+  // Filter recent contributions
+  const recentContribs = history.filter(h =>
+    new Date(h.timestamp).getTime() >= timeThreshold
+  );
+
+  // Count file edits
+  const fileEdits = new Map();
+  const agentActivity = new Map();
+
+  for (const contrib of recentContribs) {
+    // File popularity
+    fileEdits.set(contrib.file_path, (fileEdits.get(contrib.file_path) || 0) + 1);
+
+    // Agent activity
+    if (!agentActivity.has(contrib.agent_name)) {
+      agentActivity.set(contrib.agent_name, { contributions: 0, lastActive: null });
+    }
+    const activity = agentActivity.get(contrib.agent_name);
+    activity.contributions++;
+    if (!activity.lastActive || new Date(contrib.timestamp) > new Date(activity.lastActive)) {
+      activity.lastActive = contrib.timestamp;
+    }
+  }
+
+  // Sort and get top results
+  const trendingFiles = Array.from(fileEdits.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([path, edits]) => ({ path, edits }));
+
+  const activeAgents = Array.from(agentActivity.entries())
+    .sort((a, b) => b[1].contributions - a[1].contributions)
+    .slice(0, 10)
+    .map(([name, data]) => ({
+      name,
+      contributions: data.contributions,
+      lastActive: data.lastActive,
+    }));
+
+  res.json({
+    period,
+    trendingFiles,
+    activeAgents,
+    totalActivity: recentContribs.length,
+  });
+});
+
+// API: Get file history (for timeline)
+app.get('/api/files/:path(*)/history', (req, res) => {
+  const filePath = req.params.path;
+
+  const fileHistory = history
+    .filter(h => h.file_path === filePath)
+    .map(h => ({
+      id: h.id,
+      timestamp: h.timestamp,
+      agent_name: h.agent_name,
+      action: h.action,
+      message: h.message,
+    }));
+
+  res.json({
+    path: filePath,
+    history: fileHistory,
+    total: fileHistory.length,
+  });
+});
+
 // API: Get git log (timeline)
 app.get('/api/timeline', async (req, res) => {
   try {
