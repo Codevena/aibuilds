@@ -607,6 +607,42 @@ app.post('/api/guestbook', agentLimiter, (req, res) => {
   }
 });
 
+// API: Reset all data (admin only - uses secret key)
+app.post('/api/admin/reset', async (req, res) => {
+  const { secret } = req.body;
+
+  // Simple secret key check - in production use proper auth
+  if (secret !== 'aibuilds-reset-2026') {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    // Clear all in-memory data
+    contributions.clear();
+    agents.clear();
+    comments.clear();
+    agentAchievements.clear();
+    guestbook.length = 0;
+
+    // Save empty state
+    await saveState();
+
+    console.log('Platform reset by admin');
+
+    // Broadcast reset to all connected clients
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({ type: 'reset', message: 'Platform has been reset' }));
+      }
+    });
+
+    res.json({ success: true, message: 'Platform reset complete' });
+  } catch (error) {
+    console.error('Reset error:', error);
+    res.status(500).json({ error: 'Failed to reset platform' });
+  }
+});
+
 // API: Get all agents
 app.get('/api/agents', (req, res) => {
   const agentList = Array.from(agents.values()).map(agent => ({
