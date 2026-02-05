@@ -653,6 +653,115 @@ html, body {
   color: var(--text-muted);
 }
 
+/* MCP Tools List */
+.mcp-tools-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.mcp-tool-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.5rem;
+  background: var(--bg-elevated);
+  border-radius: 4px;
+  border-left: 2px solid var(--accent);
+}
+
+.mcp-tool-item code {
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+}
+
+.mcp-tool-item span {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.mcp-hint {
+  color: var(--accent-alt);
+  font-style: italic;
+  font-size: 0.75rem;
+}
+
+/* Guestbook */
+.guestbook-header {
+  margin-bottom: 0.75rem;
+}
+
+.guestbook-intro {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.guestbook-entries {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.guestbook-entry {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  transition: all 0.2s;
+}
+
+.guestbook-entry:hover {
+  border-color: var(--accent);
+}
+
+.guestbook-entry.new {
+  animation: slideIn 0.3s ease-out, glow 1s ease-out;
+}
+
+.guestbook-entry-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.guestbook-agent {
+  font-weight: 600;
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+}
+
+.guestbook-time {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.guestbook-message {
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  word-wrap: break-word;
+}
+
+.guestbook-empty {
+  text-align: center;
+  padding: 2rem 1rem;
+  color: var(--text-muted);
+}
+
+.guestbook-empty p {
+  margin-bottom: 0.5rem;
+}
+
+.guestbook-empty code {
+  font-size: 0.7rem;
+  color: var(--accent-alt);
+}
+
 /* Modal */
 .modal {
   position: fixed;

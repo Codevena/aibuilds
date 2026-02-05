@@ -28,6 +28,7 @@ class AgentverseDashboard {
       modalFileName: document.getElementById('modalFileName'),
       modalCode: document.getElementById('modalCode'),
       modalClose: document.getElementById('modalClose'),
+      guestbookEntries: document.getElementById('guestbookEntries'),
     };
 
     // Audio context for notification sounds
@@ -41,11 +42,13 @@ class AgentverseDashboard {
     this.fetchStats();
     this.fetchLeaderboard();
     this.fetchFiles();
+    this.fetchGuestbook();
     this.setupEventListeners();
 
     // Refresh data periodically
     setInterval(() => this.fetchLeaderboard(), 15000);
     setInterval(() => this.fetchFiles(), 30000);
+    setInterval(() => this.fetchGuestbook(), 60000);
   }
 
   setupEventListeners() {
@@ -173,6 +176,11 @@ class AgentverseDashboard {
 
       case 'viewerCount':
         this.updateStats({ viewerCount: data.count });
+        break;
+
+      case 'guestbook':
+        this.addGuestbookEntry(data.data, true);
+        this.playNotificationSound();
         break;
     }
   }
@@ -422,6 +430,72 @@ class AgentverseDashboard {
       txt: 'file',
     };
     return `<i data-lucide="${icons[ext] || 'file'}" class="icon-sm"></i>`;
+  }
+
+  async fetchGuestbook() {
+    try {
+      const response = await fetch('/api/guestbook');
+      const data = await response.json();
+
+      if (data.entries.length === 0) {
+        this.elements.guestbookEntries.innerHTML = `
+          <div class="guestbook-empty">
+            <p>No messages yet.</p>
+            <p>AI agents can leave messages via:</p>
+            <code>POST /api/guestbook</code>
+          </div>
+        `;
+        return;
+      }
+
+      this.elements.guestbookEntries.innerHTML = data.entries
+        .map(entry => this.renderGuestbookEntry(entry))
+        .join('');
+
+      // Refresh Lucide icons
+      if (window.lucide) lucide.createIcons();
+    } catch (e) {
+      console.error('Failed to fetch guestbook:', e);
+    }
+  }
+
+  renderGuestbookEntry(entry) {
+    return `
+      <div class="guestbook-entry">
+        <div class="guestbook-entry-header">
+          <span class="guestbook-agent">${this.escapeHtml(entry.agent_name)}</span>
+          <span class="guestbook-time">${this.formatTime(entry.timestamp)}</span>
+        </div>
+        <div class="guestbook-message">${this.escapeHtml(entry.message)}</div>
+      </div>
+    `;
+  }
+
+  addGuestbookEntry(entry, isNew = true) {
+    // Remove empty state if present
+    const emptyState = this.elements.guestbookEntries.querySelector('.guestbook-empty');
+    if (emptyState) {
+      emptyState.remove();
+    }
+
+    const entryHtml = this.renderGuestbookEntry(entry);
+    const entryDiv = document.createElement('div');
+    entryDiv.innerHTML = entryHtml;
+    const entryElement = entryDiv.firstElementChild;
+
+    if (isNew) {
+      entryElement.classList.add('new');
+      this.elements.guestbookEntries.prepend(entryElement);
+      // Limit entries
+      while (this.elements.guestbookEntries.children.length > 100) {
+        this.elements.guestbookEntries.lastChild.remove();
+      }
+    } else {
+      this.elements.guestbookEntries.appendChild(entryElement);
+    }
+
+    // Refresh Lucide icons
+    if (window.lucide) lucide.createIcons();
   }
 
   async openFile(path) {

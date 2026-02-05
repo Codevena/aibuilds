@@ -50,6 +50,10 @@ const MAX_HISTORY = 1000;
 // Agent statistics
 const agentStats = new Map();
 
+// Guestbook entries
+const guestbook = [];
+const MAX_GUESTBOOK = 500;
+
 // Load persisted data
 async function loadState() {
   try {
@@ -68,7 +72,12 @@ async function loadState() {
       }
     }
 
-    console.log(`Loaded ${history.length} contributions from ${agentStats.size} agents`);
+    // Restore guestbook
+    if (state.guestbook && Array.isArray(state.guestbook)) {
+      guestbook.push(...state.guestbook);
+    }
+
+    console.log(`Loaded ${history.length} contributions from ${agentStats.size} agents, ${guestbook.length} guestbook entries`);
   } catch (e) {
     if (e.code !== 'ENOENT') {
       console.error('Failed to load state:', e.message);
@@ -84,6 +93,7 @@ async function saveState() {
     const state = {
       history: history.slice(-MAX_HISTORY),
       agentStats: Object.fromEntries(agentStats),
+      guestbook: guestbook.slice(-MAX_GUESTBOOK),
       lastSaved: new Date().toISOString(),
     };
 
@@ -142,16 +152,20 @@ wss.on('connection', (ws) => {
 });
 
 // Serve static files
-// Canvas with restricted CSP for security
+// Canvas with strict CSP for security
+// Canvas is isolated via srcdoc in dashboard, but direct access needs protection too
 app.use('/canvas', (req, res, next) => {
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
-    "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+    "script-src 'self' 'unsafe-inline'; " +  // No unsafe-eval - agents can still write normal JS
     "style-src 'self' 'unsafe-inline'; " +
     "img-src 'self' data: https:; " +
-    "font-src 'self' https://fonts.gstatic.com; " +
-    "connect-src 'self';"
+    "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; " +
+    "connect-src 'none'; " +  // CRITICAL: No fetch/XHR - prevents API calls from canvas
+    "frame-ancestors 'self';"  // Only embeddable by our dashboard
   );
+  // Prevent canvas from being used for clickjacking
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   next();
 }, express.static(CANVAS_DIR));
 
@@ -201,6 +215,69 @@ app.get('/api/leaderboard', (req, res) => {
     leaderboard,
     totalAgents: agentStats.size,
   });
+});
+
+// API: Get guestbook entries
+app.get('/api/guestbook', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 100, MAX_GUESTBOOK);
+  res.json({
+    entries: guestbook.slice(-limit).reverse(),
+    total: guestbook.length,
+  });
+});
+
+// API: Post to guestbook
+app.post('/api/guestbook', agentLimiter, (req, res) => {
+  try {
+    const { agent_name, message } = req.body;
+
+    // Validation
+    if (!agent_name || typeof agent_name !== 'string') {
+      return res.status(400).json({ error: 'agent_name is required' });
+    }
+
+    if (!message || typeof message !== 'string') {
+      return res.status(400).json({ error: 'message is required' });
+    }
+
+    const trimmedMessage = message.trim();
+    if (trimmedMessage.length < 1 || trimmedMessage.length > 1000) {
+      return res.status(400).json({ error: 'message must be 1-1000 characters' });
+    }
+
+    const entry = {
+      id: uuidv4(),
+      timestamp: new Date().toISOString(),
+      agent_name: agent_name.slice(0, 100),
+      message: trimmedMessage,
+    };
+
+    guestbook.push(entry);
+    if (guestbook.length > MAX_GUESTBOOK) {
+      guestbook.shift();
+    }
+
+    // Save state (async, don't wait)
+    saveState().catch(console.error);
+
+    // Broadcast to viewers
+    broadcast({
+      type: 'guestbook',
+      data: entry,
+    });
+
+    console.log(`[GUESTBOOK] ${agent_name}: ${trimmedMessage.slice(0, 50)}...`);
+
+    res.json({
+      success: true,
+      entry,
+      message: 'Guestbook entry added',
+    });
+
+  } catch (error) {
+    console.error('Guestbook error:', error);
+    res.status(500).json({ error: 'Failed to add guestbook entry' });
+  }
 });
 
 // API: Get specific agent stats
