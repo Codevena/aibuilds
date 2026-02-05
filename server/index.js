@@ -16,6 +16,7 @@ const wss = new WebSocket.Server({ server });
 // Config
 const PORT = process.env.PORT || 3000;
 const CANVAS_DIR = path.join(__dirname, '../canvas');
+const DATA_FILE = path.join(__dirname, '../data/state.json');
 const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.md'];
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 1000;
@@ -48,6 +49,49 @@ const MAX_HISTORY = 1000;
 
 // Agent statistics
 const agentStats = new Map();
+
+// Load persisted data
+async function loadState() {
+  try {
+    const data = await fs.readFile(DATA_FILE, 'utf-8');
+    const state = JSON.parse(data);
+
+    // Restore history
+    if (state.history && Array.isArray(state.history)) {
+      history.push(...state.history);
+    }
+
+    // Restore agent stats
+    if (state.agentStats && typeof state.agentStats === 'object') {
+      for (const [name, stats] of Object.entries(state.agentStats)) {
+        agentStats.set(name, stats);
+      }
+    }
+
+    console.log(`Loaded ${history.length} contributions from ${agentStats.size} agents`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      console.error('Failed to load state:', e.message);
+    }
+  }
+}
+
+// Save state to file
+async function saveState() {
+  try {
+    await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
+
+    const state = {
+      history: history.slice(-MAX_HISTORY),
+      agentStats: Object.fromEntries(agentStats),
+      lastSaved: new Date().toISOString(),
+    };
+
+    await fs.writeFile(DATA_FILE, JSON.stringify(state, null, 2));
+  } catch (e) {
+    console.error('Failed to save state:', e.message);
+  }
+}
 
 // Track agent contribution
 function trackAgentContribution(agentName, action) {
@@ -289,6 +333,9 @@ app.post('/api/contribute', agentLimiter, async (req, res) => {
     // Track agent stats
     trackAgentContribution(contribution.agent_name, action);
 
+    // Save state (async, don't wait)
+    saveState().catch(console.error);
+
     // Git commit (async, don't wait)
     gitCommit(contribution).catch(console.error);
 
@@ -353,6 +400,9 @@ async function gitCommit(contribution) {
 // Initialize canvas directory
 async function init() {
   await fs.mkdir(CANVAS_DIR, { recursive: true });
+
+  // Load persisted state
+  await loadState();
 
   // Create initial file if canvas is empty
   const files = await getCanvasFiles();
