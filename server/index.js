@@ -46,6 +46,28 @@ const viewers = new Set();
 const history = [];
 const MAX_HISTORY = 1000;
 
+// Agent statistics
+const agentStats = new Map();
+
+// Track agent contribution
+function trackAgentContribution(agentName, action) {
+  if (!agentStats.has(agentName)) {
+    agentStats.set(agentName, {
+      name: agentName,
+      contributions: 0,
+      creates: 0,
+      edits: 0,
+      deletes: 0,
+      firstSeen: new Date().toISOString(),
+      lastSeen: new Date().toISOString(),
+    });
+  }
+  const stats = agentStats.get(agentName);
+  stats.contributions++;
+  stats[action + 's']++;
+  stats.lastSeen = new Date().toISOString();
+}
+
 // Broadcast to all viewers
 function broadcast(data) {
   const message = JSON.stringify(data);
@@ -97,7 +119,53 @@ app.get('/api/stats', async (req, res) => {
 // API: Get contribution history
 app.get('/api/history', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, MAX_HISTORY);
-  res.json(history.slice(-limit));
+  const offset = parseInt(req.query.offset) || 0;
+  res.json({
+    items: history.slice(-(limit + offset), offset ? -offset : undefined),
+    total: history.length,
+    hasMore: history.length > limit + offset,
+  });
+});
+
+// API: Get agent leaderboard
+app.get('/api/leaderboard', (req, res) => {
+  const leaderboard = Array.from(agentStats.values())
+    .sort((a, b) => b.contributions - a.contributions)
+    .slice(0, 50);
+  res.json({
+    leaderboard,
+    totalAgents: agentStats.size,
+  });
+});
+
+// API: Get specific agent stats
+app.get('/api/agents/:name', (req, res) => {
+  const stats = agentStats.get(req.params.name);
+  if (!stats) {
+    return res.status(404).json({ error: 'Agent not found' });
+  }
+
+  // Get agent's recent contributions
+  const agentHistory = history
+    .filter(h => h.agent_name === req.params.name)
+    .slice(-50);
+
+  res.json({ ...stats, recentContributions: agentHistory });
+});
+
+// API: Get git log (timeline)
+app.get('/api/timeline', async (req, res) => {
+  try {
+    const log = await git.log({ maxCount: 100 });
+    res.json(log.all.map(commit => ({
+      hash: commit.hash.slice(0, 7),
+      date: commit.date,
+      message: commit.message,
+      author: commit.author_name,
+    })));
+  } catch (e) {
+    res.json([]);
+  }
 });
 
 // API: Read a canvas file
@@ -208,6 +276,9 @@ app.post('/api/contribute', agentLimiter, async (req, res) => {
     if (history.length > MAX_HISTORY) {
       history.shift();
     }
+
+    // Track agent stats
+    trackAgentContribution(contribution.agent_name, action);
 
     // Git commit (async, don't wait)
     gitCommit(contribution).catch(console.error);

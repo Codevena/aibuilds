@@ -6,17 +6,32 @@ class AgentverseDashboard {
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10;
     this.reconnectDelay = 1000;
+    this.soundEnabled = true;
+    this.autoScroll = true;
 
     this.elements = {
       viewerCount: document.getElementById('viewerCount'),
       contributionCount: document.getElementById('contributionCount'),
+      agentCount: document.getElementById('agentCount'),
       fileCount: document.getElementById('fileCount'),
       statusDot: document.getElementById('statusDot'),
       connectionStatus: document.getElementById('connectionStatus'),
       feed: document.getElementById('feed'),
-      fileList: document.getElementById('fileList'),
+      leaderboard: document.getElementById('leaderboard'),
+      fileTree: document.getElementById('fileTree'),
       canvasFrame: document.getElementById('canvasFrame'),
+      canvasOverlay: document.getElementById('canvasOverlay'),
+      soundToggle: document.getElementById('soundToggle'),
+      autoScrollCheckbox: document.getElementById('autoScroll'),
+      refreshCanvas: document.getElementById('refreshCanvas'),
+      fileModal: document.getElementById('fileModal'),
+      modalFileName: document.getElementById('modalFileName'),
+      modalCode: document.getElementById('modalCode'),
+      modalClose: document.getElementById('modalClose'),
     };
+
+    // Audio context for notification sounds
+    this.audioCtx = null;
 
     this.init();
   }
@@ -24,10 +39,51 @@ class AgentverseDashboard {
   init() {
     this.connectWebSocket();
     this.fetchStats();
+    this.fetchLeaderboard();
     this.fetchFiles();
+    this.setupEventListeners();
 
-    // Refresh files periodically
+    // Refresh data periodically
+    setInterval(() => this.fetchLeaderboard(), 15000);
     setInterval(() => this.fetchFiles(), 30000);
+  }
+
+  setupEventListeners() {
+    // Sound toggle
+    this.elements.soundToggle.addEventListener('click', () => {
+      this.soundEnabled = !this.soundEnabled;
+      this.elements.soundToggle.textContent = this.soundEnabled ? '🔊' : '🔇';
+      this.elements.soundToggle.classList.toggle('muted', !this.soundEnabled);
+    });
+
+    // Auto-scroll toggle
+    this.elements.autoScrollCheckbox.addEventListener('change', (e) => {
+      this.autoScroll = e.target.checked;
+    });
+
+    // Refresh canvas button
+    this.elements.refreshCanvas.addEventListener('click', () => {
+      this.refreshCanvas();
+    });
+
+    // Tabs
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+      });
+    });
+
+    // Modal close
+    this.elements.modalClose.addEventListener('click', () => this.closeModal());
+    this.elements.fileModal.addEventListener('click', (e) => {
+      if (e.target === this.elements.fileModal) this.closeModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') this.closeModal();
+    });
   }
 
   connectWebSocket() {
@@ -73,7 +129,6 @@ class AgentverseDashboard {
 
   updateConnectionStatus(status) {
     const { statusDot, connectionStatus } = this.elements;
-
     statusDot.className = 'status-dot';
 
     switch (status) {
@@ -102,14 +157,18 @@ class AgentverseDashboard {
           this.elements.feed.innerHTML = '';
           data.recentHistory.forEach(item => this.addFeedItem(item, false));
         }
+        this.fetchLeaderboard();
         break;
 
       case 'contribution':
         this.addFeedItem(data.data, true);
         this.updateStats({ viewerCount: data.viewerCount });
         this.incrementContributions();
+        this.flashCanvas();
         this.refreshCanvas();
         this.fetchFiles();
+        this.fetchLeaderboard();
+        this.playNotificationSound();
         break;
 
       case 'viewerCount':
@@ -118,24 +177,48 @@ class AgentverseDashboard {
     }
   }
 
-  updateStats({ viewerCount, contributionCount, fileCount }) {
+  updateStats({ viewerCount, contributionCount, fileCount, agentCount }) {
     if (viewerCount !== undefined) {
-      this.elements.viewerCount.textContent = viewerCount;
+      this.animateNumber(this.elements.viewerCount, viewerCount);
     }
     if (contributionCount !== undefined) {
-      this.elements.contributionCount.textContent = contributionCount;
+      this.animateNumber(this.elements.contributionCount, contributionCount);
     }
     if (fileCount !== undefined) {
-      this.elements.fileCount.textContent = fileCount;
+      this.animateNumber(this.elements.fileCount, fileCount);
     }
+    if (agentCount !== undefined) {
+      this.animateNumber(this.elements.agentCount, agentCount);
+    }
+  }
+
+  animateNumber(element, target) {
+    const current = parseInt(element.textContent) || 0;
+    if (current === target) return;
+
+    const duration = 300;
+    const start = performance.now();
+
+    const animate = (now) => {
+      const elapsed = now - start;
+      const progress = Math.min(elapsed / duration, 1);
+      const value = Math.round(current + (target - current) * progress);
+      element.textContent = value;
+
+      if (progress < 1) {
+        requestAnimationFrame(animate);
+      }
+    };
+
+    requestAnimationFrame(animate);
   }
 
   incrementContributions() {
     const current = parseInt(this.elements.contributionCount.textContent) || 0;
-    this.elements.contributionCount.textContent = current + 1;
+    this.animateNumber(this.elements.contributionCount, current + 1);
   }
 
-  addFeedItem(item, prepend = true) {
+  addFeedItem(item, isNew = true) {
     // Remove empty state if present
     const emptyState = this.elements.feed.querySelector('.feed-empty');
     if (emptyState) {
@@ -149,7 +232,7 @@ class AgentverseDashboard {
     };
 
     const feedItem = document.createElement('div');
-    feedItem.className = `feed-item action-${item.action}`;
+    feedItem.className = `feed-item action-${item.action}${isNew ? ' new' : ''}`;
     feedItem.innerHTML = `
       <span class="feed-icon">${actionIcons[item.action] || '📝'}</span>
       <div class="feed-content">
@@ -158,13 +241,19 @@ class AgentverseDashboard {
           <span class="feed-time">${this.formatTime(item.timestamp)}</span>
         </div>
         <div class="feed-action">
-          ${item.action} <span class="feed-file">${this.escapeHtml(item.file_path)}</span>
+          ${item.action} <span class="feed-file" data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
         </div>
         ${item.message ? `<div class="feed-message">"${this.escapeHtml(item.message)}"</div>` : ''}
       </div>
     `;
 
-    if (prepend) {
+    // Add click handler for file
+    const fileLink = feedItem.querySelector('.feed-file');
+    if (fileLink && item.action !== 'delete') {
+      fileLink.addEventListener('click', () => this.openFile(item.file_path));
+    }
+
+    if (isNew) {
       this.elements.feed.prepend(feedItem);
       // Limit feed items
       while (this.elements.feed.children.length > 100) {
@@ -173,13 +262,52 @@ class AgentverseDashboard {
     } else {
       this.elements.feed.appendChild(feedItem);
     }
+
+    // Auto-scroll
+    if (this.autoScroll && isNew) {
+      this.elements.feed.scrollTop = 0;
+    }
+  }
+
+  flashCanvas() {
+    this.elements.canvasOverlay.classList.remove('flash');
+    void this.elements.canvasOverlay.offsetWidth; // Trigger reflow
+    this.elements.canvasOverlay.classList.add('flash');
   }
 
   refreshCanvas() {
-    // Add cache-busting to refresh the iframe
     const frame = this.elements.canvasFrame;
     const src = frame.src.split('?')[0];
     frame.src = `${src}?t=${Date.now()}`;
+  }
+
+  playNotificationSound() {
+    if (!this.soundEnabled) return;
+
+    // Lazy init audio context
+    if (!this.audioCtx) {
+      this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+
+    const ctx = this.audioCtx;
+    const now = ctx.currentTime;
+
+    // Create oscillator for a pleasant notification sound
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, now); // A5
+    osc.frequency.setValueAtTime(1100, now + 0.1); // C#6
+
+    gain.gain.setValueAtTime(0.1, now);
+    gain.gain.exponentialDecayTo(0.001, now + 0.3);
+
+    osc.start(now);
+    osc.stop(now + 0.3);
   }
 
   async fetchStats() {
@@ -196,6 +324,46 @@ class AgentverseDashboard {
     }
   }
 
+  async fetchLeaderboard() {
+    try {
+      const response = await fetch('/api/leaderboard');
+      const data = await response.json();
+
+      this.updateStats({ agentCount: data.totalAgents });
+
+      if (data.leaderboard.length === 0) {
+        this.elements.leaderboard.innerHTML = `
+          <div class="loading">No agents yet. Be the first to contribute!</div>
+        `;
+        return;
+      }
+
+      this.elements.leaderboard.innerHTML = data.leaderboard
+        .map((agent, i) => `
+          <div class="leaderboard-item rank-${i + 1}">
+            <span class="rank">${this.getRankDisplay(i + 1)}</span>
+            <div class="agent-info">
+              <div class="agent-name">${this.escapeHtml(agent.name)}</div>
+              <div class="agent-stats">
+                ${agent.creates}✨ ${agent.edits}✏️ ${agent.deletes}🗑️
+              </div>
+            </div>
+            <span class="contribution-count">${agent.contributions}</span>
+          </div>
+        `)
+        .join('');
+    } catch (e) {
+      console.error('Failed to fetch leaderboard:', e);
+    }
+  }
+
+  getRankDisplay(rank) {
+    if (rank === 1) return '🥇';
+    if (rank === 2) return '🥈';
+    if (rank === 3) return '🥉';
+    return rank;
+  }
+
   async fetchFiles() {
     try {
       const response = await fetch('/api/files');
@@ -204,21 +372,62 @@ class AgentverseDashboard {
       this.updateStats({ fileCount: files.length });
 
       if (files.length === 0) {
-        this.elements.fileList.innerHTML = '<span class="loading">No files yet...</span>';
+        this.elements.fileTree.innerHTML = '<div class="loading">No files yet...</div>';
         return;
       }
 
-      this.elements.fileList.innerHTML = files
+      this.elements.fileTree.innerHTML = files
         .map(file => `
-          <div class="file-item">
+          <div class="file-item" data-path="${this.escapeHtml(file.path)}">
+            <span class="file-icon">${this.getFileIcon(file.path)}</span>
             <span class="file-name">${this.escapeHtml(file.path)}</span>
             <span class="file-size">${this.formatSize(file.size)}</span>
           </div>
         `)
         .join('');
+
+      // Add click handlers
+      this.elements.fileTree.querySelectorAll('.file-item').forEach(item => {
+        item.addEventListener('click', () => {
+          this.openFile(item.dataset.path);
+        });
+      });
     } catch (e) {
       console.error('Failed to fetch files:', e);
     }
+  }
+
+  getFileIcon(path) {
+    const ext = path.split('.').pop().toLowerCase();
+    const icons = {
+      html: '📄',
+      css: '🎨',
+      js: '⚡',
+      json: '📋',
+      svg: '🖼️',
+      md: '📝',
+      txt: '📃',
+    };
+    return icons[ext] || '📁';
+  }
+
+  async openFile(path) {
+    try {
+      const response = await fetch(`/api/canvas/${path}`);
+      if (!response.ok) throw new Error('Failed to load file');
+
+      const data = await response.json();
+
+      this.elements.modalFileName.textContent = path;
+      this.elements.modalCode.textContent = data.content;
+      this.elements.fileModal.classList.add('open');
+    } catch (e) {
+      console.error('Failed to open file:', e);
+    }
+  }
+
+  closeModal() {
+    this.elements.fileModal.classList.remove('open');
   }
 
   formatTime(timestamp) {
@@ -250,6 +459,13 @@ class AgentverseDashboard {
     div.textContent = text;
     return div.innerHTML;
   }
+}
+
+// Polyfill for exponentialDecayTo (not standard)
+if (!GainNode.prototype.exponentialDecayTo) {
+  GainNode.prototype.exponentialDecayTo = function(value, endTime) {
+    this.gain.exponentialRampToValueAtTime(Math.max(value, 0.0001), endTime);
+  };
 }
 
 // Initialize
