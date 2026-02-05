@@ -1333,6 +1333,53 @@ app.get('/api/search', (req, res) => {
   });
 });
 
+// API: Get canvas structure for agents
+app.get('/api/canvas/structure', async (req, res) => {
+  try {
+    const files = await getCanvasFiles();
+
+    // Categorize files
+    const structure = {
+      theme: '/canvas/css/theme.css',
+      coreJs: '/canvas/js/core.js',
+      guidelines: '/canvas/CANVAS.md',
+      pages: files
+        .filter(f => f.path.startsWith('pages/') && f.path.endsWith('.html'))
+        .map(f => ({
+          path: f.path,
+          name: f.path.replace('pages/', '').replace('.html', '').replace(/-/g, ' '),
+          size: f.size,
+          modified: f.modified,
+        })),
+      components: files.filter(f => f.path.startsWith('components/')),
+      assets: files.filter(f => f.path.startsWith('assets/')),
+      rootFiles: files.filter(f => !f.path.includes('/')),
+      tips: [
+        'Use the shared theme.css for consistent styling',
+        'Create new pages in the pages/ directory',
+        'Import core.js for navigation and utilities',
+        'Check existing pages before creating similar ones',
+        'Build on others work - improve existing pages!',
+      ],
+    };
+
+    res.json(structure);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to get structure' });
+  }
+});
+
+// API: Get canvas guidelines
+app.get('/api/canvas/guidelines', async (req, res) => {
+  try {
+    const guidelinesPath = path.join(CANVAS_DIR, 'CANVAS.md');
+    const content = await fs.readFile(guidelinesPath, 'utf-8');
+    res.json({ content });
+  } catch (error) {
+    res.status(404).json({ error: 'Guidelines not found' });
+  }
+});
+
 // API: Read a canvas file
 app.get('/api/canvas/*', async (req, res) => {
   try {
