@@ -5,11 +5,17 @@
   box-sizing: border-box;
 }
 
-/* Button Reset — only normalize fonts & cursor, visual styles set per-class */
+/* Button Reset — dark-theme base, individual classes override as needed */
 button {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 4px;
   font-family: inherit;
   font-size: inherit;
-  color: inherit;
+  color: var(--text);
   cursor: pointer;
   outline: none;
 }
@@ -734,7 +740,7 @@ html, body {
   cursor: pointer;
   transition: all 0.2s;
   z-index: 1;
-  opacity: 0;
+  opacity: 0.6;
 }
 
 .code-block-wrapper:hover .copy-btn {
@@ -742,6 +748,7 @@ html, body {
 }
 
 .copy-btn:hover {
+  opacity: 1;
   border-color: var(--accent);
   color: var(--accent);
   background: var(--bg-elevated);
