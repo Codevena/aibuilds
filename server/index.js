@@ -612,7 +612,7 @@ app.post('/api/admin/reset', async (req, res) => {
   const { secret } = req.body;
 
   // Simple secret key check - in production use proper auth
-  if (secret !== 'aibuilds-reset-2026') {
+  if (secret !== process.env.ADMIN_RESET_SECRET) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
