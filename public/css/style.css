@@ -181,6 +181,10 @@ html, body {
   cursor: pointer;
   font-size: 1.2rem;
   transition: all 0.2s;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .sound-toggle:hover {
@@ -687,11 +691,12 @@ html, body {
   font-size: 0.7rem;
 }
 
-.mcp-config-block {
+/* Code Block Copy Button */
+.code-block-wrapper {
   position: relative;
 }
 
-.mcp-copy-btn {
+.copy-btn {
   position: absolute;
   top: 0.5rem;
   right: 0.5rem;
@@ -699,26 +704,33 @@ html, body {
   align-items: center;
   gap: 0.3rem;
   padding: 0.3rem 0.6rem;
-  background: var(--bg-elevated);
+  background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--text-muted);
   font-size: 0.65rem;
-  font-family: inherit;
+  font-family: 'JetBrains Mono', monospace;
   cursor: pointer;
   transition: all 0.2s;
   z-index: 1;
+  opacity: 0;
 }
 
-.mcp-copy-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
+.code-block-wrapper:hover .copy-btn {
+  opacity: 1;
 }
 
-.mcp-copy-btn.copied {
+.copy-btn:hover {
   border-color: var(--accent);
   color: var(--accent);
-  background: rgba(0, 255, 136, 0.1);
+  background: var(--bg-elevated);
+}
+
+.copy-btn.copied {
+  opacity: 1;
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(0, 255, 136, 0.15);
 }
 
 .mcp-hint {
@@ -2012,7 +2024,7 @@ html, body {
   font-size: 0.8rem;
 }
 
-/* Responsive */
+/* Responsive - Tablet */
 @media (max-width: 1000px) {
   .app {
     grid-template-columns: 1fr;
@@ -2020,7 +2032,9 @@ html, body {
       "header"
       "main"
       "sidebar";
-    grid-template-rows: auto 1fr 300px;
+    grid-template-rows: auto 1fr auto;
+    height: auto;
+    min-height: 100vh;
   }
 
   .tagline { display: none; }
@@ -2030,20 +2044,87 @@ html, body {
 
   .sidebar {
     border-top: 1px solid var(--border);
+    min-height: 400px;
+    max-height: 60vh;
+  }
+
+  .canvas-section {
+    min-height: 300px;
+  }
+
+  .feed-section {
+    height: 200px;
+  }
+
+  /* Tabs scroll horizontally on tablet */
+  .sidebar-tabs {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .sidebar-tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tab {
+    white-space: nowrap;
+    min-width: 0;
+    flex-shrink: 0;
+  }
+
+  /* Modal responsive */
+  .modal-content {
+    width: 95%;
+    max-height: 90vh;
+  }
+
+  .file-modal-body {
+    flex-direction: column;
+    max-height: 75vh;
+  }
+
+  .file-comments-section {
+    width: 100%;
+    max-height: 200px;
+    border-top: 1px solid var(--border);
+  }
+
+  .file-modal-body .modal-code {
+    border-right: none;
+    max-height: 50vh;
+  }
+
+  /* Network graph */
+  .trends-grid {
+    grid-template-columns: 1fr;
   }
 }
 
+/* Responsive - Mobile */
 @media (max-width: 600px) {
+  .app {
+    grid-template-rows: auto 1fr auto;
+  }
+
   .header {
     flex-direction: column;
-    gap: 0.75rem;
-    padding: 0.75rem;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+  }
+
+  .logo h1 {
+    font-size: 1.1rem;
   }
 
   .stats {
     flex-wrap: wrap;
     justify-content: center;
+    gap: 0.5rem;
   }
+
+  .stat-value { font-size: 1rem; }
+  .stat-label { font-size: 0.55rem; }
 
   .canvas-controls, .feed-controls {
     margin-left: 0;
@@ -2051,11 +2132,187 @@ html, body {
 
   .section-header {
     flex-wrap: wrap;
-    justify-content: center;
-    text-align: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
   }
 
   .section-header h2 {
+    font-size: 0.8rem;
+  }
+
+  .section-header .subtitle {
+    display: none;
+  }
+
+  /* Canvas */
+  .canvas-wrapper {
+    padding: 0.5rem;
+  }
+
+  .canvas-section {
+    min-height: 250px;
+  }
+
+  .feed-section {
+    height: 160px;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    min-height: 350px;
+    max-height: 70vh;
+  }
+
+  .sidebar > .search-container {
+    padding: 0.5rem;
+  }
+
+  .tab {
+    padding: 0.6rem 0.35rem;
+    font-size: 0.65rem;
+  }
+
+  .tab-content {
+    padding: 0.5rem;
+  }
+
+  /* Leaderboard filters */
+  .leaderboard-filters {
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .filter-btn {
+    padding: 0.3rem 0.5rem;
+    font-size: 0.65rem;
+  }
+
+  /* Heatmap */
+  .heatmap-day {
+    width: 8px;
+    height: 8px;
+  }
+
+  .heatmap-legend-item {
+    width: 8px;
+    height: 8px;
+  }
+
+  /* Leaderboard items */
+  .leaderboard-item {
+    padding: 0.5rem;
+    gap: 0.5rem;
+  }
+
+  .contribution-count {
+    font-size: 0.9rem;
+  }
+
+  /* Guestbook */
+  .guestbook-entry {
+    padding: 0.5rem;
+  }
+
+  /* Code blocks */
+  .api-example {
+    font-size: 0.6rem;
+    padding: 0.5rem;
+  }
+
+  .copy-btn {
+    opacity: 1;
+    padding: 0.25rem 0.45rem;
+    font-size: 0.6rem;
+  }
+
+  /* MCP tools */
+  .mcp-tool-item {
+    padding: 0.4rem;
+  }
+
+  /* Network */
+  .network-graph {
+    height: 140px;
+  }
+
+  /* Modal - full screen on mobile */
+  .modal-content {
     width: 100%;
+    max-width: 100%;
+    max-height: 100vh;
+    border-radius: 0;
+    margin: 0;
+  }
+
+  .agent-modal-content {
+    max-width: 100%;
+  }
+
+  .diff-modal-content {
+    max-width: 100%;
+  }
+
+  .agent-stats-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.35rem;
+  }
+
+  .agent-stat-value {
+    font-size: 1.1rem;
+  }
+
+  .agent-stat-label {
+    font-size: 0.55rem;
+  }
+
+  /* Achievement popup */
+  .achievement-popup {
+    right: 10px;
+    left: 10px;
+  }
+
+  .achievement-popup-content {
+    padding: 0.75rem 1rem;
+  }
+
+  .achievement-icon {
+    font-size: 1.8rem;
+  }
+
+  .achievement-name {
+    font-size: 0.9rem;
+  }
+}
+
+/* Responsive - Very small screens */
+@media (max-width: 380px) {
+  .stats {
+    gap: 0.35rem;
+  }
+
+  .stat {
+    min-width: 0;
+  }
+
+  .stat-value {
+    font-size: 0.85rem;
+  }
+
+  .logo h1 {
+    font-size: 0.95rem;
+    letter-spacing: 0.1em;
+  }
+
+  .tab {
+    padding: 0.5rem 0.25rem;
+    font-size: 0.6rem;
+  }
+
+  .filter-group {
+    gap: 0.15rem;
+  }
+
+  .filter-btn {
+    padding: 0.25rem 0.4rem;
   }
 }

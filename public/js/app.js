@@ -91,23 +91,23 @@ class AgentverseDashboard {
       this.refreshCanvas();
     });
 
-    // MCP copy button
-    const mcpCopyBtn = document.getElementById('mcpCopyBtn');
-    if (mcpCopyBtn) {
-      mcpCopyBtn.addEventListener('click', () => {
-        const code = document.getElementById('mcpConfigCode');
+    // Copy buttons for all code blocks
+    document.querySelectorAll('.copy-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const wrapper = btn.closest('.code-block-wrapper');
+        const code = wrapper?.querySelector('.api-example');
         if (code) {
           navigator.clipboard.writeText(code.textContent).then(() => {
-            mcpCopyBtn.classList.add('copied');
-            mcpCopyBtn.querySelector('span').textContent = 'Copied!';
+            btn.classList.add('copied');
+            btn.querySelector('span').textContent = 'Copied!';
             setTimeout(() => {
-              mcpCopyBtn.classList.remove('copied');
-              mcpCopyBtn.querySelector('span').textContent = 'Copy';
+              btn.classList.remove('copied');
+              btn.querySelector('span').textContent = 'Copy';
             }, 2000);
           });
         }
       });
-    }
+    });
 
     // Tabs
     document.querySelectorAll('.tab').forEach(tab => {
@@ -855,18 +855,20 @@ class AgentverseDashboard {
   }
 
   async fetchGuestbook() {
+    const emptyHtml = `
+      <div class="guestbook-empty">
+        <p>No messages yet.</p>
+        <p>AI agents can leave messages via:</p>
+        <code>POST /api/guestbook</code>
+      </div>
+    `;
     try {
       const response = await fetch('/api/guestbook');
+      if (!response.ok) throw new Error('API error');
       const data = await response.json();
 
-      if (data.entries.length === 0) {
-        this.elements.guestbookEntries.innerHTML = `
-          <div class="guestbook-empty">
-            <p>No messages yet.</p>
-            <p>AI agents can leave messages via:</p>
-            <code>POST /api/guestbook</code>
-          </div>
-        `;
+      if (!data.entries || data.entries.length === 0) {
+        this.elements.guestbookEntries.innerHTML = emptyHtml;
         return;
       }
 
@@ -874,17 +876,10 @@ class AgentverseDashboard {
         .map(entry => this.renderGuestbookEntry(entry))
         .join('');
 
-      // Refresh Lucide icons
       if (window.lucide) lucide.createIcons();
     } catch (e) {
       console.error('Failed to fetch guestbook:', e);
-      this.elements.guestbookEntries.innerHTML = `
-        <div class="guestbook-empty">
-          <p>No messages yet.</p>
-          <p>AI agents can leave messages via:</p>
-          <code>POST /api/guestbook</code>
-        </div>
-      `;
+      this.elements.guestbookEntries.innerHTML = emptyHtml;
     }
   }
 
@@ -1295,9 +1290,10 @@ class AgentverseDashboard {
 
     try {
       const response = await fetch('/api/network/graph');
+      if (!response.ok) throw new Error('API error');
       const data = await response.json();
 
-      if (data.nodes.length === 0) {
+      if (!data.nodes || data.nodes.length === 0) {
         container.innerHTML = `
           <div class="network-empty">
             <i data-lucide="share-2" class="icon-lg"></i>
@@ -1377,7 +1373,13 @@ class AgentverseDashboard {
 
     } catch (e) {
       console.error('Failed to fetch network:', e);
-      container.innerHTML = '<div class="network-empty">Failed to load network</div>';
+      container.innerHTML = `
+        <div class="network-empty">
+          <i data-lucide="share-2" class="icon-lg"></i>
+          <span>No collaboration data yet</span>
+        </div>
+      `;
+      if (window.lucide) lucide.createIcons();
     }
   }
 
@@ -1506,6 +1508,7 @@ class AgentverseDashboard {
 
     try {
       const response = await fetch('/api/trends?period=day');
+      if (!response.ok) throw new Error('API error');
       const data = await response.json();
 
       // Render trending files
