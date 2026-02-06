@@ -474,8 +474,11 @@ function broadcast(data) {
 
 // WebSocket connection handling
 wss.on('connection', (ws) => {
+  ws.isAlive = true;
   viewers.add(ws);
   console.log(`Viewer connected. Total: ${viewers.size}`);
+
+  ws.on('pong', () => { ws.isAlive = true; });
 
   // Send current stats
   ws.send(JSON.stringify({
@@ -490,6 +493,22 @@ wss.on('connection', (ws) => {
     broadcast({ type: 'viewerCount', count: viewers.size });
   });
 });
+
+// Heartbeat: detect and remove dead WebSocket connections every 30s
+const WS_HEARTBEAT_INTERVAL = 30 * 1000;
+setInterval(() => {
+  for (const ws of viewers) {
+    if (!ws.isAlive) {
+      viewers.delete(ws);
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+  // Broadcast accurate count after cleanup
+  broadcast({ type: 'viewerCount', count: viewers.size });
+}, WS_HEARTBEAT_INTERVAL);
 
 // Serve the world — CSP middleware for all /world routes
 const worldCSP = (req, res, next) => {
