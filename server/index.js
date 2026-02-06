@@ -833,6 +833,11 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
+// Dashboard route
+app.get('/live', (req, res) => {
+  res.sendFile(path.join(__dirname, '../public/index.html'));
+});
+
 // API: Get current stats
 app.get('/api/stats', async (req, res) => {
   try {
