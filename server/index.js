@@ -187,7 +187,16 @@ const AVATAR_STYLES = [
 // Load persisted data
 async function loadState() {
   try {
-    const data = await fs.readFile(DATA_FILE, 'utf-8');
+    let data;
+    try {
+      data = await fs.readFile(DATA_FILE, 'utf-8');
+      JSON.parse(data); // validate JSON
+    } catch (e) {
+      // Primary file corrupted or missing, try backup
+      console.warn('Primary state.json failed, trying backup...');
+      data = await fs.readFile(DATA_FILE + '.bak', 'utf-8');
+      console.log('Recovered from state.json.bak');
+    }
     const state = JSON.parse(data);
 
     // Restore history
