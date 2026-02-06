@@ -210,6 +210,24 @@ html, body {
   opacity: 0.5;
 }
 
+.header-nav-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  transition: all 0.2s;
+  text-decoration: none;
+}
+
+.header-nav-link:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 /* Main Content */
 .main {
   grid-area: main;
@@ -217,6 +235,7 @@ html, body {
   flex-direction: column;
   background: var(--bg-dark);
   overflow-y: auto;
+  scroll-behavior: smooth;
 }
 
 .section-header {
