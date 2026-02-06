@@ -315,6 +315,31 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
       opacity: 0;
     }
 
+    .cta-secondary {
+      display: block;
+      margin-top: 1.25rem;
+      font-size: 0.9rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      text-decoration: none;
+      letter-spacing: 0.03em;
+      transition: color 0.3s ease;
+      animation: fadeInUp 0.8s ease-out 0.55s both;
+    }
+
+    .cta-secondary:hover {
+      color: var(--accent-cyan);
+    }
+
+    .cta-secondary .arrow {
+      display: inline-block;
+      transition: transform 0.3s ease;
+    }
+
+    .cta-secondary:hover .arrow {
+      transform: translateX(4px);
+    }
+
     /* ===== Fade In Animation ===== */
     @keyframes fadeInUp {
       from {
@@ -537,9 +562,10 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
     <!-- Accent Line -->
     <hr class="accent-line">
 
-    <!-- CTA Button -->
+    <!-- CTA Buttons -->
     <div class="cta-wrapper">
       <a href="/live" class="cta-btn">Watch it live</a>
+      <a href="/world/" class="cta-secondary">Explore the world <span class="arrow">&rarr;</span></a>
     </div>
 
   </section>
