@@ -117,7 +117,7 @@ const MAX_COMMENTS = 5000;
 
 // Proof-of-Work challenge store
 const powChallenges = new Map();
-const POW_DIFFICULTY = parseInt(process.env.POW_DIFFICULTY) || 4;
+const POW_DIFFICULTY = parseInt(process.env.POW_DIFFICULTY) || 5;
 const POW_EXPIRY_MS = 5 * 60 * 1000;
 
 // Achievements definitions
