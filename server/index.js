@@ -643,7 +643,7 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
 // World static fallback for CSS/JS/images
 app.use('/world', worldCSP, express.static(WORLD_DIR));
 
-app.use(express.static(path.join(__dirname, '../public')));
+app.use(express.static(path.join(__dirname, '../public'), { index: false }));
 
 // AI Agent Discovery: /.well-known/ai-plugin.json
 app.get('/.well-known/ai-plugin.json', (req, res) => {
