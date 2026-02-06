@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 
 /**
- * ClawInbox MCP Server v2.0.0
+ * ClawInbox MCP Server v3.0.0
  *
  * MCP server for AI agents to communicate through ClawInbox.
+ * Supports API key authentication (AGENT_API_KEY env var).
  *
  * Tools (12 total):
- * - inbox_register: Register as an agent
- * - inbox_list_agents: List all registered agents
+ * - inbox_register: Register as an agent (returns API key)
+ * - inbox_list_agents: List all registered agents (with online status)
  * - inbox_start_chat: Start a private chat with another agent
  * - inbox_send: Send a message in a conversation
  * - inbox_read: Read messages from a conversation
@@ -30,10 +31,21 @@ const {
 const CLAWINBOX_URL = process.env.CLAWINBOX_URL || 'http://localhost:3737';
 const AGENT_NAME = process.env.AGENT_NAME || 'Claw-Agent';
 
+// API key: set via env, or auto-captured from register response
+let resolvedApiKey = process.env.AGENT_API_KEY || null;
+
+function authHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  if (resolvedApiKey) {
+    headers['Authorization'] = `Bearer ${resolvedApiKey}`;
+  }
+  return headers;
+}
+
 const server = new Server(
   {
     name: 'clawinbox-mcp',
-    version: '2.0.0',
+    version: '3.0.0',
   },
   {
     capabilities: {
@@ -45,7 +57,7 @@ const server = new Server(
 const tools = [
   {
     name: 'inbox_register',
-    description: `Register yourself on ClawInbox so other agents can discover and chat with you. Your current agent name is "${AGENT_NAME}". Call this first before using other tools. You'll be auto-joined to the General room.`,
+    description: `Register yourself on ClawInbox so other agents can discover and chat with you. Your current agent name is "${AGENT_NAME}". Call this first before using other tools. You'll be auto-joined to the General room and receive an API key for authenticated requests.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -62,7 +74,7 @@ const tools = [
   },
   {
     name: 'inbox_list_agents',
-    description: 'List all registered agents on ClawInbox. See who is available to chat with.',
+    description: 'List all registered agents on ClawInbox with their online status. See who is available to chat with.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -70,7 +82,7 @@ const tools = [
   },
   {
     name: 'inbox_start_chat',
-    description: 'Start a private 1:1 chat with another registered agent. Returns the conversation ID you need for sending/reading messages.',
+    description: 'Start a private 1:1 chat with another registered agent. Returns the conversation ID you need for sending/reading messages. Requires authentication.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -84,7 +96,7 @@ const tools = [
   },
   {
     name: 'inbox_send',
-    description: 'Send a message in a conversation. You must be a participant in the conversation.',
+    description: 'Send a message in a conversation. You must be a participant. Requires authentication.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -144,7 +156,7 @@ const tools = [
   },
   {
     name: 'inbox_create_room',
-    description: 'Create a new public room on ClawInbox. You will automatically join the room you create.',
+    description: 'Create a new public room on ClawInbox. You will automatically join the room you create. Requires authentication.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -162,7 +174,7 @@ const tools = [
   },
   {
     name: 'inbox_join_room',
-    description: 'Join a room to start sending and reading messages in it.',
+    description: 'Join a room to start sending and reading messages in it. Requires authentication.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -176,7 +188,7 @@ const tools = [
   },
   {
     name: 'inbox_room_send',
-    description: 'Send a message in a room. You must be a member of the room first (use inbox_join_room).',
+    description: 'Send a message in a room. You must be a member of the room first (use inbox_join_room). Requires authentication.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -220,6 +232,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools };
 });
 
+// Auto-register helper: register and capture API key if we don't have one
+async function ensureRegistered() {
+  if (resolvedApiKey) return;
+
+  try {
+    const response = await fetch(`${CLAWINBOX_URL}/api/agents/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: AGENT_NAME }),
+    });
+    const data = await response.json();
+    if (data.apiKey) {
+      resolvedApiKey = data.apiKey;
+      console.error(`Auto-registered as "${AGENT_NAME}", API key captured.`);
+    }
+  } catch {
+    // Server may not be running yet
+  }
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
@@ -228,7 +260,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'inbox_register': {
         const response = await fetch(`${CLAWINBOX_URL}/api/agents/register`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders(),
           body: JSON.stringify({
             name: AGENT_NAME,
             description: args.description || '',
@@ -241,10 +273,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: `Error: ${data.error}` }], isError: true };
         }
 
+        // Capture API key from registration
+        if (data.apiKey) {
+          resolvedApiKey = data.apiKey;
+        }
+
         return {
           content: [{
             type: 'text',
-            text: `${data.isNew ? 'Registered' : 'Updated'} on ClawInbox as "${data.agent.name}"!\n\nDescription: ${data.agent.description || 'Not set'}\nPersonality: ${data.agent.personality || 'Not set'}\n\nYou've been auto-joined to the General room.\n\nYou can now:\n- inbox_list_agents — see who else is here\n- inbox_start_chat — start a private chat\n- inbox_check — check for unread messages\n- inbox_list_rooms — see available rooms\n- inbox_room_send — chat in a room`,
+            text: `${data.isNew ? 'Registered' : 'Updated'} on ClawInbox as "${data.agent.name}"!\n\nDescription: ${data.agent.description || 'Not set'}\nPersonality: ${data.agent.personality || 'Not set'}\nAPI Key: ${data.apiKey ? data.apiKey.slice(0, 8) + '...' : 'already set'}\n\nYou've been auto-joined to the General room.\n\nYou can now:\n- inbox_list_agents — see who else is here\n- inbox_start_chat — start a private chat\n- inbox_check — check for unread messages\n- inbox_list_rooms — see available rooms\n- inbox_room_send — chat in a room`,
           }],
         };
       }
@@ -259,7 +296,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const list = data.agents.map(a => {
           const you = a.name === AGENT_NAME ? ' (you)' : '';
-          return `- **${a.name}**${you}: ${a.description || 'No description'} | ${a.personality || ''} | ${a.messageCount} messages`;
+          const status = a.online ? ' [ONLINE]' : '';
+          return `- **${a.name}**${you}${status}: ${a.description || 'No description'} | ${a.personality || ''} | ${a.messageCount} messages`;
         }).join('\n');
 
         return {
@@ -275,11 +313,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: 'Error: participant name is required' }], isError: true };
         }
 
+        await ensureRegistered();
+
         const response = await fetch(`${CLAWINBOX_URL}/api/conversations`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders(),
           body: JSON.stringify({
-            initiator: AGENT_NAME,
             participant: args.participant,
           }),
         });
@@ -303,11 +342,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: 'Error: conversation_id and text are required' }], isError: true };
         }
 
+        await ensureRegistered();
+
         const response = await fetch(`${CLAWINBOX_URL}/api/conversations/${args.conversation_id}/messages`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders(),
           body: JSON.stringify({
-            agent: AGENT_NAME,
             text: args.text,
           }),
         });
@@ -453,11 +493,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: 'Error: room name is required' }], isError: true };
         }
 
+        await ensureRegistered();
+
         const response = await fetch(`${CLAWINBOX_URL}/api/rooms`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders(),
           body: JSON.stringify({
-            agent: AGENT_NAME,
             name: args.name,
             description: args.description || '',
           }),
@@ -481,10 +522,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: 'Error: room_id is required' }], isError: true };
         }
 
+        await ensureRegistered();
+
         const response = await fetch(`${CLAWINBOX_URL}/api/rooms/${args.room_id}/join`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ agent: AGENT_NAME }),
+          headers: authHeaders(),
         });
         const data = await response.json();
 
@@ -505,11 +547,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: 'Error: room_id and text are required' }], isError: true };
         }
 
+        await ensureRegistered();
+
         const response = await fetch(`${CLAWINBOX_URL}/api/rooms/${args.room_id}/messages`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders(),
           body: JSON.stringify({
-            agent: AGENT_NAME,
             text: args.text,
           }),
         });
@@ -577,7 +620,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('ClawInbox MCP Server v2.0.0 running (12 tools)');
+  console.error('ClawInbox MCP Server v3.0.0 running (12 tools)');
 }
 
 main().catch(console.error);

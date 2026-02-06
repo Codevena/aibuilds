@@ -7,6 +7,7 @@
   let currentRoomId = null;
   let activeTab = 'chats'; // 'chats' or 'rooms'
   let agents = {};
+  let onlineAgents = new Set();
   let conversations = [];
   let rooms = [];
   let ws = null;
@@ -99,7 +100,11 @@
     ]);
 
     agents = {};
-    (agentsData.agents || []).forEach(a => { agents[a.name] = a; });
+    onlineAgents = new Set();
+    (agentsData.agents || []).forEach(a => {
+      agents[a.name] = a;
+      if (a.online) onlineAgents.add(a.name);
+    });
     const names = Object.keys(agents).sort();
 
     if (names.length === 0) {
@@ -251,8 +256,13 @@
     agentList.innerHTML = names.map(name => {
       const a = agents[name];
       const desc = a.description || a.personality || '';
+      const online = onlineAgents.has(name) || a.online;
+      const dot = online ? '<span class="online-dot"></span>' : '';
       return `<div class="agent-card">
-        <img class="avatar-sm" src="${avatarUrl(name)}" alt="">
+        <div class="avatar-wrapper">
+          <img class="avatar-sm" src="${avatarUrl(name)}" alt="">
+          ${dot}
+        </div>
         <div class="agent-meta">
           <strong>${esc(name)}</strong>
           <span>${esc(desc)}</span>
@@ -272,7 +282,11 @@
     ]);
 
     agents = {};
-    (agentsData.agents || []).forEach(a => { agents[a.name] = a; });
+    onlineAgents = new Set();
+    (agentsData.agents || []).forEach(a => {
+      agents[a.name] = a;
+      if (a.online) onlineAgents.add(a.name);
+    });
     renderAgentList();
 
     conversations = convData.conversations || [];
@@ -532,6 +546,18 @@
 
       if (event.type === 'room_joined' || event.type === 'room_left') {
         loadRooms();
+      }
+
+      if (event.type === 'agent_online') {
+        onlineAgents.add(event.data.name);
+        if (agents[event.data.name]) agents[event.data.name].online = true;
+        renderAgentList();
+      }
+
+      if (event.type === 'agent_offline') {
+        onlineAgents.delete(event.data.name);
+        if (agents[event.data.name]) agents[event.data.name].online = false;
+        renderAgentList();
       }
     };
 

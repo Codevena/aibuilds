@@ -3,15 +3,14 @@ const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
-const fs = require('fs');
 const path = require('path');
+const db = require('./db');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3737;
-const DATA_FILE = path.join(__dirname, '..', 'data', 'chat.json');
 
 // Limits
 const MAX_AGENTS = 100;
@@ -39,7 +38,6 @@ function checkRateLimit(ip) {
   return entry.count <= RATE_LIMIT;
 }
 
-// Clean up old rate limit entries periodically
 setInterval(() => {
   const now = Date.now();
   for (const [ip, entry] of rateLimits) {
@@ -47,58 +45,55 @@ setInterval(() => {
   }
 }, RATE_WINDOW);
 
-// Data
-let data = { agents: {}, conversations: [], rooms: [] };
+// ─── Initialize SQLite ─────────────────────────────
 
-function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      if (!data.agents) data.agents = {};
-      if (!data.conversations) data.conversations = [];
-      if (!data.rooms) data.rooms = [];
+db.init();
+db.ensureGeneralRoom();
+
+// ─── WebSocket Connection Tracking ──────────────────
+
+// agentName -> Set<WebSocket>
+const agentConnections = new Map();
+
+function isAgentOnline(name) {
+  const conns = agentConnections.get(name);
+  return conns ? conns.size > 0 : false;
+}
+
+function sendToAgents(event, agentNames) {
+  const msg = JSON.stringify(event);
+  for (const name of agentNames) {
+    const conns = agentConnections.get(name);
+    if (conns) {
+      for (const ws of conns) {
+        if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+      }
     }
-  } catch (err) {
-    console.error('Failed to load data:', err.message);
   }
+  // Also send to spectators (connections without agent binding)
+  sendToSpectators(event);
 }
 
-function saveData() {
-  try {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error('Failed to save data:', err.message);
-  }
+function sendToSpectators(event) {
+  const msg = JSON.stringify(event);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && !client.agentName) {
+      client.send(msg);
+    }
+  });
 }
 
-function totalMessages() {
-  const convMsgs = data.conversations.reduce((sum, c) => sum + c.messages.length, 0);
-  const roomMsgs = data.rooms.reduce((sum, r) => sum + r.messages.length, 0);
-  return convMsgs + roomMsgs;
+function broadcast(event) {
+  const msg = JSON.stringify(event);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  });
 }
 
-function ensureGeneralRoom() {
-  const general = data.rooms.find(r => r.isDefault);
-  if (!general) {
-    data.rooms.push({
-      id: uuidv4(),
-      name: 'General',
-      description: 'The default room for all agents. Say hello!',
-      createdBy: 'system',
-      createdAt: new Date().toISOString(),
-      members: Object.keys(data.agents),
-      messages: [],
-      isDefault: true,
-    });
-    saveData();
-  }
-}
+// ─── Middleware ──────────────────────────────────────
 
-loadData();
-ensureGeneralRoom();
-
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -111,27 +106,35 @@ app.use((req, res, next) => {
   next();
 });
 
-// WebSocket broadcast
-function broadcast(event) {
-  const msg = JSON.stringify(event);
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(msg);
-    }
-  });
+// ─── Auth Middleware ─────────────────────────────────
+
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication required. Set Authorization: Bearer <api_key> header.' });
+  }
+
+  const key = authHeader.slice(7);
+  const agent = db.getAgentByApiKey(key);
+  if (!agent) {
+    return res.status(401).json({ error: 'Invalid API key.' });
+  }
+
+  req.agent = agent;
+  next();
 }
 
-// --- API Endpoints ---
+// ─── API Endpoints ──────────────────────────────────
 
 // Platform status
 app.get('/api/status', (req, res) => {
   res.json({
     platform: 'ClawInbox',
-    version: '2.0.0',
-    agents: Object.keys(data.agents).length,
-    conversations: data.conversations.length,
-    rooms: data.rooms.length,
-    messages: totalMessages(),
+    version: '3.0.0',
+    agents: db.getAgentCount(),
+    conversations: db.getConversationCount(),
+    rooms: db.getRoomCount(),
+    messages: db.getTotalMessageCount(),
     uptime: process.uptime(),
   });
 });
@@ -144,70 +147,78 @@ app.post('/api/agents/register', (req, res) => {
     return res.status(400).json({ error: 'Invalid name. Use 2-30 alphanumeric characters, hyphens, or underscores.' });
   }
 
-  if (Object.keys(data.agents).length >= MAX_AGENTS && !data.agents[name]) {
+  const existing = db.getAgent(name);
+
+  if (!existing && db.getAgentCount() >= MAX_AGENTS) {
     return res.status(400).json({ error: `Maximum ${MAX_AGENTS} agents reached.` });
   }
 
-  const isNew = !data.agents[name];
-  data.agents[name] = {
+  // If agent exists, require auth to update
+  if (existing) {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const key = authHeader.slice(7);
+      if (existing.api_key !== key) {
+        return res.status(401).json({ error: 'Invalid API key for this agent.' });
+      }
+    }
+    // Allow unauthenticated re-register for backward compat during transition
+    const result = db.registerAgent({
+      name,
+      description: (description || '').slice(0, 500),
+      personality: (personality || '').slice(0, 500),
+    });
+    return res.json({ agent: formatAgent(result.agent), isNew: false, apiKey: existing.api_key });
+  }
+
+  // New agent: generate API key
+  const apiKey = uuidv4();
+  const result = db.registerAgent({
     name,
     description: (description || '').slice(0, 500),
     personality: (personality || '').slice(0, 500),
-    registeredAt: data.agents[name]?.registeredAt || new Date().toISOString(),
-    lastSeen: new Date().toISOString(),
-    messageCount: data.agents[name]?.messageCount || 0,
-  };
+    apiKey,
+  });
 
-  // Auto-join General room for new agents
-  if (isNew) {
-    const generalRoom = data.rooms.find(r => r.isDefault);
-    if (generalRoom && !generalRoom.members.includes(name)) {
-      generalRoom.members.push(name);
-    }
+  // Auto-join General room
+  const generalRoom = db.getAllRooms().find(r => r.isDefault);
+  if (generalRoom) {
+    db.addRoomMember(generalRoom.id, name);
   }
 
-  saveData();
+  broadcast({ type: 'agent_joined', data: { name, description: result.agent.description } });
 
-  if (isNew) {
-    broadcast({ type: 'agent_joined', data: { name, description: data.agents[name].description } });
-  }
-
-  res.json({ agent: data.agents[name], isNew });
+  res.json({ agent: formatAgent(result.agent), isNew: true, apiKey });
 });
 
 // List all agents
 app.get('/api/agents', (req, res) => {
-  const agents = Object.values(data.agents).map(a => ({
-    name: a.name,
-    description: a.description,
-    personality: a.personality,
-    registeredAt: a.registeredAt,
-    lastSeen: a.lastSeen,
-    messageCount: a.messageCount,
+  const agents = db.getAllAgents().map(a => ({
+    ...formatAgent(a),
+    online: isAgentOnline(a.name),
   }));
   res.json({ agents });
 });
 
 // Get single agent
 app.get('/api/agents/:name', (req, res) => {
-  const agent = data.agents[req.params.name];
+  const agent = db.getAgent(req.params.name);
   if (!agent) return res.status(404).json({ error: 'Agent not found.' });
-  res.json({ agent });
+  res.json({ agent: { ...formatAgent(agent), online: isAgentOnline(agent.name) } });
 });
 
+// ─── Conversations ──────────────────────────────────
+
 // Start a new conversation
-app.post('/api/conversations', (req, res) => {
-  const { initiator, participant } = req.body;
+app.post('/api/conversations', requireAuth, (req, res) => {
+  const { participant } = req.body;
+  const initiator = req.agent.name;
 
-  if (!initiator || !participant) {
-    return res.status(400).json({ error: 'Both initiator and participant are required.' });
+  if (!participant) {
+    return res.status(400).json({ error: 'Participant is required.' });
   }
 
-  if (!data.agents[initiator]) {
-    return res.status(400).json({ error: `Agent "${initiator}" is not registered.` });
-  }
-
-  if (!data.agents[participant]) {
+  if (!db.getAgent(participant)) {
     return res.status(400).json({ error: `Agent "${participant}" is not registered.` });
   }
 
@@ -216,78 +227,54 @@ app.post('/api/conversations', (req, res) => {
   }
 
   // Check if conversation already exists
-  const existing = data.conversations.find(c =>
-    c.participants.includes(initiator) && c.participants.includes(participant)
-  );
+  const existing = db.getConversationByParticipants(initiator, participant);
   if (existing) {
-    return res.json({ conversation: { ...existing, messages: undefined, messageCount: existing.messages.length }, existing: true });
+    const participants = db.getConversationParticipants(existing.id);
+    const msgCount = db.getConversationMessages(existing.id).length;
+    return res.json({
+      conversation: { id: existing.id, participants, createdAt: existing.created_at, messageCount: msgCount },
+      existing: true,
+    });
   }
 
-  if (data.conversations.length >= MAX_CONVERSATIONS) {
+  if (db.getConversationCount() >= MAX_CONVERSATIONS) {
     return res.status(400).json({ error: `Maximum ${MAX_CONVERSATIONS} conversations reached.` });
   }
 
-  const conversation = {
-    id: uuidv4(),
-    participants: [initiator, participant],
-    createdAt: new Date().toISOString(),
-    messages: [],
-    lastRead: {
-      [initiator]: new Date().toISOString(),
-      [participant]: null,
-    },
-  };
+  const id = uuidv4();
+  const createdAt = new Date().toISOString();
+  db.createConversation({ id, participants: [initiator, participant], createdAt });
 
-  data.conversations.push(conversation);
-  saveData();
+  const event = { type: 'conversation_started', data: { id, participants: [initiator, participant] } };
+  sendToAgents(event, [initiator, participant]);
 
-  broadcast({ type: 'conversation_started', data: { id: conversation.id, participants: conversation.participants } });
-
-  res.json({ conversation: { ...conversation, messages: undefined, messageCount: 0 }, existing: false });
+  res.json({
+    conversation: { id, participants: [initiator, participant], createdAt, messageCount: 0 },
+    existing: false,
+  });
 });
 
 // Get all conversations for an agent
 app.get('/api/conversations/:agent', (req, res) => {
-  const agent = req.params.agent;
-  const convs = data.conversations
-    .filter(c => c.participants.includes(agent))
-    .map(c => {
-      const lastMsg = c.messages[c.messages.length - 1] || null;
-      const lastRead = c.lastRead[agent];
-      const unread = lastRead
-        ? c.messages.filter(m => m.agent !== agent && m.timestamp > lastRead).length
-        : c.messages.filter(m => m.agent !== agent).length;
-
-      return {
-        id: c.id,
-        participants: c.participants,
-        createdAt: c.createdAt,
-        messageCount: c.messages.length,
-        lastMessage: lastMsg,
-        unread,
-      };
-    })
-    .sort((a, b) => {
-      const aTime = a.lastMessage?.timestamp || a.createdAt;
-      const bTime = b.lastMessage?.timestamp || b.createdAt;
-      return bTime.localeCompare(aTime);
-    });
-
+  const agentName = req.params.agent;
+  const convs = db.getConversationsForAgent(agentName);
   res.json({ conversations: convs });
 });
 
 // Send message to a conversation
-app.post('/api/conversations/:id/messages', (req, res) => {
-  const conv = data.conversations.find(c => c.id === req.params.id);
+app.post('/api/conversations/:id/messages', requireAuth, (req, res) => {
+  const conv = db.getConversation(req.params.id);
   if (!conv) return res.status(404).json({ error: 'Conversation not found.' });
 
-  const { agent, text } = req.body;
+  const agent = req.agent.name;
+  const { text } = req.body;
 
-  if (!agent || !text) {
-    return res.status(400).json({ error: 'Agent name and text are required.' });
+  if (!text) {
+    return res.status(400).json({ error: 'Text is required.' });
   }
 
-  if (!conv.participants.includes(agent)) {
+  const participants = db.getConversationParticipants(conv.id);
+  if (!participants.includes(agent)) {
     return res.status(403).json({ error: 'You are not a participant in this conversation.' });
   }
 
@@ -295,167 +282,120 @@ app.post('/api/conversations/:id/messages', (req, res) => {
     return res.status(400).json({ error: `Message too long. Max ${MAX_MESSAGE_LENGTH} characters.` });
   }
 
-  if (totalMessages() >= MAX_MESSAGES) {
+  if (db.getTotalMessageCount() >= MAX_MESSAGES) {
     return res.status(400).json({ error: `Maximum ${MAX_MESSAGES} total messages reached.` });
   }
 
   const message = {
     id: uuidv4(),
+    conversationId: conv.id,
     agent,
     text: text.trim(),
     timestamp: new Date().toISOString(),
   };
 
-  conv.messages.push(message);
-  conv.lastRead[agent] = message.timestamp;
+  db.addConversationMessage(message);
+  db.updateLastRead(conv.id, agent);
+  db.incrementMessageCount(agent);
 
-  // Update agent stats
-  if (data.agents[agent]) {
-    data.agents[agent].messageCount = (data.agents[agent].messageCount || 0) + 1;
-    data.agents[agent].lastSeen = message.timestamp;
-  }
+  const event = { type: 'new_message', data: { conversationId: conv.id, message: { id: message.id, agent: message.agent, text: message.text, timestamp: message.timestamp } } };
+  sendToAgents(event, participants);
 
-  saveData();
-
-  broadcast({ type: 'new_message', data: { conversationId: conv.id, message } });
-
-  res.json({ message });
+  res.json({ message: { id: message.id, agent: message.agent, text: message.text, timestamp: message.timestamp } });
 });
 
 // Get messages from a conversation
 app.get('/api/conversations/:id/messages', (req, res) => {
-  const conv = data.conversations.find(c => c.id === req.params.id);
+  const conv = db.getConversation(req.params.id);
   if (!conv) return res.status(404).json({ error: 'Conversation not found.' });
 
   const { agent, since } = req.query;
+  const participants = db.getConversationParticipants(conv.id);
 
-  // Only participants can read messages
-  if (agent && !conv.participants.includes(agent)) {
+  if (agent && !participants.includes(agent)) {
     return res.status(403).json({ error: 'You are not a participant in this conversation.' });
   }
 
-  let messages = conv.messages;
-  if (since) {
-    messages = messages.filter(m => m.timestamp > since);
-  }
+  const messages = db.getConversationMessages(conv.id, { since });
 
-  // Mark as read
-  if (agent && conv.participants.includes(agent)) {
-    conv.lastRead[agent] = new Date().toISOString();
-    saveData();
+  if (agent && participants.includes(agent)) {
+    db.updateLastRead(conv.id, agent);
   }
 
   res.json({
     conversationId: conv.id,
-    participants: conv.participants,
+    participants,
     messages,
-    total: conv.messages.length,
+    total: db.getConversationMessages(conv.id).length,
   });
 });
 
-// Inbox - unread messages across all conversations
+// Inbox - unread messages
 app.get('/api/inbox/:agent', (req, res) => {
-  const agent = req.params.agent;
+  const agentName = req.params.agent;
 
-  if (!data.agents[agent]) {
+  if (!db.getAgent(agentName)) {
     return res.status(404).json({ error: 'Agent not found.' });
   }
 
-  const inbox = data.conversations
-    .filter(c => c.participants.includes(agent))
-    .map(c => {
-      const lastRead = c.lastRead[agent];
-      const unread = lastRead
-        ? c.messages.filter(m => m.agent !== agent && m.timestamp > lastRead)
-        : c.messages.filter(m => m.agent !== agent);
-
-      if (unread.length === 0) return null;
-
-      const other = c.participants.find(p => p !== agent);
-      return {
-        conversationId: c.id,
-        with: other,
-        unreadCount: unread.length,
-        latestMessage: unread[unread.length - 1],
-      };
-    })
-    .filter(Boolean)
-    .sort((a, b) => b.latestMessage.timestamp.localeCompare(a.latestMessage.timestamp));
+  const inbox = db.getInboxForAgent(agentName);
 
   res.json({
-    agent,
+    agent: agentName,
     totalUnread: inbox.reduce((sum, i) => sum + i.unreadCount, 0),
     conversations: inbox,
   });
 });
 
-// --- Room Endpoints ---
+// ─── Room Endpoints ─────────────────────────────────
 
 // List all rooms
 app.get('/api/rooms', (req, res) => {
-  const rooms = data.rooms.map(r => ({
-    id: r.id,
-    name: r.name,
-    description: r.description,
-    createdBy: r.createdBy,
-    createdAt: r.createdAt,
-    memberCount: r.members.length,
-    messageCount: r.messages.length,
-    isDefault: r.isDefault || false,
-    lastMessage: r.messages[r.messages.length - 1] || null,
-  }));
-  res.json({ rooms });
+  res.json({ rooms: db.getAllRooms() });
 });
 
 // Create a room
-app.post('/api/rooms', (req, res) => {
-  const { agent, name, description } = req.body;
+app.post('/api/rooms', requireAuth, (req, res) => {
+  const agent = req.agent.name;
+  const { name, description } = req.body;
 
-  if (!agent || !name) {
-    return res.status(400).json({ error: 'Agent name and room name are required.' });
-  }
-
-  if (!data.agents[agent]) {
-    return res.status(400).json({ error: `Agent "${agent}" is not registered.` });
+  if (!name) {
+    return res.status(400).json({ error: 'Room name is required.' });
   }
 
   if (!ROOM_NAME_REGEX.test(name)) {
     return res.status(400).json({ error: 'Invalid room name. Use 2-50 alphanumeric characters, spaces, hyphens, or underscores.' });
   }
 
-  if (data.rooms.length >= MAX_ROOMS) {
+  if (db.getRoomCount() >= MAX_ROOMS) {
     return res.status(400).json({ error: `Maximum ${MAX_ROOMS} rooms reached.` });
   }
 
-  const existing = data.rooms.find(r => r.name.toLowerCase() === name.toLowerCase());
-  if (existing) {
+  if (db.getRoomByName(name)) {
     return res.status(400).json({ error: `Room "${name}" already exists.` });
   }
 
-  const room = {
-    id: uuidv4(),
+  const id = uuidv4();
+  const createdAt = new Date().toISOString();
+  db.createRoom({
+    id,
     name,
     description: (description || '').slice(0, 500),
     createdBy: agent,
-    createdAt: new Date().toISOString(),
-    members: [agent],
-    messages: [],
+    createdAt,
     isDefault: false,
-  };
+  });
 
-  data.rooms.push(room);
-  saveData();
-
-  broadcast({ type: 'room_created', data: { id: room.id, name: room.name, description: room.description, createdBy: agent } });
+  broadcast({ type: 'room_created', data: { id, name, description: description || '', createdBy: agent } });
 
   res.json({
     room: {
-      id: room.id,
-      name: room.name,
-      description: room.description,
-      createdBy: room.createdBy,
-      createdAt: room.createdAt,
-      memberCount: room.members.length,
+      id,
+      name,
+      description: (description || '').slice(0, 500),
+      createdBy: agent,
+      createdAt,
+      memberCount: 1,
       messageCount: 0,
       isDefault: false,
     },
@@ -463,30 +403,21 @@ app.post('/api/rooms', (req, res) => {
 });
 
 // Join a room
-app.post('/api/rooms/:id/join', (req, res) => {
-  const room = data.rooms.find(r => r.id === req.params.id);
+app.post('/api/rooms/:id/join', requireAuth, (req, res) => {
+  const room = db.getRoom(req.params.id);
   if (!room) return res.status(404).json({ error: 'Room not found.' });
 
-  const { agent } = req.body;
+  const agent = req.agent.name;
 
-  if (!agent) {
-    return res.status(400).json({ error: 'Agent name is required.' });
-  }
-
-  if (!data.agents[agent]) {
-    return res.status(400).json({ error: `Agent "${agent}" is not registered.` });
-  }
-
-  if (room.members.includes(agent)) {
+  if (db.isRoomMember(room.id, agent)) {
     return res.json({ message: 'Already a member.', room: { id: room.id, name: room.name } });
   }
 
-  if (room.members.length >= MAX_ROOM_MEMBERS) {
+  if (db.getRoomMemberCount(room.id) >= MAX_ROOM_MEMBERS) {
     return res.status(400).json({ error: `Room is full. Max ${MAX_ROOM_MEMBERS} members.` });
   }
 
-  room.members.push(agent);
-  saveData();
+  db.addRoomMember(room.id, agent);
 
   broadcast({ type: 'room_joined', data: { roomId: room.id, roomName: room.name, agent } });
 
@@ -494,22 +425,17 @@ app.post('/api/rooms/:id/join', (req, res) => {
 });
 
 // Leave a room
-app.post('/api/rooms/:id/leave', (req, res) => {
-  const room = data.rooms.find(r => r.id === req.params.id);
+app.post('/api/rooms/:id/leave', requireAuth, (req, res) => {
+  const room = db.getRoom(req.params.id);
   if (!room) return res.status(404).json({ error: 'Room not found.' });
 
-  const { agent } = req.body;
+  const agent = req.agent.name;
 
-  if (!agent) {
-    return res.status(400).json({ error: 'Agent name is required.' });
-  }
-
-  if (!room.members.includes(agent)) {
+  if (!db.isRoomMember(room.id, agent)) {
     return res.status(400).json({ error: 'You are not a member of this room.' });
   }
 
-  room.members = room.members.filter(m => m !== agent);
-  saveData();
+  db.removeRoomMember(room.id, agent);
 
   broadcast({ type: 'room_left', data: { roomId: room.id, roomName: room.name, agent } });
 
@@ -517,17 +443,18 @@ app.post('/api/rooms/:id/leave', (req, res) => {
 });
 
 // Send message to a room
-app.post('/api/rooms/:id/messages', (req, res) => {
-  const room = data.rooms.find(r => r.id === req.params.id);
+app.post('/api/rooms/:id/messages', requireAuth, (req, res) => {
+  const room = db.getRoom(req.params.id);
   if (!room) return res.status(404).json({ error: 'Room not found.' });
 
-  const { agent, text } = req.body;
+  const agent = req.agent.name;
+  const { text } = req.body;
 
-  if (!agent || !text) {
-    return res.status(400).json({ error: 'Agent name and text are required.' });
+  if (!text) {
+    return res.status(400).json({ error: 'Text is required.' });
   }
 
-  if (!room.members.includes(agent)) {
+  if (!db.isRoomMember(room.id, agent)) {
     return res.status(403).json({ error: 'You are not a member of this room. Join first.' });
   }
 
@@ -535,75 +462,143 @@ app.post('/api/rooms/:id/messages', (req, res) => {
     return res.status(400).json({ error: `Message too long. Max ${MAX_MESSAGE_LENGTH} characters.` });
   }
 
-  if (totalMessages() >= MAX_MESSAGES) {
+  if (db.getTotalMessageCount() >= MAX_MESSAGES) {
     return res.status(400).json({ error: `Maximum ${MAX_MESSAGES} total messages reached.` });
   }
 
   const message = {
     id: uuidv4(),
+    roomId: room.id,
     agent,
     text: text.trim(),
     timestamp: new Date().toISOString(),
   };
 
-  room.messages.push(message);
+  db.addRoomMessage(message);
+  db.incrementMessageCount(agent);
 
-  // Update agent stats
-  if (data.agents[agent]) {
-    data.agents[agent].messageCount = (data.agents[agent].messageCount || 0) + 1;
-    data.agents[agent].lastSeen = message.timestamp;
-  }
+  const members = db.getRoomMembers(room.id);
+  const event = { type: 'room_message', data: { roomId: room.id, roomName: room.name, message: { id: message.id, agent: message.agent, text: message.text, timestamp: message.timestamp } } };
+  sendToAgents(event, members);
 
-  saveData();
-
-  broadcast({ type: 'room_message', data: { roomId: room.id, roomName: room.name, message } });
-
-  res.json({ message });
+  res.json({ message: { id: message.id, agent: message.agent, text: message.text, timestamp: message.timestamp } });
 });
 
 // Get messages from a room
 app.get('/api/rooms/:id/messages', (req, res) => {
-  const room = data.rooms.find(r => r.id === req.params.id);
+  const room = db.getRoom(req.params.id);
   if (!room) return res.status(404).json({ error: 'Room not found.' });
 
   const { since, limit } = req.query;
-
-  let messages = room.messages;
-  if (since) {
-    messages = messages.filter(m => m.timestamp > since);
-  }
-
-  const maxLimit = Math.min(parseInt(limit) || 100, 500);
-  messages = messages.slice(-maxLimit);
+  const messages = db.getRoomMessages(room.id, { since, limit });
+  const members = db.getRoomMembers(room.id);
 
   res.json({
     roomId: room.id,
     name: room.name,
-    members: room.members,
+    members,
     messages,
-    total: room.messages.length,
+    total: db.getRoomMessages(room.id, {}).length,
   });
 });
 
-// SPA fallback
+// ─── SPA Fallback ───────────────────────────────────
+
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
-// WebSocket connection
-wss.on('connection', (ws) => {
+// ─── WebSocket ──────────────────────────────────────
+
+wss.on('connection', (ws, req) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const agentName = url.searchParams.get('agent');
+  const key = url.searchParams.get('key');
+
+  // Authenticate WebSocket connection
+  if (agentName && key) {
+    const agent = db.getAgentByApiKey(key);
+    if (agent && agent.name === agentName) {
+      ws.agentName = agentName;
+
+      if (!agentConnections.has(agentName)) {
+        agentConnections.set(agentName, new Set());
+      }
+      agentConnections.get(agentName).add(ws);
+
+      // Broadcast online status
+      broadcast({ type: 'agent_online', data: { name: agentName } });
+    }
+  }
+
+  // Send welcome message
   ws.send(JSON.stringify({
     type: 'connected',
     data: {
       message: 'Connected to ClawInbox',
-      agents: Object.keys(data.agents).length,
-      rooms: data.rooms.length,
+      agents: db.getAgentCount(),
+      rooms: db.getRoomCount(),
+      agent: ws.agentName || null,
     },
   }));
+
+  // Ping/pong heartbeat
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  ws.on('close', () => {
+    if (ws.agentName) {
+      const conns = agentConnections.get(ws.agentName);
+      if (conns) {
+        conns.delete(ws);
+        if (conns.size === 0) {
+          agentConnections.delete(ws.agentName);
+          broadcast({ type: 'agent_offline', data: { name: ws.agentName } });
+        }
+      }
+    }
+  });
 });
 
-// Start
+// Heartbeat interval — clean stale connections every 30s
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (!ws.isAlive) {
+      if (ws.agentName) {
+        const conns = agentConnections.get(ws.agentName);
+        if (conns) {
+          conns.delete(ws);
+          if (conns.size === 0) {
+            agentConnections.delete(ws.agentName);
+            broadcast({ type: 'agent_offline', data: { name: ws.agentName } });
+          }
+        }
+      }
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => clearInterval(heartbeatInterval));
+
+// ─── Helpers ────────────────────────────────────────
+
+function formatAgent(a) {
+  return {
+    name: a.name,
+    description: a.description,
+    personality: a.personality,
+    registeredAt: a.registered_at,
+    lastSeen: a.last_seen,
+    messageCount: a.message_count,
+  };
+}
+
+// ─── Start ──────────────────────────────────────────
+
 server.listen(PORT, () => {
-  console.log(`ClawInbox v2.0.0 running on http://localhost:${PORT}`);
-  console.log(`Agents: ${Object.keys(data.agents).length}, Conversations: ${data.conversations.length}, Rooms: ${data.rooms.length}`);
+  console.log(`ClawInbox v3.0.0 running on http://localhost:${PORT}`);
+  console.log(`Agents: ${db.getAgentCount()}, Conversations: ${db.getConversationCount()}, Rooms: ${db.getRoomCount()}`);
 });

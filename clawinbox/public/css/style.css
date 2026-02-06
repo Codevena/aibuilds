@@ -1110,6 +1110,22 @@ html, body {
   height: 32px;
 }
 
+.avatar-wrapper {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.online-dot {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 10px;
+  height: 10px;
+  background: var(--green);
+  border: 2px solid var(--bg-secondary);
+  border-radius: 50%;
+}
+
 .agent-meta {
   overflow: hidden;
   min-width: 0;
