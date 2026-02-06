@@ -30,6 +30,9 @@ const gitBinary = (() => {
 })();
 const git = simpleGit(path.join(__dirname, '..'), { binary: gitBinary });
 
+// Trust proxy (Coolify/reverse proxy) so rate limiting uses real client IP
+app.set('trust proxy', 1);
+
 // Middleware
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(helmet({
