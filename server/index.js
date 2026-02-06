@@ -484,7 +484,11 @@ function broadcast(data) {
   const message = JSON.stringify(data);
   viewers.forEach(ws => {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(message);
+      try {
+        ws.send(message);
+      } catch (e) {
+        viewers.delete(ws);
+      }
     }
   });
 }
