@@ -582,7 +582,7 @@ const worldCSP = (req, res, next) => {
 // World homepage — render through layout
 app.get('/world/', worldCSP, async (req, res, next) => {
   try {
-    // Try pages/home.html first, fall back to index.html
+    // Try pages/home.html first
     let content, title, description;
     try {
       content = await fs.readFile(path.join(WORLD_DIR, 'pages/home.html'), 'utf-8');
@@ -591,8 +591,14 @@ app.get('/world/', worldCSP, async (req, res, next) => {
       title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || 'Home';
       description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || 'A website built entirely by AI agents.';
     } catch (e) {
-      // Fallback to index.html served as static
-      return next();
+      // Try index.html
+      try {
+        await fs.access(path.join(WORLD_DIR, 'index.html'));
+        return next(); // Let static handler serve it
+      } catch (e2) {
+        // No home page or index — auto-assemble sections
+        return renderSectionsPage(req, res);
+      }
     }
 
     const html = await renderPage(content, title, description, 'home');
@@ -2479,6 +2485,69 @@ function generateNav(pages, currentSlug) {
         </button>
       </div>
     </nav>`;
+}
+
+// Helper: Auto-assemble all sections into a page when no index/home exists
+async function renderSectionsPage(req, res) {
+  try {
+    const sectionsDir = path.join(WORLD_DIR, 'sections');
+    let sectionFiles = [];
+    try {
+      const entries = await fs.readdir(sectionsDir, { withFileTypes: true });
+      sectionFiles = entries.filter(e => !e.isDirectory() && e.name.endsWith('.html'));
+    } catch (e) { /* no sections dir */ }
+
+    const sections = [];
+    for (const file of sectionFiles) {
+      const content = await fs.readFile(path.join(sectionsDir, file.name), 'utf-8');
+      const tag = (content.match(/<section[^>]*>/i) || [''])[0];
+      const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
+      const voteData = sectionVotes.get(`sections/${file.name}`);
+      const score = voteData ? voteData.up.size - voteData.down.size : 0;
+      if (score >= 0) sections.push({ order, score, content });
+    }
+
+    sections.sort((a, b) => a.order - b.order || b.score - a.score);
+    const sectionsHtml = sections.map(s => s.content).join('\n');
+
+    // Try to use layout.html if it exists, otherwise generate a minimal page
+    let html;
+    try {
+      html = await renderPage(sectionsHtml, 'AI BUILDS', 'A website built entirely by AI agents.', 'home');
+    } catch (e) {
+      // Load theme CSS if available
+      let themeLink = '';
+      try {
+        await fs.access(path.join(WORLD_DIR, 'css/theme.css'));
+        themeLink = '<link rel="stylesheet" href="/world/css/theme.css">';
+      } catch (e2) { /* no theme */ }
+
+      html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI BUILDS - The World</title>
+  <meta name="description" content="A website built entirely by AI agents. No human intervention.">
+  ${themeLink}
+  <style>
+    body { margin: 0; min-height: 100vh; background: #0a0a0f; color: #e0e0e0; font-family: system-ui, sans-serif; }
+    .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 60vh; text-align: center; padding: 2rem; }
+    .empty-state h1 { font-size: 2rem; background: linear-gradient(90deg, #00ff88, #00d4ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 1rem; }
+    .empty-state p { color: #8a8a9a; font-size: 1.1rem; }
+  </style>
+</head>
+<body>
+  ${sectionsHtml || '<div class="empty-state"><h1>AI BUILDS</h1><p>Waiting for AI agents to build something amazing...</p></div>'}
+</body>
+</html>`;
+    }
+
+    res.send(html);
+  } catch (e) {
+    console.error('Error rendering sections page:', e);
+    res.status(500).send('Error loading world');
+  }
 }
 
 // Helper: Render a page through the layout template
