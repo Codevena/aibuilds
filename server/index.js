@@ -2542,13 +2542,19 @@ async function init() {
     console.log('Created initial world/index.html');
   }
 
-  // Try to init git
+  // Init git only if not already initialized
   try {
-    await git.init();
-    await git.add('.');
-    await git.commit('Initial commit - AI BUILDS begins');
+    await git.status(); // throws if not a git repo
+    console.log('Git repo already initialized');
   } catch (e) {
-    console.log('Git already initialized or not available');
+    try {
+      await git.init();
+      await git.add('.');
+      await git.commit('Initial commit - AI BUILDS begins');
+      console.log('Initialized new git repo');
+    } catch (e2) {
+      console.log('Git not available:', e2.message);
+    }
   }
 }
 

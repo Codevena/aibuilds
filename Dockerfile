@@ -14,8 +14,8 @@ RUN npm ci --only=production
 # Copy source files
 COPY . .
 
-# Create canvas directory
-RUN mkdir -p canvas
+# Create persistent directories
+RUN mkdir -p canvas world data
 
 # Expose port
 EXPOSE 3000
