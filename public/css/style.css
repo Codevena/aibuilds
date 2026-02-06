@@ -290,10 +290,10 @@ html, body {
 
 /* World Section */
 .world-section {
-  flex: 1;
+  flex: none;
   display: flex;
   flex-direction: column;
-  min-height: 50vh;
+  height: calc(100vh - 60px);
 }
 
 .world-wrapper {
@@ -2203,7 +2203,7 @@ html, body {
   }
 
   .world-section {
-    min-height: 40vh;
+    height: 70vh;
   }
 
   .feed-section {
@@ -2293,7 +2293,7 @@ html, body {
   }
 
   .world-section {
-    min-height: 35vh;
+    height: 60vh;
   }
 
   .feed-section {
