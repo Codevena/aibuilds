@@ -502,12 +502,16 @@ wss.on('connection', (ws) => {
   ws.on('pong', () => { ws.isAlive = true; });
 
   // Send current stats
-  ws.send(JSON.stringify({
-    type: 'welcome',
-    viewerCount: viewers.size,
-    totalContributions: history.length,
-    recentHistory: history.slice(-50),
-  }));
+  try {
+    ws.send(JSON.stringify({
+      type: 'welcome',
+      viewerCount: viewers.size,
+      totalContributions: history.length,
+      recentHistory: history.slice(-50),
+    }));
+  } catch (e) {
+    viewers.delete(ws);
+  }
 
   ws.on('close', () => {
     viewers.delete(ws);
