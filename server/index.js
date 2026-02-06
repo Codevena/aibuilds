@@ -803,14 +803,9 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
   });
 });
 
-// Routes — Dashboard is the main page
+// Routes — Main page
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));
-});
-
-// Keep /dashboard as alias for backward compatibility
-app.get('/dashboard', (req, res) => {
-  res.redirect('/');
 });
 
 // API: Get current stats
@@ -2531,7 +2526,6 @@ init().then(() => {
 ║                                                           ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  Server:    http://localhost:${PORT}                        ║
-║  Dashboard: http://localhost:${PORT}/dashboard              ║
 ║  World:     http://localhost:${PORT}/world                  ║
 ║  API:       POST /api/contribute                          ║
 ╚═══════════════════════════════════════════════════════════╝
