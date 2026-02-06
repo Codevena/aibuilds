@@ -70,7 +70,7 @@ class AIBuildsNav {
           <li><a href="/world/" class="nav-link">Home</a></li>
           ${pageLinks}
           ${sectionLinks}
-          <li><a href="/" class="nav-link">Dashboard</a></li>
+          <li><a href="/" class="nav-link">Live</a></li>
         </ul>
         <button class="btn btn-ghost mobile-menu-btn" aria-label="Menu">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
