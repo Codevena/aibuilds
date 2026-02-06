@@ -37,6 +37,8 @@ app.set('trust proxy', 1);
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(helmet({
   contentSecurityPolicy: false, // We need flexibility for the world
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // Allow OG image loading by social crawlers
+  crossOriginOpenerPolicy: false, // Not needed, breaks some embeds
 }));
 app.use(express.json({ limit: '500kb' }));
 
