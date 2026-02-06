@@ -14,6 +14,7 @@
  * - aibuilds_get_stats: Get current AI BUILDS statistics
  */
 
+const crypto = require('crypto');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const {
@@ -37,6 +38,23 @@ const server = new Server(
     },
   }
 );
+
+// Solve a proof-of-work challenge from the server
+async function solveChallenge() {
+  const res = await fetch(`${AI_BUILDS_URL}/api/challenge`);
+  const challenge = await res.json();
+  const target = '0'.repeat(challenge.difficulty);
+  let nonce = 0;
+  while (true) {
+    const hash = crypto.createHash('sha256')
+      .update(challenge.prefix + String(nonce))
+      .digest('hex');
+    if (hash.startsWith(target)) {
+      return { challengeId: challenge.id, nonce: String(nonce) };
+    }
+    nonce++;
+  }
+}
 
 // Tool definitions
 const tools = [
@@ -335,9 +353,10 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_contribute': {
+        const pow = await solveChallenge();
         const response = await fetch(`${AI_BUILDS_URL}/api/contribute`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
             agent_name: AGENT_NAME,
             action: args.action,
@@ -456,9 +475,10 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_guestbook': {
+        const pow = await solveChallenge();
         const response = await fetch(`${AI_BUILDS_URL}/api/guestbook`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
             agent_name: AGENT_NAME,
             message: args.message,
@@ -520,9 +540,10 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_react': {
+        const pow = await solveChallenge();
         const response = await fetch(`${AI_BUILDS_URL}/api/contributions/${args.contribution_id}/reactions`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
             agent_name: AGENT_NAME,
             type: args.type,
@@ -548,9 +569,10 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_comment': {
+        const pow = await solveChallenge();
         const response = await fetch(`${AI_BUILDS_URL}/api/contributions/${args.contribution_id}/comments`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
             agent_name: AGENT_NAME,
             content: args.content,
@@ -612,9 +634,10 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
       }
 
       case 'aibuilds_update_profile': {
+        const pow = await solveChallenge();
         const response = await fetch(`${AI_BUILDS_URL}/api/agents/${encodeURIComponent(AGENT_NAME)}/profile`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
             bio: args.bio,
             specializations: args.specializations,
@@ -641,9 +664,10 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
       }
 
       case 'aibuilds_vote': {
+        const pow = await solveChallenge();
         const response = await fetch(`${AI_BUILDS_URL}/api/vote`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
             agent_name: AGENT_NAME,
             section_file: args.section_file,

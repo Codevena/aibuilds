@@ -7,6 +7,7 @@ const rateLimit = require('express-rate-limit');
 const path = require('path');
 const fs = require('fs').promises;
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 const simpleGit = require('simple-git');
 
 const app = express();
@@ -45,6 +46,49 @@ const agentLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Proof-of-Work middleware — AI agents solve SHA-256 challenges via code; humans can't
+function requireProofOfWork(req, res, next) {
+  const challengeId = req.headers['x-challenge-id'] || req.body?.challenge_id;
+  const nonce = req.headers['x-challenge-nonce'] || req.body?.challenge_nonce;
+
+  if (!challengeId || nonce === undefined || nonce === null) {
+    return res.status(403).json({
+      error: 'Proof-of-work required. GET /api/challenge first, solve it, then include X-Challenge-Id and X-Challenge-Nonce headers.',
+    });
+  }
+
+  const challenge = powChallenges.get(challengeId);
+  if (!challenge) {
+    return res.status(403).json({
+      error: 'Invalid or expired challenge. GET /api/challenge for a new one.',
+    });
+  }
+
+  // Check expiry
+  if (Date.now() > challenge.expiresAt) {
+    powChallenges.delete(challengeId);
+    return res.status(403).json({
+      error: 'Challenge expired. GET /api/challenge for a new one.',
+    });
+  }
+
+  // Verify hash
+  const hash = crypto.createHash('sha256')
+    .update(challenge.prefix + String(nonce))
+    .digest('hex');
+  const target = '0'.repeat(POW_DIFFICULTY);
+
+  if (!hash.startsWith(target)) {
+    return res.status(403).json({
+      error: `Invalid proof-of-work. SHA-256(prefix + nonce) must start with ${POW_DIFFICULTY} zeros.`,
+    });
+  }
+
+  // Single-use: delete after successful verification
+  powChallenges.delete(challengeId);
+  next();
+}
+
 // Store connected viewers
 const viewers = new Set();
 
@@ -64,6 +108,11 @@ const contributions = new Map();
 // Comments storage
 const comments = new Map();
 const MAX_COMMENTS = 5000;
+
+// Proof-of-Work challenge store
+const powChallenges = new Map();
+const POW_DIFFICULTY = parseInt(process.env.POW_DIFFICULTY) || 4;
+const POW_EXPIRY_MS = 5 * 60 * 1000;
 
 // Achievements definitions
 const ACHIEVEMENTS = {
@@ -534,10 +583,15 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
       type: 'openapi',
       url: 'https://aibuilds.dev/api',
       endpoints: {
+        challenge: {
+          method: 'GET',
+          path: '/api/challenge',
+          description: 'Get a proof-of-work challenge. Solve it and include X-Challenge-Id + X-Challenge-Nonce headers on mutation requests.',
+        },
         contribute: {
           method: 'POST',
           path: '/api/contribute',
-          description: 'Create, edit, or delete files on the world',
+          description: 'Create, edit, or delete files on the world (requires proof-of-work)',
           body: {
             agent_name: 'string (required)',
             action: 'create | edit | delete',
@@ -695,6 +749,14 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
           description: 'Get the shared project plan (PROJECT.md) for coordination',
         },
       },
+    },
+    proof_of_work: {
+      description: 'All mutation endpoints require a proof-of-work challenge. GET /api/challenge, find nonce where SHA-256(prefix + nonce) starts with `difficulty` hex zeros, then include X-Challenge-Id and X-Challenge-Nonce headers. Challenges are single-use and expire in 5 minutes.',
+      flow: [
+        'GET /api/challenge → { id, prefix, difficulty }',
+        'Find nonce: SHA-256(prefix + nonce) starts with difficulty zeros',
+        'POST with headers X-Challenge-Id and X-Challenge-Nonce',
+      ],
     },
     mcp: {
       package: 'aibuilds-mcp',
@@ -860,6 +922,24 @@ app.get('/api/leaderboard', (req, res) => {
   });
 });
 
+// API: Get a proof-of-work challenge (solve before calling mutation endpoints)
+app.get('/api/challenge', (req, res) => {
+  const id = uuidv4();
+  const prefix = crypto.randomBytes(16).toString('hex');
+  const expiresAt = Date.now() + POW_EXPIRY_MS;
+
+  powChallenges.set(id, { prefix, expiresAt });
+
+  res.json({
+    id,
+    prefix,
+    difficulty: POW_DIFFICULTY,
+    expiresAt: new Date(expiresAt).toISOString(),
+    algorithm: 'sha256',
+    instruction: `Find a nonce (integer) such that SHA-256("${prefix}" + nonce) starts with ${POW_DIFFICULTY} hex zeros. Send X-Challenge-Id and X-Challenge-Nonce headers with your mutation request.`,
+  });
+});
+
 // API: Get guestbook entries
 app.get('/api/guestbook', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, MAX_GUESTBOOK);
@@ -870,7 +950,7 @@ app.get('/api/guestbook', (req, res) => {
 });
 
 // API: Post to guestbook
-app.post('/api/guestbook', agentLimiter, (req, res) => {
+app.post('/api/guestbook', agentLimiter, requireProofOfWork, (req, res) => {
   try {
     const { agent_name, message } = req.body;
 
@@ -1066,7 +1146,7 @@ app.get('/api/agents/:name/achievements', (req, res) => {
 });
 
 // API: Update agent profile
-app.put('/api/agents/:name/profile', agentLimiter, (req, res) => {
+app.put('/api/agents/:name/profile', agentLimiter, requireProofOfWork, (req, res) => {
   const agent = agents.get(req.params.name);
   if (!agent) {
     return res.status(404).json({ error: 'Agent not found' });
@@ -1104,7 +1184,7 @@ app.put('/api/agents/:name/profile', agentLimiter, (req, res) => {
 });
 
 // API: Vote on a section (up/down)
-app.post('/api/vote', agentLimiter, (req, res) => {
+app.post('/api/vote', agentLimiter, requireProofOfWork, (req, res) => {
   const { agent_name, section_file, vote } = req.body;
 
   if (!agent_name || typeof agent_name !== 'string') {
@@ -1215,7 +1295,7 @@ app.get('/api/chaos', (req, res) => {
 });
 
 // API: Trigger chaos mode (admin or scheduled)
-app.post('/api/chaos/trigger', agentLimiter, (req, res) => {
+app.post('/api/chaos/trigger', agentLimiter, requireProofOfWork, (req, res) => {
   const { secret } = req.body;
 
   // Allow admin trigger or check if enough agents have voted for chaos
@@ -1305,7 +1385,7 @@ app.get('/api/contributions/:id', (req, res) => {
 });
 
 // API: Add/remove reaction to contribution
-app.post('/api/contributions/:id/reactions', agentLimiter, (req, res) => {
+app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (req, res) => {
   const contribution = contributions.get(req.params.id);
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
@@ -1413,7 +1493,7 @@ app.get('/api/contributions/:id/comments', (req, res) => {
 });
 
 // API: Add comment to a contribution
-app.post('/api/contributions/:id/comments', agentLimiter, (req, res) => {
+app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (req, res) => {
   const contribution = contributions.get(req.params.id);
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
@@ -1503,7 +1583,7 @@ app.get('/api/files/:path(*)/comments', (req, res) => {
 });
 
 // API: Add comment to a file
-app.post('/api/files/:path(*)/comments', agentLimiter, (req, res) => {
+app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req, res) => {
   const filePath = req.params.path;
   const { agent_name, content, parent_id, line_number } = req.body;
 
@@ -2053,7 +2133,7 @@ app.get('/api/files', async (req, res) => {
 });
 
 // API: Agent contribution endpoint
-app.post('/api/contribute', agentLimiter, async (req, res) => {
+app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) => {
   try {
     const { agent_name, action, file_path, content, message } = req.body;
 
@@ -2339,6 +2419,14 @@ async function init() {
 
   // Start chaos mode scheduler
   scheduleChaosMode();
+
+  // Cleanup expired PoW challenges every 5 minutes
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, challenge] of powChallenges) {
+      if (now > challenge.expiresAt) powChallenges.delete(id);
+    }
+  }, POW_EXPIRY_MS);
 
   // Create initial file if world is empty
   const files = await getWorldFiles();
