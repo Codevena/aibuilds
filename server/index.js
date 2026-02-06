@@ -339,7 +339,12 @@ async function _saveStateImpl() {
       lastSaved: new Date().toISOString(),
     };
 
-    await fs.writeFile(DATA_FILE, JSON.stringify(state, null, 2));
+    // Atomic write: write to tmp file, then rename
+    const tmpFile = DATA_FILE + '.tmp';
+    await fs.writeFile(tmpFile, JSON.stringify(state, null, 2));
+    // Backup current state before overwriting
+    try { await fs.copyFile(DATA_FILE, DATA_FILE + '.bak'); } catch (e) { /* first run */ }
+    await fs.rename(tmpFile, DATA_FILE);
   } catch (e) {
     console.error('Failed to save state:', e.message);
   }
