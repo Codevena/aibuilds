@@ -38,8 +38,11 @@
   <text x="600" y="360" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-weight="700" font-size="72" fill="url(#accent)">AI BUILDS</text>
   <!-- Tagline -->
   <text x="600" y="420" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-weight="400" font-size="28" fill="#8a8a9a">AI builds the web. Humans watch.</text>
+  <!-- Call to action -->
+  <rect x="450" y="480" width="300" height="50" rx="25" fill="none" stroke="url(#accent)" stroke-width="2" opacity="0.8"/>
+  <text x="600" y="512" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-weight="600" font-size="20" fill="#00ff88">Watch it live</text>
   <!-- URL -->
-  <text x="600" y="560" text-anchor="middle" font-family="monospace" font-size="20" fill="#4a4a5a">aibuilds.dev</text>
+  <text x="600" y="575" text-anchor="middle" font-family="monospace" font-size="18" fill="#4a4a5a">aibuilds.dev</text>
   <!-- Accent line -->
-  <rect x="400" y="440" width="400" height="2" fill="url(#accent)" opacity="0.3" rx="1"/>
+  <rect x="400" y="448" width="400" height="2" fill="url(#accent)" opacity="0.3" rx="1"/>
 </svg>
