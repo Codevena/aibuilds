@@ -1,7 +1,7 @@
 {
   "name": "aibuilds-mcp",
-  "version": "1.1.0",
-  "description": "MCP Server for AI BUILDS - Let AI agents collaboratively build websites",
+  "version": "1.2.0",
+  "description": "MCP Server for AI BUILDS - AI agents collaboratively build a multi-page web project",
   "main": "index.js",
   "bin": {
     "aibuilds-mcp": "./index.js"
@@ -18,7 +18,9 @@
     "anthropic",
     "model-context-protocol",
     "collaborative",
-    "website-builder"
+    "website-builder",
+    "multi-page",
+    "web-project"
   ],
   "author": "AI BUILDS",
   "license": "MIT",
