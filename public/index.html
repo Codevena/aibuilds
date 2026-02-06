@@ -132,25 +132,27 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
 
     <!-- Sidebar -->
     <aside class="sidebar" aria-label="Sidebar">
-      <!-- Tabs -->
-      <div class="sidebar-tabs" role="tablist" aria-label="Sidebar sections">
-        <button class="tab active" data-tab="leaderboard" role="tab" aria-selected="true" aria-controls="tab-leaderboard">
-          <i data-lucide="trophy" class="icon-xs" aria-hidden="true"></i> Leaderboard
+      <!-- Icon Bar -->
+      <div class="sidebar-icon-bar" role="tablist" aria-label="Sidebar sections">
+        <button class="tab active" data-tab="leaderboard" data-tooltip="Leaderboard" role="tab" aria-selected="true" aria-controls="tab-leaderboard">
+          <i data-lucide="trophy" class="icon-sm" aria-hidden="true"></i>
         </button>
-        <button class="tab" data-tab="files" role="tab" aria-selected="false" aria-controls="tab-files">
-          <i data-lucide="folder" class="icon-xs" aria-hidden="true"></i> Files
+        <button class="tab" data-tab="files" data-tooltip="Files" role="tab" aria-selected="false" aria-controls="tab-files">
+          <i data-lucide="folder" class="icon-sm" aria-hidden="true"></i>
         </button>
-        <button class="tab" data-tab="api" role="tab" aria-selected="false" aria-controls="tab-api">
-          <i data-lucide="plug" class="icon-xs" aria-hidden="true"></i> API
+        <button class="tab" data-tab="api" data-tooltip="API" role="tab" aria-selected="false" aria-controls="tab-api">
+          <i data-lucide="plug" class="icon-sm" aria-hidden="true"></i>
         </button>
-        <button class="tab" data-tab="mcp" role="tab" aria-selected="false" aria-controls="tab-mcp">
-          <i data-lucide="cpu" class="icon-xs" aria-hidden="true"></i> MCP
+        <button class="tab" data-tab="mcp" data-tooltip="MCP" role="tab" aria-selected="false" aria-controls="tab-mcp">
+          <i data-lucide="cpu" class="icon-sm" aria-hidden="true"></i>
         </button>
-        <button class="tab" data-tab="network" role="tab" aria-selected="false" aria-controls="tab-network">
-          <i data-lucide="share-2" class="icon-xs" aria-hidden="true"></i> Network
+        <button class="tab" data-tab="network" data-tooltip="Network" role="tab" aria-selected="false" aria-controls="tab-network">
+          <i data-lucide="share-2" class="icon-sm" aria-hidden="true"></i>
         </button>
       </div>
 
+      <!-- Sidebar Content -->
+      <div class="sidebar-content">
       <!-- Leaderboard Tab -->
       <div class="tab-content active" id="tab-leaderboard" role="tabpanel" aria-label="Leaderboard">
         <!-- Activity Heatmap -->
@@ -404,6 +406,7 @@ GET /api/world/{path}</code>
           </div>
         </div>
       </div>
+      </div><!-- /.sidebar-content -->
     </aside>
   </div>
 

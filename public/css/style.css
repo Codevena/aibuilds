@@ -476,25 +476,43 @@ html, body {
   grid-area: sidebar;
   background: var(--bg-card);
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   overflow: hidden;
 }
 
-.sidebar-tabs {
+/* VS Code-style Icon Bar */
+.sidebar-icon-bar {
   display: flex;
-  border-bottom: 1px solid var(--border);
+  flex-direction: column;
+  width: 44px;
+  flex-shrink: 0;
+  background: var(--bg-dark);
+  border-right: 1px solid var(--border);
+}
+
+.sidebar-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
 }
 
 .tab {
-  flex: 1;
-  padding: 0.75rem 0.5rem;
+  position: relative;
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   background: transparent;
   border: none;
+  border-left: 2px solid transparent;
   color: var(--text-muted);
-  font-size: 0.75rem;
   cursor: pointer;
   transition: all 0.2s;
   font-family: inherit;
+  padding: 0;
 }
 
 .tab:hover {
@@ -505,7 +523,35 @@ html, body {
 .tab.active {
   color: var(--accent);
   background: var(--bg-elevated);
-  border-bottom: 2px solid var(--accent);
+  border-left: 2px solid var(--accent);
+}
+
+/* Tooltip on hover */
+.tab[data-tooltip] {
+  position: relative;
+}
+
+.tab[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-elevated);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.7rem;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 100;
+}
+
+.tab[data-tooltip]:hover::after {
+  opacity: 1;
 }
 
 .tab-content {
@@ -2121,6 +2167,24 @@ html, body {
     border-top: 1px solid var(--border);
     min-height: 350px;
     max-height: 60vh;
+    flex-direction: row;
+  }
+
+  .sidebar-icon-bar {
+    width: 40px;
+    flex-direction: column;
+    border-right: 1px solid var(--border);
+    border-bottom: none;
+  }
+
+  .tab {
+    width: 40px;
+    height: 40px;
+  }
+
+  /* Hide tooltip on tablet to avoid overflow */
+  .tab[data-tooltip]::after {
+    display: none;
   }
 
   .world-section {
@@ -2135,23 +2199,6 @@ html, body {
   .guestbook-section {
     min-height: 140px;
     max-height: 200px;
-  }
-
-  /* Tabs scroll horizontally on tablet */
-  .sidebar-tabs {
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-
-  .sidebar-tabs::-webkit-scrollbar {
-    display: none;
-  }
-
-  .tab {
-    white-space: nowrap;
-    min-width: 0;
-    flex-shrink: 0;
   }
 
   /* Modal responsive */
@@ -2244,15 +2291,37 @@ html, body {
     max-height: 180px;
   }
 
-  /* Sidebar */
+  /* Sidebar: icon bar becomes horizontal on mobile */
   .sidebar {
     min-height: 350px;
     max-height: 50vh;
+    flex-direction: column;
+  }
+
+  .sidebar-icon-bar {
+    flex-direction: row;
+    width: 100%;
+    height: 40px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
   }
 
   .tab {
-    padding: 0.6rem 0.35rem;
-    font-size: 0.65rem;
+    width: auto;
+    height: 40px;
+    flex: 1;
+    border-left: none;
+    border-bottom: 2px solid transparent;
+  }
+
+  .tab.active {
+    border-left: none;
+    border-bottom: 2px solid var(--accent);
+  }
+
+  /* Hide tooltip on mobile */
+  .tab[data-tooltip]::after {
+    display: none;
   }
 
   .tab-content {
@@ -2387,8 +2456,7 @@ html, body {
   }
 
   .tab {
-    padding: 0.5rem 0.25rem;
-    font-size: 0.6rem;
+    height: 36px;
   }
 
   .filter-group {
