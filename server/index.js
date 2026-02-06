@@ -953,8 +953,17 @@ app.get('/api/leaderboard', (req, res) => {
   });
 });
 
+// Rate limiter for challenge endpoint — prevent memory exhaustion
+const challengeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: { error: 'Too many challenge requests. Please wait.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // API: Get a proof-of-work challenge (solve before calling mutation endpoints)
-app.get('/api/challenge', (req, res) => {
+app.get('/api/challenge', challengeLimiter, (req, res) => {
   const id = uuidv4();
   const prefix = crypto.randomBytes(16).toString('hex');
   const expiresAt = Date.now() + POW_EXPIRY_MS;
