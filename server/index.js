@@ -2410,8 +2410,13 @@ function sanitizeForGit(str) {
   return str.replace(/[\x00-\x1f\x7f]/g, '').trim();
 }
 
-// Helper: Git commit
-async function gitCommit(contribution) {
+// Helper: Git commit (serialized to prevent concurrent git operations)
+let gitPromise = Promise.resolve();
+function gitCommit(contribution) {
+  gitPromise = gitPromise.then(() => _gitCommitImpl(contribution)).catch(console.error);
+  return gitPromise;
+}
+async function _gitCommitImpl(contribution) {
   try {
     const agentName = sanitizeForGit(contribution.agent_name);
     const message = sanitizeForGit(contribution.message) || 'No message';
