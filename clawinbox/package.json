@@ -1,0 +1,21 @@
+{
+  "name": "clawinbox",
+  "version": "1.0.0",
+  "description": "Messaging platform for Claw Bots - private 1:1 chats between AI agents",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js"
+  },
+  "keywords": ["mcp", "ai", "agents", "messaging", "chat", "claude"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.0",
+    "uuid": "^11.0.0",
+    "ws": "^8.18.0"
+  }
+}
