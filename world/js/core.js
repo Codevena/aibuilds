@@ -49,14 +49,14 @@ class AIBuildsNav {
     // Build page links (exclude home — it gets its own link)
     const pageLinks = pages
       .filter(p => p.slug !== 'home')
-      .map(p => `<li><a href="${p.route}" class="nav-link">${p.title}</a></li>`)
+      .map(p => `<li><a href="${escapeHtml(p.route)}" class="nav-link">${escapeHtml(p.title)}</a></li>`)
       .join('');
 
     // Build section links (only shown as anchors on homepage)
     const sectionLinks = sections.map(s => {
       const id = 'section-' + s.file.replace('.html', '');
       const href = isHomepage ? `#${id}` : `/world/#${id}`;
-      return `<li><a href="${href}" class="nav-link nav-section-link">${s.title}</a></li>`;
+      return `<li><a href="${escapeHtml(href)}" class="nav-link nav-section-link">${escapeHtml(s.title)}</a></li>`;
     }).join('');
 
     const nav = document.createElement('nav');
@@ -122,6 +122,17 @@ class AIBuildsNav {
   }
 }
 
+// === HTML ESCAPING ===
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // === UTILITIES ===
 const AIBuilds = {
   // Format relative time (e.g., "2 hours ago")
@@ -163,7 +174,7 @@ const AIBuilds = {
   toast(message, type = 'info') {
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
-    toast.innerHTML = message;
+    toast.textContent = message;
     toast.style.cssText = `
       position: fixed;
       bottom: 20px;
@@ -280,17 +291,21 @@ class LiveActivity {
 
     const item = document.createElement('div');
     item.className = 'activity-item card animate-slide-up';
+    const agentName = escapeHtml(data.agent_name);
+    const filePath = escapeHtml(data.file_path);
+    const message = escapeHtml(data.message || 'No message');
+    const actionTag = data.action === 'create' ? 'green' : 'blue';
     item.innerHTML = `
       <div class="flex items-center gap-md">
-        <img src="https://api.dicebear.com/7.x/bottts/svg?seed=${data.agent_name}"
-             alt="${data.agent_name}"
+        <img src="https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(data.agent_name)}"
+             alt="${agentName}"
              style="width: 40px; height: 40px; border-radius: 50%;">
         <div>
-          <strong>${data.agent_name}</strong>
-          <span class="tag tag-${data.action === 'create' ? 'green' : 'blue'}">${data.action}</span>
-          <code>${data.file_path}</code>
+          <strong>${agentName}</strong>
+          <span class="tag tag-${actionTag}">${escapeHtml(data.action)}</span>
+          <code>${filePath}</code>
           <p style="margin: 0; color: var(--text-muted); font-size: 0.875rem;">
-            ${data.message || 'No message'}
+            ${message}
           </p>
         </div>
       </div>

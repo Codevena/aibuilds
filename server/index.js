@@ -30,7 +30,7 @@ const gitBinary = (() => {
 const git = simpleGit(path.join(__dirname, '..'), { binary: gitBinary });
 
 // Middleware
-app.use(cors());
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(helmet({
   contentSecurityPolicy: false, // We need flexibility for the world
 }));
@@ -245,8 +245,13 @@ function generateAgentId(name) {
   return Math.abs(hash).toString(16).padStart(8, '0');
 }
 
-// Save state to file
-async function saveState() {
+// Save state to file (mutex to prevent interleaved writes)
+let saveStatePromise = Promise.resolve();
+function saveState() {
+  saveStatePromise = saveStatePromise.then(_saveStateImpl).catch(console.error);
+  return saveStatePromise;
+}
+async function _saveStateImpl() {
   try {
     await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
 
@@ -2021,8 +2026,8 @@ app.get('/api/world/*', async (req, res) => {
     const filePath = req.params[0];
     const fullPath = path.join(WORLD_DIR, filePath);
 
-    // Security: ensure path is within world
-    if (!fullPath.startsWith(WORLD_DIR)) {
+    // Security: ensure path is within world (path.sep prevents traversal to sibling dirs)
+    if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -2077,8 +2082,8 @@ app.post('/api/contribute', agentLimiter, async (req, res) => {
 
     const fullPath = path.join(WORLD_DIR, sanitizedPath);
 
-    // Security: ensure path is within world
-    if (!fullPath.startsWith(WORLD_DIR)) {
+    // Security: ensure path is within world (path.sep prevents traversal to sibling dirs)
+    if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -2282,11 +2287,16 @@ async function renderPage(content, title, description, slug) {
   const pages = await getPages();
   const nav = generateNav(pages, slug);
 
-  return layout
-    .replace('{{TITLE}}', escapeHtmlServer(title))
-    .replace('{{DESCRIPTION}}', escapeHtmlServer(description))
-    .replace('{{NAV}}', nav)
-    .replace('{{CONTENT}}', content);
+  const replacements = {
+    '{{TITLE}}': escapeHtmlServer(title),
+    '{{DESCRIPTION}}': escapeHtmlServer(description),
+    '{{NAV}}': nav,
+    '{{CONTENT}}': content,
+  };
+  return layout.replace(
+    /\{\{TITLE\}\}|\{\{DESCRIPTION\}\}|\{\{NAV\}\}|\{\{CONTENT\}\}/g,
+    match => replacements[match] || match
+  );
 }
 
 // Helper: Server-side HTML escaping
@@ -2296,15 +2306,24 @@ function escapeHtmlServer(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Helper: Sanitize string for git commit message (strip control chars and newlines)
+function sanitizeForGit(str) {
+  if (!str) return '';
+  return str.replace(/[\x00-\x1f\x7f]/g, '').trim();
 }
 
 // Helper: Git commit
 async function gitCommit(contribution) {
   try {
+    const agentName = sanitizeForGit(contribution.agent_name);
+    const message = sanitizeForGit(contribution.message) || 'No message';
     await git.add('world/*');
     await git.commit(
-      `[${contribution.agent_name}] ${contribution.action}: ${contribution.file_path}\n\n${contribution.message || 'No message'}`
+      `[${agentName}] ${contribution.action}: ${contribution.file_path}\n\n${message}`
     );
   } catch (e) {
     // Git might not be initialized, that's ok
