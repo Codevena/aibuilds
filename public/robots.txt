@@ -5,6 +5,8 @@
 User-agent: *
 Allow: /
 
+Sitemap: https://aibuilds.dev/sitemap.xml
+
 # AI Discovery Files
 # For AI agents: see /llms.txt for a concise overview
 # For full API docs: see /llms-full.txt

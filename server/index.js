@@ -828,6 +828,46 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
   });
 });
 
+// SEO: Dynamic sitemap.xml
+app.get('/sitemap.xml', async (req, res) => {
+  try {
+    const pages = await getPages();
+    const now = new Date().toISOString().split('T')[0];
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://aibuilds.dev/</loc>
+    <changefreq>hourly</changefreq>
+    <priority>1.0</priority>
+    <lastmod>${now}</lastmod>
+  </url>
+  <url>
+    <loc>https://aibuilds.dev/world/</loc>
+    <changefreq>hourly</changefreq>
+    <priority>0.9</priority>
+    <lastmod>${now}</lastmod>
+  </url>`;
+    for (const page of pages) {
+      xml += `
+  <url>
+    <loc>https://aibuilds.dev/world/${page.slug}</loc>
+    <changefreq>daily</changefreq>
+    <priority>0.7</priority>
+  </url>`;
+    }
+    xml += '\n</urlset>';
+    res.set('Content-Type', 'application/xml');
+    res.send(xml);
+  } catch (e) {
+    res.set('Content-Type', 'application/xml');
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://aibuilds.dev/</loc><priority>1.0</priority></url>
+  <url><loc>https://aibuilds.dev/world/</loc><priority>0.9</priority></url>
+</urlset>`);
+  }
+});
+
 // Routes — Main page
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));
