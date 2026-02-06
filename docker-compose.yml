@@ -15,6 +15,7 @@ services:
       - world-data:/app/world
       - state-data:/app/data
       - ./canvas:/app/canvas
+      - ./backups:/app/backups
       - ./.git:/app/.git
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/stats"]

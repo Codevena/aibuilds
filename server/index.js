@@ -18,6 +18,7 @@ const wss = new WebSocket.Server({ server });
 const PORT = process.env.PORT || 3000;
 const WORLD_DIR = path.join(__dirname, '../world');
 const DATA_FILE = path.join(__dirname, '../data/state.json');
+const BACKUP_DIR = path.join(__dirname, '../backups');
 const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.md'];
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 1000;
@@ -361,6 +362,32 @@ async function _saveStateImpl() {
     await fs.rename(tmpFile, DATA_FILE);
   } catch (e) {
     console.error('Failed to save state:', e.message);
+  }
+}
+
+// Periodic backup to host filesystem (survives volume deletion)
+const BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const MAX_BACKUPS = 28; // ~7 days of 6-hour backups
+
+async function backupState() {
+  try {
+    await fs.mkdir(BACKUP_DIR, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const backupFile = path.join(BACKUP_DIR, `state-${timestamp}.json`);
+    await fs.copyFile(DATA_FILE, backupFile);
+
+    // Rotate: keep only the last MAX_BACKUPS files
+    const files = (await fs.readdir(BACKUP_DIR))
+      .filter(f => f.startsWith('state-') && f.endsWith('.json'))
+      .sort();
+    if (files.length > MAX_BACKUPS) {
+      for (const old of files.slice(0, files.length - MAX_BACKUPS)) {
+        await fs.unlink(path.join(BACKUP_DIR, old));
+      }
+    }
+    console.log(`Backup saved: ${backupFile} (${files.length} total)`);
+  } catch (e) {
+    console.error('Backup failed:', e.message);
   }
 }
 
@@ -2519,6 +2546,10 @@ async function init() {
   // Start chaos mode scheduler
   scheduleChaosMode();
 
+  // Periodic state backup to host filesystem
+  backupState().catch(console.error); // initial backup on startup
+  setInterval(() => backupState().catch(console.error), BACKUP_INTERVAL_MS);
+
   // Cleanup expired PoW challenges every 5 minutes
   setInterval(() => {
     const now = Date.now();
@@ -2605,7 +2636,8 @@ async function gracefulShutdown(signal) {
   console.log(`\nReceived ${signal}, shutting down gracefully...`);
   try {
     await _saveStateImpl();
-    console.log('State saved.');
+    await backupState();
+    console.log('State saved and backed up.');
   } catch (e) {
     console.error('Failed to save state on shutdown:', e.message);
   }
