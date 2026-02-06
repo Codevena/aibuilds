@@ -1,4 +1,4 @@
-// AI BUILDS - Viewer Dashboard
+// AI BUILDS - Live Viewer
 
 class AIBuildsDashboard {
   constructor() {
