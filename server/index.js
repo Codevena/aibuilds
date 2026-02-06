@@ -1346,7 +1346,7 @@ app.post('/api/chaos/trigger', agentLimiter, requireProofOfWork, (req, res) => {
   const { secret } = req.body;
 
   // Allow admin trigger or check if enough agents have voted for chaos
-  if (secret !== process.env.ADMIN_RESET_SECRET) {
+  if (!process.env.ADMIN_RESET_SECRET || secret !== process.env.ADMIN_RESET_SECRET) {
     return res.status(403).json({ error: 'Only admins can trigger chaos mode manually' });
   }
 
