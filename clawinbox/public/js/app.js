@@ -4,8 +4,11 @@
   // State
   let currentAgent = null;
   let currentConvId = null;
+  let currentRoomId = null;
+  let activeTab = 'chats'; // 'chats' or 'rooms'
   let agents = {};
   let conversations = [];
+  let rooms = [];
   let ws = null;
   let pollTimer = null;
 
@@ -28,15 +31,27 @@
   const convPanel = $('conv-panel');
   const convList = $('conv-list');
   const convEmpty = $('conv-empty');
+  const roomList = $('room-list');
+  const roomEmpty = $('room-empty');
   const unreadTotal = $('unread-total');
   const chatPanel = $('chat-panel');
   const chatWelcome = $('chat-welcome');
   const chatView = $('chat-view');
   const chatAvatar = $('chat-avatar');
+  const chatRoomIcon = $('chat-room-icon');
   const chatName = $('chat-name');
   const chatDesc = $('chat-desc');
   const chatBackBtn = $('chat-back-btn');
   const messagesEl = $('messages');
+  const tabChats = $('tab-chats');
+  const tabRooms = $('tab-rooms');
+
+  // Landing-page stat elements
+  const statAgents = $('stat-agents');
+  const statRooms = $('stat-rooms');
+  const statConversations = $('stat-conversations');
+  const statMessages = $('stat-messages');
+  const roomsLiveList = $('rooms-live-list');
 
   // Helpers
   function avatarUrl(name) {
@@ -77,9 +92,10 @@
   // ─── Landing ─────────────────────────────
 
   async function loadLanding() {
-    const [agentsData, statusData] = await Promise.all([
+    const [agentsData, statusData, roomsData] = await Promise.all([
       api('/api/agents'),
       api('/api/status'),
+      api('/api/rooms'),
     ]);
 
     agents = {};
@@ -97,12 +113,37 @@
       enterBtn.disabled = true;
     }
 
+    // Hero stats
     const s = statusData;
     const parts = [];
-    if (s.agents > 0) parts.push(`${s.agents} agent${s.agents !== 1 ? 's' : ''} connected`);
+    if (s.agents > 0) parts.push(`${s.agents} agent${s.agents !== 1 ? 's' : ''}`);
+    if (s.rooms > 0) parts.push(`${s.rooms} room${s.rooms !== 1 ? 's' : ''}`);
     if (s.conversations > 0) parts.push(`${s.conversations} conversation${s.conversations !== 1 ? 's' : ''}`);
-    if (s.messages > 0) parts.push(`${s.messages} message${s.messages !== 1 ? 's' : ''} exchanged`);
+    if (s.messages > 0) parts.push(`${s.messages} message${s.messages !== 1 ? 's' : ''}`);
     heroStats.textContent = parts.length > 0 ? parts.join(' · ') : '';
+
+    // Stats section
+    if (statAgents) statAgents.textContent = s.agents || 0;
+    if (statRooms) statRooms.textContent = s.rooms || 0;
+    if (statConversations) statConversations.textContent = s.conversations || 0;
+    if (statMessages) statMessages.textContent = s.messages || 0;
+
+    // Rooms live list
+    if (roomsLiveList && roomsData.rooms) {
+      if (roomsData.rooms.length === 0) {
+        roomsLiveList.innerHTML = '<div class="room-live-item"><div class="room-live-name"><span>#</span> No rooms yet</div><div class="room-live-meta">Create one via API or MCP</div></div>';
+      } else {
+        roomsLiveList.innerHTML = roomsData.rooms.map(r => {
+          const lastMsg = r.lastMessage
+            ? `Last: ${esc(r.lastMessage.agent)}: "${esc(r.lastMessage.text.slice(0, 40))}${r.lastMessage.text.length > 40 ? '...' : ''}"`
+            : 'No messages yet';
+          return `<div class="room-live-item">
+            <div class="room-live-name"><span>#</span> ${esc(r.name)}</div>
+            <div class="room-live-meta">${r.memberCount} members · ${r.messageCount} msgs</div>
+          </div>`;
+        }).join('');
+      }
+    }
   }
 
   agentSelect.addEventListener('change', () => {
@@ -117,13 +158,18 @@
 
   function enterApp(name) {
     currentAgent = name;
+    currentConvId = null;
+    currentRoomId = null;
+    activeTab = 'chats';
     landing.classList.add('hidden');
     mainApp.classList.remove('hidden');
     topbarAvatar.src = avatarUrl(name);
     topbarName.textContent = name;
+    setActiveTab('chats');
     renderAgentList();
     connectWS();
     loadConversations();
+    loadRooms();
     startPolling();
   }
 
@@ -132,6 +178,7 @@
   switchBtn.addEventListener('click', () => {
     currentAgent = null;
     currentConvId = null;
+    currentRoomId = null;
     if (ws) { ws.onclose = null; ws.close(); ws = null; }
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     mainApp.classList.add('hidden');
@@ -143,6 +190,22 @@
     removeSidebarOverlay();
     loadLanding();
   });
+
+  // ─── Tab Switching ─────────────────────────
+
+  tabChats.addEventListener('click', () => setActiveTab('chats'));
+  tabRooms.addEventListener('click', () => setActiveTab('rooms'));
+
+  function setActiveTab(tab) {
+    activeTab = tab;
+    tabChats.classList.toggle('active', tab === 'chats');
+    tabRooms.classList.toggle('active', tab === 'rooms');
+
+    convList.classList.toggle('hidden', tab !== 'chats');
+    convEmpty.classList.toggle('hidden', tab !== 'chats' || conversations.length > 0);
+    roomList.classList.toggle('hidden', tab !== 'rooms');
+    roomEmpty.classList.toggle('hidden', tab !== 'rooms' || rooms.length > 0);
+  }
 
   // ─── Mobile sidebar ───────────────────────
 
@@ -172,10 +235,12 @@
 
   chatBackBtn.addEventListener('click', () => {
     currentConvId = null;
+    currentRoomId = null;
     chatPanel.classList.remove('mobile-visible');
     chatView.classList.add('hidden');
     chatWelcome.classList.remove('hidden');
     convList.querySelectorAll('.conv-item.active').forEach(el => el.classList.remove('active'));
+    roomList.querySelectorAll('.conv-item.active').forEach(el => el.classList.remove('active'));
   });
 
   // ─── Agent List ───────────────────────────
@@ -206,7 +271,6 @@
       api('/api/agents'),
     ]);
 
-    // Refresh agents
     agents = {};
     (agentsData.agents || []).forEach(a => { agents[a.name] = a; });
     renderAgentList();
@@ -218,12 +282,12 @@
   function renderConversations() {
     if (conversations.length === 0) {
       convList.innerHTML = '';
-      convEmpty.classList.remove('hidden');
+      if (activeTab === 'chats') convEmpty.classList.remove('hidden');
       unreadTotal.classList.add('hidden');
       return;
     }
 
-    convEmpty.classList.add('hidden');
+    if (activeTab === 'chats') convEmpty.classList.add('hidden');
 
     const total = conversations.reduce((s, c) => s + (c.unread || 0), 0);
     if (total > 0) {
@@ -266,12 +330,16 @@
 
   async function openConv(id, otherName) {
     currentConvId = id;
+    currentRoomId = null;
 
     convList.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
+    roomList.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
     const active = convList.querySelector(`[data-id="${id}"]`);
     if (active) active.classList.add('active');
 
     const other = agents[otherName] || { name: otherName, description: '' };
+    chatAvatar.classList.remove('hidden');
+    chatRoomIcon.classList.add('hidden');
     chatAvatar.src = avatarUrl(otherName);
     chatName.textContent = otherName;
     chatDesc.textContent = other.description || other.personality || '';
@@ -281,13 +349,83 @@
     chatPanel.classList.add('mobile-visible');
 
     const data = await api(`/api/conversations/${id}/messages?agent=${encodeURIComponent(currentAgent)}`);
-    renderMessages(data.messages || []);
+    renderMessages(data.messages || [], false);
     loadConversations();
+  }
+
+  // ─── Rooms ────────────────────────────────
+
+  async function loadRooms() {
+    if (!currentAgent) return;
+    const data = await api('/api/rooms');
+    rooms = data.rooms || [];
+    renderRooms();
+  }
+
+  function renderRooms() {
+    if (rooms.length === 0) {
+      roomList.innerHTML = '';
+      if (activeTab === 'rooms') roomEmpty.classList.remove('hidden');
+      return;
+    }
+
+    if (activeTab === 'rooms') roomEmpty.classList.add('hidden');
+
+    roomList.innerHTML = rooms.map(r => {
+      const preview = r.lastMessage
+        ? `${r.lastMessage.agent}: ${r.lastMessage.text}`
+        : r.description || 'No messages yet';
+      const time = r.lastMessage ? timeStr(r.lastMessage.timestamp) : '';
+      const active = r.id === currentRoomId ? ' active' : '';
+
+      return `<div class="conv-item${active}" data-room-id="${r.id}" data-room-name="${esc(r.name)}">
+        <div class="room-icon">#</div>
+        <div class="conv-body">
+          <div class="conv-body-top">
+            <span class="conv-name">${esc(r.name)}</span>
+            <span class="conv-time">${time}</span>
+          </div>
+          <div class="conv-bottom">
+            <span class="conv-preview">${esc(preview.slice(0, 70))}</span>
+            <span class="conv-time">${r.memberCount} members</span>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+
+    roomList.querySelectorAll('.conv-item').forEach(el => {
+      el.addEventListener('click', () => {
+        openRoom(el.dataset.roomId, el.dataset.roomName);
+      });
+    });
+  }
+
+  async function openRoom(id, roomName) {
+    currentRoomId = id;
+    currentConvId = null;
+
+    convList.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
+    roomList.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
+    const active = roomList.querySelector(`[data-room-id="${id}"]`);
+    if (active) active.classList.add('active');
+
+    chatAvatar.classList.add('hidden');
+    chatRoomIcon.classList.remove('hidden');
+    chatName.textContent = `#${roomName}`;
+    const room = rooms.find(r => r.id === id);
+    chatDesc.textContent = room ? `${room.memberCount} members · ${room.description || ''}` : '';
+
+    chatWelcome.classList.add('hidden');
+    chatView.classList.remove('hidden');
+    chatPanel.classList.add('mobile-visible');
+
+    const data = await api(`/api/rooms/${id}/messages`);
+    renderMessages(data.messages || [], true);
   }
 
   // ─── Messages ─────────────────────────────
 
-  function renderMessages(msgs) {
+  function renderMessages(msgs, isRoom) {
     let html = '';
     let lastDate = '';
 
@@ -298,19 +436,27 @@
         lastDate = d;
       }
 
-      const mine = m.agent === currentAgent;
-      html += `<div class="msg ${mine ? 'msg-mine' : 'msg-theirs'}">
-        ${!mine ? `<div class="msg-sender">${esc(m.agent)}</div>` : ''}
-        <div class="msg-text">${esc(m.text)}</div>
-        <div class="msg-time">${timeStr(m.timestamp)}</div>
-      </div>`;
+      if (isRoom) {
+        html += `<div class="msg msg-room">
+          <div class="msg-sender">${esc(m.agent)}</div>
+          <div class="msg-text">${esc(m.text)}</div>
+          <div class="msg-time">${timeStr(m.timestamp)}</div>
+        </div>`;
+      } else {
+        const mine = m.agent === currentAgent;
+        html += `<div class="msg ${mine ? 'msg-mine' : 'msg-theirs'}">
+          ${!mine ? `<div class="msg-sender">${esc(m.agent)}</div>` : ''}
+          <div class="msg-text">${esc(m.text)}</div>
+          <div class="msg-time">${timeStr(m.timestamp)}</div>
+        </div>`;
+      }
     });
 
     messagesEl.innerHTML = html;
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
-  function appendMessage(msg) {
+  function appendMessage(msg, isRoom) {
     const d = dateStr(msg.timestamp);
     const dividers = messagesEl.querySelectorAll('.msg-divider');
     const lastDiv = dividers[dividers.length - 1];
@@ -321,12 +467,21 @@
       messagesEl.appendChild(el);
     }
 
-    const mine = msg.agent === currentAgent;
     const el = document.createElement('div');
-    el.className = `msg ${mine ? 'msg-mine' : 'msg-theirs'}`;
-    el.innerHTML = `${!mine ? `<div class="msg-sender">${esc(msg.agent)}</div>` : ''}
-      <div class="msg-text">${esc(msg.text)}</div>
-      <div class="msg-time">${timeStr(msg.timestamp)}</div>`;
+
+    if (isRoom) {
+      el.className = 'msg msg-room';
+      el.innerHTML = `<div class="msg-sender">${esc(msg.agent)}</div>
+        <div class="msg-text">${esc(msg.text)}</div>
+        <div class="msg-time">${timeStr(msg.timestamp)}</div>`;
+    } else {
+      const mine = msg.agent === currentAgent;
+      el.className = `msg ${mine ? 'msg-mine' : 'msg-theirs'}`;
+      el.innerHTML = `${!mine ? `<div class="msg-sender">${esc(msg.agent)}</div>` : ''}
+        <div class="msg-text">${esc(msg.text)}</div>
+        <div class="msg-time">${timeStr(msg.timestamp)}</div>`;
+    }
+
     messagesEl.appendChild(el);
 
     const nearBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 120;
@@ -345,10 +500,18 @@
       if (event.type === 'new_message') {
         const { conversationId, message } = event.data;
         if (conversationId === currentConvId) {
-          appendMessage(message);
+          appendMessage(message, false);
           api(`/api/conversations/${conversationId}/messages?agent=${encodeURIComponent(currentAgent)}`);
         }
         loadConversations();
+      }
+
+      if (event.type === 'room_message') {
+        const { roomId, message } = event.data;
+        if (roomId === currentRoomId) {
+          appendMessage(message, true);
+        }
+        loadRooms();
       }
 
       if (event.type === 'agent_joined') {
@@ -362,6 +525,14 @@
           loadConversations();
         }
       }
+
+      if (event.type === 'room_created') {
+        loadRooms();
+      }
+
+      if (event.type === 'room_joined' || event.type === 'room_left') {
+        loadRooms();
+      }
     };
 
     ws.onclose = () => {
@@ -371,7 +542,10 @@
 
   function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(loadConversations, 10000);
+    pollTimer = setInterval(() => {
+      loadConversations();
+      loadRooms();
+    }, 10000);
   }
 
   // Copy buttons

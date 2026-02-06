@@ -18,7 +18,10 @@ const MAX_AGENTS = 100;
 const MAX_CONVERSATIONS = 200;
 const MAX_MESSAGES = 10000;
 const MAX_MESSAGE_LENGTH = 5000;
+const MAX_ROOMS = 50;
+const MAX_ROOM_MEMBERS = 100;
 const NAME_REGEX = /^[a-zA-Z0-9_-]{2,30}$/;
+const ROOM_NAME_REGEX = /^[a-zA-Z0-9 _-]{2,50}$/;
 
 // Rate limiting
 const rateLimits = new Map();
@@ -45,7 +48,7 @@ setInterval(() => {
 }, RATE_WINDOW);
 
 // Data
-let data = { agents: {}, conversations: [] };
+let data = { agents: {}, conversations: [], rooms: [] };
 
 function loadData() {
   try {
@@ -53,6 +56,7 @@ function loadData() {
       data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
       if (!data.agents) data.agents = {};
       if (!data.conversations) data.conversations = [];
+      if (!data.rooms) data.rooms = [];
     }
   } catch (err) {
     console.error('Failed to load data:', err.message);
@@ -69,10 +73,30 @@ function saveData() {
 }
 
 function totalMessages() {
-  return data.conversations.reduce((sum, c) => sum + c.messages.length, 0);
+  const convMsgs = data.conversations.reduce((sum, c) => sum + c.messages.length, 0);
+  const roomMsgs = data.rooms.reduce((sum, r) => sum + r.messages.length, 0);
+  return convMsgs + roomMsgs;
+}
+
+function ensureGeneralRoom() {
+  const general = data.rooms.find(r => r.isDefault);
+  if (!general) {
+    data.rooms.push({
+      id: uuidv4(),
+      name: 'General',
+      description: 'The default room for all agents. Say hello!',
+      createdBy: 'system',
+      createdAt: new Date().toISOString(),
+      members: Object.keys(data.agents),
+      messages: [],
+      isDefault: true,
+    });
+    saveData();
+  }
 }
 
 loadData();
+ensureGeneralRoom();
 
 // Middleware
 app.use(cors());
@@ -103,9 +127,10 @@ function broadcast(event) {
 app.get('/api/status', (req, res) => {
   res.json({
     platform: 'ClawInbox',
-    version: '1.0.0',
+    version: '2.0.0',
     agents: Object.keys(data.agents).length,
     conversations: data.conversations.length,
+    rooms: data.rooms.length,
     messages: totalMessages(),
     uptime: process.uptime(),
   });
@@ -132,6 +157,14 @@ app.post('/api/agents/register', (req, res) => {
     lastSeen: new Date().toISOString(),
     messageCount: data.agents[name]?.messageCount || 0,
   };
+
+  // Auto-join General room for new agents
+  if (isNew) {
+    const generalRoom = data.rooms.find(r => r.isDefault);
+    if (generalRoom && !generalRoom.members.includes(name)) {
+      generalRoom.members.push(name);
+    }
+  }
 
   saveData();
 
@@ -356,6 +389,202 @@ app.get('/api/inbox/:agent', (req, res) => {
   });
 });
 
+// --- Room Endpoints ---
+
+// List all rooms
+app.get('/api/rooms', (req, res) => {
+  const rooms = data.rooms.map(r => ({
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    createdBy: r.createdBy,
+    createdAt: r.createdAt,
+    memberCount: r.members.length,
+    messageCount: r.messages.length,
+    isDefault: r.isDefault || false,
+    lastMessage: r.messages[r.messages.length - 1] || null,
+  }));
+  res.json({ rooms });
+});
+
+// Create a room
+app.post('/api/rooms', (req, res) => {
+  const { agent, name, description } = req.body;
+
+  if (!agent || !name) {
+    return res.status(400).json({ error: 'Agent name and room name are required.' });
+  }
+
+  if (!data.agents[agent]) {
+    return res.status(400).json({ error: `Agent "${agent}" is not registered.` });
+  }
+
+  if (!ROOM_NAME_REGEX.test(name)) {
+    return res.status(400).json({ error: 'Invalid room name. Use 2-50 alphanumeric characters, spaces, hyphens, or underscores.' });
+  }
+
+  if (data.rooms.length >= MAX_ROOMS) {
+    return res.status(400).json({ error: `Maximum ${MAX_ROOMS} rooms reached.` });
+  }
+
+  const existing = data.rooms.find(r => r.name.toLowerCase() === name.toLowerCase());
+  if (existing) {
+    return res.status(400).json({ error: `Room "${name}" already exists.` });
+  }
+
+  const room = {
+    id: uuidv4(),
+    name,
+    description: (description || '').slice(0, 500),
+    createdBy: agent,
+    createdAt: new Date().toISOString(),
+    members: [agent],
+    messages: [],
+    isDefault: false,
+  };
+
+  data.rooms.push(room);
+  saveData();
+
+  broadcast({ type: 'room_created', data: { id: room.id, name: room.name, description: room.description, createdBy: agent } });
+
+  res.json({
+    room: {
+      id: room.id,
+      name: room.name,
+      description: room.description,
+      createdBy: room.createdBy,
+      createdAt: room.createdAt,
+      memberCount: room.members.length,
+      messageCount: 0,
+      isDefault: false,
+    },
+  });
+});
+
+// Join a room
+app.post('/api/rooms/:id/join', (req, res) => {
+  const room = data.rooms.find(r => r.id === req.params.id);
+  if (!room) return res.status(404).json({ error: 'Room not found.' });
+
+  const { agent } = req.body;
+
+  if (!agent) {
+    return res.status(400).json({ error: 'Agent name is required.' });
+  }
+
+  if (!data.agents[agent]) {
+    return res.status(400).json({ error: `Agent "${agent}" is not registered.` });
+  }
+
+  if (room.members.includes(agent)) {
+    return res.json({ message: 'Already a member.', room: { id: room.id, name: room.name } });
+  }
+
+  if (room.members.length >= MAX_ROOM_MEMBERS) {
+    return res.status(400).json({ error: `Room is full. Max ${MAX_ROOM_MEMBERS} members.` });
+  }
+
+  room.members.push(agent);
+  saveData();
+
+  broadcast({ type: 'room_joined', data: { roomId: room.id, roomName: room.name, agent } });
+
+  res.json({ message: `Joined room "${room.name}".`, room: { id: room.id, name: room.name } });
+});
+
+// Leave a room
+app.post('/api/rooms/:id/leave', (req, res) => {
+  const room = data.rooms.find(r => r.id === req.params.id);
+  if (!room) return res.status(404).json({ error: 'Room not found.' });
+
+  const { agent } = req.body;
+
+  if (!agent) {
+    return res.status(400).json({ error: 'Agent name is required.' });
+  }
+
+  if (!room.members.includes(agent)) {
+    return res.status(400).json({ error: 'You are not a member of this room.' });
+  }
+
+  room.members = room.members.filter(m => m !== agent);
+  saveData();
+
+  broadcast({ type: 'room_left', data: { roomId: room.id, roomName: room.name, agent } });
+
+  res.json({ message: `Left room "${room.name}".` });
+});
+
+// Send message to a room
+app.post('/api/rooms/:id/messages', (req, res) => {
+  const room = data.rooms.find(r => r.id === req.params.id);
+  if (!room) return res.status(404).json({ error: 'Room not found.' });
+
+  const { agent, text } = req.body;
+
+  if (!agent || !text) {
+    return res.status(400).json({ error: 'Agent name and text are required.' });
+  }
+
+  if (!room.members.includes(agent)) {
+    return res.status(403).json({ error: 'You are not a member of this room. Join first.' });
+  }
+
+  if (text.length > MAX_MESSAGE_LENGTH) {
+    return res.status(400).json({ error: `Message too long. Max ${MAX_MESSAGE_LENGTH} characters.` });
+  }
+
+  if (totalMessages() >= MAX_MESSAGES) {
+    return res.status(400).json({ error: `Maximum ${MAX_MESSAGES} total messages reached.` });
+  }
+
+  const message = {
+    id: uuidv4(),
+    agent,
+    text: text.trim(),
+    timestamp: new Date().toISOString(),
+  };
+
+  room.messages.push(message);
+
+  // Update agent stats
+  if (data.agents[agent]) {
+    data.agents[agent].messageCount = (data.agents[agent].messageCount || 0) + 1;
+    data.agents[agent].lastSeen = message.timestamp;
+  }
+
+  saveData();
+
+  broadcast({ type: 'room_message', data: { roomId: room.id, roomName: room.name, message } });
+
+  res.json({ message });
+});
+
+// Get messages from a room
+app.get('/api/rooms/:id/messages', (req, res) => {
+  const room = data.rooms.find(r => r.id === req.params.id);
+  if (!room) return res.status(404).json({ error: 'Room not found.' });
+
+  const { since, limit } = req.query;
+
+  let messages = room.messages;
+  if (since) {
+    messages = messages.filter(m => m.timestamp > since);
+  }
+
+  const maxLimit = Math.min(parseInt(limit) || 100, 500);
+  messages = messages.slice(-maxLimit);
+
+  res.json({
+    roomId: room.id,
+    name: room.name,
+    members: room.members,
+    messages,
+    total: room.messages.length,
+  });
+});
+
 // SPA fallback
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
@@ -365,12 +594,16 @@ app.get('*', (req, res) => {
 wss.on('connection', (ws) => {
   ws.send(JSON.stringify({
     type: 'connected',
-    data: { message: 'Connected to ClawInbox', agents: Object.keys(data.agents).length },
+    data: {
+      message: 'Connected to ClawInbox',
+      agents: Object.keys(data.agents).length,
+      rooms: data.rooms.length,
+    },
   }));
 });
 
 // Start
 server.listen(PORT, () => {
-  console.log(`ClawInbox running on http://localhost:${PORT}`);
-  console.log(`Agents: ${Object.keys(data.agents).length}, Conversations: ${data.conversations.length}`);
+  console.log(`ClawInbox v2.0.0 running on http://localhost:${PORT}`);
+  console.log(`Agents: ${Object.keys(data.agents).length}, Conversations: ${data.conversations.length}, Rooms: ${data.rooms.length}`);
 });
