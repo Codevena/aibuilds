@@ -12,26 +12,52 @@ class AIBuildsNav {
   }
 
   init() {
+    // If layout already provided a nav, just enhance it
+    if (document.querySelector('.nav')) {
+      this.highlightCurrentPage();
+      this.setupMobileMenu();
+      this.setupSmoothScroll();
+      document.body.style.paddingTop = '70px';
+      return;
+    }
+
+    // Otherwise inject nav as fallback (for pages loaded without layout)
     this.injectNav();
     this.highlightCurrentPage();
     this.setupMobileMenu();
   }
 
   async injectNav() {
-    // Only inject if no nav exists
-    if (document.querySelector('.nav')) return;
-
-    // Fetch sections for navigation
+    // Fetch pages and sections for navigation
+    let pages = [];
     let sections = [];
     try {
-      const response = await fetch('/api/world/sections');
-      const data = await response.json();
-      sections = data.sections || [];
+      const [pagesRes, sectionsRes] = await Promise.all([
+        fetch('/api/pages'),
+        fetch('/api/world/sections'),
+      ]);
+      const pagesData = await pagesRes.json();
+      const sectionsData = await sectionsRes.json();
+      pages = pagesData.pages || [];
+      sections = sectionsData.sections || [];
     } catch (e) {
-      console.log('Could not fetch sections for nav');
+      console.log('Could not fetch nav data');
     }
 
     const isHomepage = window.location.pathname === '/world/' || window.location.pathname === '/world/index.html';
+
+    // Build page links (exclude home — it gets its own link)
+    const pageLinks = pages
+      .filter(p => p.slug !== 'home')
+      .map(p => `<li><a href="${p.route}" class="nav-link">${p.title}</a></li>`)
+      .join('');
+
+    // Build section links (only shown as anchors on homepage)
+    const sectionLinks = sections.map(s => {
+      const id = 'section-' + s.file.replace('.html', '');
+      const href = isHomepage ? `#${id}` : `/world/#${id}`;
+      return `<li><a href="${href}" class="nav-link nav-section-link">${s.title}</a></li>`;
+    }).join('');
 
     const nav = document.createElement('nav');
     nav.className = 'nav';
@@ -42,12 +68,9 @@ class AIBuildsNav {
         </a>
         <ul class="nav-links">
           <li><a href="/world/" class="nav-link">Home</a></li>
-          ${sections.map(s => {
-            const id = 'section-' + s.file.replace('.html', '');
-            const href = isHomepage ? `#${id}` : `/world/#${id}`;
-            return `<li><a href="${href}" class="nav-link nav-section-link">${s.title}</a></li>`;
-          }).join('')}
-          <li><a href="/dashboard" class="nav-link">Dashboard</a></li>
+          ${pageLinks}
+          ${sectionLinks}
+          <li><a href="/" class="nav-link">Dashboard</a></li>
         </ul>
         <button class="btn btn-ghost mobile-menu-btn" aria-label="Menu">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -60,12 +83,21 @@ class AIBuildsNav {
     `;
 
     document.body.prepend(nav);
+    this.setupSmoothScroll();
 
-    // Smooth scroll for section links on homepage
+    // Add padding to body for fixed nav
+    document.body.style.paddingTop = '70px';
+  }
+
+  setupSmoothScroll() {
+    const nav = document.querySelector('.nav');
+    if (!nav) return;
+
+    const isHomepage = window.location.pathname === '/world/' || window.location.pathname === '/world/index.html';
     if (isHomepage) {
       nav.addEventListener('click', (e) => {
-        const link = e.target.closest('.nav-section-link');
-        if (link && link.getAttribute('href').startsWith('#')) {
+        const link = e.target.closest('a[href^="#"]');
+        if (link) {
           e.preventDefault();
           const target = document.querySelector(link.getAttribute('href'));
           if (target) {
@@ -74,9 +106,6 @@ class AIBuildsNav {
         }
       });
     }
-
-    // Add padding to body for fixed nav
-    document.body.style.paddingTop = '70px';
   }
 
   highlightCurrentPage() {

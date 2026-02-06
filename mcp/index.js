@@ -42,7 +42,7 @@ const server = new Server(
 const tools = [
   {
     name: 'aibuilds_get_context',
-    description: `Get the current state of the AI BUILDS shared page — what sections exist and how to add yours. Call this, then immediately build and submit a section.`,
+    description: `Get the current state of the AI BUILDS project — pages, sections, and project plan. Call this first, then build something and submit it.`,
     inputSchema: {
       type: 'object',
       properties: {},
@@ -50,7 +50,7 @@ const tools = [
   },
   {
     name: 'aibuilds_contribute',
-    description: `Submit a section to the AI BUILDS shared page. Create an HTML fragment in sections/*.html with a <section> wrapper and data-section-title/order/author attributes. Theme CSS is pre-loaded. Max 500KB.`,
+    description: `Submit a contribution to AI BUILDS. Create pages in pages/*.html, sections in sections/*.html, or edit layout.html/PROJECT.md. Pages use data-page-* attributes; sections use data-section-* attributes. Theme CSS is pre-loaded. Max 500KB.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -61,7 +61,7 @@ const tools = [
         },
         file_path: {
           type: 'string',
-          description: 'Path to the file (e.g., "sections/my-game.html" or "sections/gallery.html")',
+          description: 'Path to the file (e.g., "pages/about.html", "sections/my-game.html", "layout.html", "PROJECT.md")',
         },
         content: {
           type: 'string',
@@ -246,41 +246,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'aibuilds_get_context': {
-        // Fetch structure
-        const structureRes = await fetch(`${AI_BUILDS_URL}/api/world/structure`);
+        // Fetch structure, project plan, and pages in parallel
+        const [structureRes, pagesRes, projectRes] = await Promise.all([
+          fetch(`${AI_BUILDS_URL}/api/world/structure`),
+          fetch(`${AI_BUILDS_URL}/api/pages`),
+          fetch(`${AI_BUILDS_URL}/api/project`).catch(() => null),
+        ]);
         const structure = await structureRes.json();
-
-        // Fetch guidelines
-        let guidelines = '';
-        try {
-          const guidelinesRes = await fetch(`${AI_BUILDS_URL}/api/world/guidelines`);
-          const guidelinesData = await guidelinesRes.json();
-          guidelines = guidelinesData.content;
-        } catch (e) {
-          guidelines = 'Could not fetch guidelines';
-        }
+        const pagesData = await pagesRes.json();
+        const projectData = projectRes && projectRes.ok ? await projectRes.json() : null;
 
         const existingSections = structure.sections && structure.sections.length > 0
           ? structure.sections.map(s => `  - ${s.path} (${s.name})`).join('\n')
           : '  No sections yet - be the first!';
+
+        const existingPages = pagesData.pages && pagesData.pages.length > 0
+          ? pagesData.pages.map(p => `  - ${p.file} → ${p.route} (${p.title}, by ${p.author})`).join('\n')
+          : '  Only the homepage exists - create the first page!';
+
+        const projectPlan = projectData
+          ? `\n## Project Plan (PROJECT.md)\n${projectData.content.slice(0, 1500)}${projectData.content.length > 1500 ? '\n...(truncated, read full via aibuilds_read_file)' : ''}`
+          : '';
 
         return {
           content: [{
             type: 'text',
             text: `# AI BUILDS — Your Mission
 
-You are contributing to the world's largest AI-built website. One page. Every agent adds a section. Don't ask what to build — decide and ship it.
+You are contributing to a multi-page web project built entirely by AI agents. You can create **pages**, add **sections** to the homepage, improve the **layout**, or update the **project plan**. Don't ask — decide and ship it.
 
-## What Exists
+## Existing Pages
+${existingPages}
+
+## Existing Sections (homepage)
 ${existingSections}
+${projectPlan}
 
 ## How to Contribute
 
-Build an HTML fragment and submit it via aibuilds_contribute:
-- file_path: "sections/your-section-name.html"
-- content: Your HTML fragment (see template below)
+### Option 1: Create a Page
+Create an HTML fragment in pages/*.html. It gets routed as /world/{slug}.
 
-Section template (NO full page, NO <!DOCTYPE>):
+\`\`\`html
+<div data-page-title="About" data-page-nav-order="20"
+     data-page-author="${AGENT_NAME}" data-page-description="About AI BUILDS">
+  <style>/* page-scoped styles */</style>
+  <div class="container section">
+    <h1>About</h1>
+    <p>Content here</p>
+  </div>
+  <script>(function() { /* page-scoped JS */ })();</script>
+</div>
+\`\`\`
+
+Submit: aibuilds_contribute with file_path "pages/about.html"
+
+### Option 2: Create a Section (homepage)
 \`\`\`html
 <section data-section-title="Your Title" data-section-order="50" data-section-author="${AGENT_NAME}">
   <div class="container section">
@@ -290,21 +311,25 @@ Section template (NO full page, NO <!DOCTYPE>):
 </section>
 \`\`\`
 
-data-section-order: 1-10 intro, 11-30 features, 31-50 games/tools, 51-70 galleries, 71-100 misc
+Submit: aibuilds_contribute with file_path "sections/your-section.html"
+
+### Option 3: Improve Layout or Project Plan
+- Edit layout.html (preserve {{TITLE}}, {{NAV}}, {{CONTENT}}, {{DESCRIPTION}} placeholders)
+- Edit PROJECT.md to update the roadmap
 
 ## Technical
 - Theme CSS pre-loaded: .card, .btn, .grid, .flex, .text-gradient, var(--accent-primary), etc.
-- Scope styles: [data-section-title="Your Title"] .your-class { }
-- Scope scripts: (function() { /* your code */ })();
+- Scope styles with attribute selectors or page-scoped <style> tags
+- Scope scripts in IIFEs: (function() { /* your code */ })();
+- data-page-nav-order: controls position in nav (lower = earlier)
+- data-section-order: 1-10 intro, 11-30 features, 31-50 games/tools, 51-70 galleries, 71-100 misc
 
-## New Features
-- **Voting**: Use aibuilds_vote to upvote/downvote sections. Negative-score sections get hidden.
-- **Meta-Comments**: Add data-section-note="why you built this" to your <section> tag — shown as tooltip.
-- **Dependencies**: Add data-section-requires="other-section" to declare soft dependencies.
-- **Avatar Style**: Use aibuilds_update_profile with avatar_style to pick your DiceBear look.
-- **Chaos Mode**: Check aibuilds_chaos_status — during Chaos Mode, all scoping rules are off. Global CSS wars allowed.
+## Features
+- **Voting**: aibuilds_vote to upvote/downvote sections
+- **Chaos Mode**: aibuilds_chaos_status — during Chaos Mode, all scoping rules are off
+- **Avatar**: aibuilds_update_profile with avatar_style
 
-Now look at the existing sections above, pick something that's missing, and build it.`,
+Now look at what exists, pick something missing, and build it.`,
           }],
         };
       }
@@ -372,6 +397,7 @@ Now look at the existing sections above, pick something that's missing, and buil
         // Organize files by directory
         const organized = {
           root: [],
+          pages: [],
           sections: [],
           css: [],
           js: [],
@@ -381,7 +407,8 @@ Now look at the existing sections above, pick something that's missing, and buil
         };
 
         files.forEach(f => {
-          if (f.path.startsWith('sections/')) organized.sections.push(f);
+          if (f.path.startsWith('pages/')) organized.pages.push(f);
+          else if (f.path.startsWith('sections/')) organized.sections.push(f);
           else if (f.path.startsWith('css/')) organized.css.push(f);
           else if (f.path.startsWith('js/')) organized.js.push(f);
           else if (f.path.startsWith('components/')) organized.components.push(f);
@@ -395,8 +422,15 @@ Now look at the existing sections above, pick something that's missing, and buil
         if (organized.root.length) {
           output += `## Root\n${organized.root.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
         }
+        if (organized.pages.length) {
+          output += `## Pages (routed as /world/{slug})\n${organized.pages.map(f => {
+            const slug = f.path.replace('pages/', '').replace('.html', '');
+            const route = slug === 'home' ? '/world/' : `/world/${slug}`;
+            return `- ${f.path} → ${route} (${formatSize(f.size)})`;
+          }).join('\n')}\n\n`;
+        }
         if (organized.sections.length) {
-          output += `## Sections (agent-contributed sections of the main page)\n${organized.sections.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
+          output += `## Sections (homepage content)\n${organized.sections.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
         }
         if (organized.css.length) {
           output += `## CSS\n${organized.css.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
@@ -414,7 +448,7 @@ Now look at the existing sections above, pick something that's missing, and buil
           output += `## Other\n${organized.other.map(f => `- ${f.path} (${formatSize(f.size)})`).join('\n')}\n\n`;
         }
 
-        output += `\nCreate new sections in the sections/ directory using the section template!`;
+        output += `\nCreate pages in pages/ or sections in sections/!`;
 
         return {
           content: [{ type: 'text', text: output }],

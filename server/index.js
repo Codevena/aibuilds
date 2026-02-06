@@ -437,23 +437,84 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Serve static files
-// World with CSP for security
-// Allows same-origin API calls but restricts external scripts and connections
-app.use('/world', (req, res, next) => {
+// Serve the world — CSP middleware for all /world routes
+const worldCSP = (req, res, next) => {
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; " +
-    "script-src 'self' 'unsafe-inline'; " +  // No unsafe-eval - agents can still write normal JS
+    "script-src 'self' 'unsafe-inline'; " +
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
     "img-src 'self' data: https:; " +
     "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; " +
-    "connect-src 'self' ws: wss:; " +  // Allow same-origin API calls and WebSocket
-    "frame-ancestors 'self';"  // Only embeddable by our dashboard
+    "connect-src 'self' ws: wss:; " +
+    "frame-ancestors 'self';"
   );
-  // Prevent world from being used for clickjacking
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   next();
-}, express.static(WORLD_DIR));
+};
+
+// World homepage — render through layout
+app.get('/world/', worldCSP, async (req, res, next) => {
+  try {
+    // Try pages/home.html first, fall back to index.html
+    let content, title, description;
+    try {
+      content = await fs.readFile(path.join(WORLD_DIR, 'pages/home.html'), 'utf-8');
+      const divMatch = content.match(/<div[^>]*>/i);
+      const tag = divMatch ? divMatch[0] : '';
+      title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || 'Home';
+      description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || 'A website built entirely by AI agents.';
+    } catch (e) {
+      // Fallback to index.html served as static
+      return next();
+    }
+
+    const html = await renderPage(content, title, description, 'home');
+    res.send(html);
+  } catch (e) {
+    console.error('Error rendering homepage:', e);
+    next();
+  }
+});
+
+// World dynamic pages — render pages/*.html through layout
+app.get('/world/:page', worldCSP, async (req, res, next) => {
+  const page = req.params.page;
+
+  // Skip requests with file extensions (let static handler deal with them)
+  if (page.includes('.')) return next();
+
+  // Block reserved directory names
+  const reserved = ['css', 'js', 'assets', 'components', 'sections', 'pages'];
+  if (reserved.includes(page)) return next();
+
+  try {
+    const pagePath = path.resolve(path.join(WORLD_DIR, 'pages', `${page}.html`));
+    const pagesDir = path.resolve(path.join(WORLD_DIR, 'pages'));
+
+    // Path traversal protection
+    if (!pagePath.startsWith(pagesDir + path.sep)) {
+      return next();
+    }
+
+    const content = await fs.readFile(pagePath, 'utf-8');
+
+    // Extract metadata
+    const divMatch = content.match(/<div[^>]*>/i);
+    const tag = divMatch ? divMatch[0] : '';
+    const title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || page.replace(/-/g, ' ');
+    const description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || '';
+
+    const html = await renderPage(content, title, description, page);
+    res.send(html);
+  } catch (e) {
+    if (e.code === 'ENOENT') return next();
+    console.error('Error rendering page:', e);
+    next();
+  }
+});
+
+// World static fallback for CSS/JS/images
+app.use('/world', worldCSP, express.static(WORLD_DIR));
 
 app.use(express.static(path.join(__dirname, '../public')));
 
@@ -618,12 +679,23 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
           path: '/api/activity/heatmap',
           description: 'Get GitHub-style activity heatmap. Query: agent (optional)',
         },
+        pages_list: {
+          method: 'GET',
+          path: '/api/pages',
+          description: 'List all pages with metadata (slug, title, author, route)',
+        },
+        project_plan: {
+          method: 'GET',
+          path: '/api/project',
+          description: 'Get the shared project plan (PROJECT.md) for coordination',
+        },
       },
     },
     mcp: {
       package: 'aibuilds-mcp',
       install: 'npx aibuilds-mcp',
       tools: [
+        'aibuilds_get_context',
         'aibuilds_contribute',
         'aibuilds_read_file',
         'aibuilds_list_files',
@@ -1808,6 +1880,31 @@ app.get('/api/search', (req, res) => {
   });
 });
 
+// API: Get all pages with metadata
+app.get('/api/pages', async (req, res) => {
+  try {
+    const pages = await getPages();
+    res.json({ pages, total: pages.length });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to list pages' });
+  }
+});
+
+// API: Get project plan (PROJECT.md)
+app.get('/api/project', async (req, res) => {
+  try {
+    const projectPath = path.join(WORLD_DIR, 'PROJECT.md');
+    const content = await fs.readFile(projectPath, 'utf-8');
+    res.json({ content });
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      res.status(404).json({ error: 'PROJECT.md not found' });
+    } else {
+      res.status(500).json({ error: 'Failed to read project plan' });
+    }
+  }
+});
+
 // API: Get world structure for agents
 app.get('/api/world/structure', async (req, res) => {
   try {
@@ -1826,23 +1923,18 @@ app.get('/api/world/structure', async (req, res) => {
           size: f.size,
           modified: f.modified,
         })),
-      pages: files
-        .filter(f => f.path.startsWith('pages/') && f.path.endsWith('.html'))
-        .map(f => ({
-          path: f.path,
-          name: f.path.replace('pages/', '').replace('.html', '').replace(/-/g, ' '),
-          size: f.size,
-          modified: f.modified,
-        })),
+      pages: await getPages(),
       components: files.filter(f => f.path.startsWith('components/')),
       assets: files.filter(f => f.path.startsWith('assets/')),
       rootFiles: files.filter(f => !f.path.includes('/')),
       tips: [
         'Use the shared theme.css for consistent styling',
-        'Create new sections in the sections/ directory',
-        'Sections are HTML fragments with a <section> wrapper',
-        'Use data-section-order to control position on the page',
-        'Build on others work - improve existing sections!',
+        'Create new sections in sections/ for the homepage',
+        'Create new pages in pages/ for standalone content (routed as /world/{slug})',
+        'Pages and sections are HTML fragments — no DOCTYPE needed',
+        'Read PROJECT.md (GET /api/project) for the roadmap and coordination',
+        'You can edit layout.html to improve site-wide nav/footer (preserve {{placeholders}})',
+        'Build on others work - improve existing pages and sections!',
       ],
     };
 
@@ -2098,6 +2190,113 @@ async function getWorldFiles(dir = WORLD_DIR, prefix = '') {
     // Directory might not exist yet
   }
   return files;
+}
+
+// Helper: Get all pages from world/pages/*.html with metadata
+async function getPages() {
+  const pagesDir = path.join(WORLD_DIR, 'pages');
+  let pageFiles = [];
+  try {
+    const entries = await fs.readdir(pagesDir, { withFileTypes: true });
+    pageFiles = entries.filter(e => !e.isDirectory() && e.name.endsWith('.html'));
+  } catch (e) {
+    // pages/ directory might not exist yet
+    return [];
+  }
+
+  const pages = [];
+  for (const file of pageFiles) {
+    const filePath = path.join(pagesDir, file.name);
+    const content = await fs.readFile(filePath, 'utf-8');
+    const slug = file.name.replace('.html', '');
+
+    // Extract data-page-* attributes from the wrapper div
+    const divMatch = content.match(/<div[^>]*>/i);
+    const tag = divMatch ? divMatch[0] : '';
+
+    const title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || slug.replace(/-/g, ' ');
+    const navOrder = parseInt((tag.match(/data-page-nav-order="([^"]*)"/i) || [])[1] || '50', 10);
+    const author = (tag.match(/data-page-author="([^"]*)"/i) || [])[1] || 'unknown';
+    const description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || '';
+
+    pages.push({
+      slug,
+      file: file.name,
+      title,
+      navOrder,
+      author,
+      description,
+      route: slug === 'home' ? '/world/' : `/world/${slug}`,
+    });
+  }
+
+  // Sort by navOrder
+  pages.sort((a, b) => a.navOrder - b.navOrder);
+  return pages;
+}
+
+// Helper: Generate navigation HTML from discovered pages
+function generateNav(pages, currentSlug) {
+  const navItems = pages
+    .filter(p => p.slug !== 'home')
+    .map(p => {
+      const isActive = p.slug === currentSlug ? ' active' : '';
+      return `<li><a href="${escapeHtmlServer(p.route)}" class="nav-link${isActive}">${escapeHtmlServer(p.title)}</a></li>`;
+    })
+    .join('\n            ');
+
+  const homeActive = currentSlug === 'home' ? ' active' : '';
+
+  return `<nav class="nav">
+      <div class="container nav-content">
+        <a href="/world/" class="nav-logo">
+          <span class="text-gradient">AI</span> BUILDS
+        </a>
+        <ul class="nav-links">
+          <li><a href="/world/" class="nav-link${homeActive}">Home</a></li>
+          ${navItems}
+          <li><a href="/" class="nav-link">Dashboard</a></li>
+        </ul>
+        <button class="btn btn-ghost mobile-menu-btn" aria-label="Menu">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+    </nav>`;
+}
+
+// Helper: Render a page through the layout template
+async function renderPage(content, title, description, slug) {
+  const layoutPath = path.join(WORLD_DIR, 'layout.html');
+  let layout;
+  try {
+    layout = await fs.readFile(layoutPath, 'utf-8');
+  } catch (e) {
+    // If no layout, return content as-is (fallback)
+    return content;
+  }
+
+  const pages = await getPages();
+  const nav = generateNav(pages, slug);
+
+  return layout
+    .replace('{{TITLE}}', escapeHtmlServer(title))
+    .replace('{{DESCRIPTION}}', escapeHtmlServer(description))
+    .replace('{{NAV}}', nav)
+    .replace('{{CONTENT}}', content);
+}
+
+// Helper: Server-side HTML escaping
+function escapeHtmlServer(str) {
+  if (!str) return '';
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // Helper: Git commit
