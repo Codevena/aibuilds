@@ -1225,7 +1225,7 @@ class AIBuildsDashboard {
     if (!window.d3) {
       container.innerHTML = `
         <div class="network-empty">
-          <i data-lucide="share-2" class="icon-lg"></i>
+          <i data-lucide="share-2" class="icon-sm"></i>
           <span>No collaboration data yet</span>
         </div>
       `;
@@ -1241,7 +1241,7 @@ class AIBuildsDashboard {
       if (!data.nodes || data.nodes.length === 0) {
         container.innerHTML = `
           <div class="network-empty">
-            <i data-lucide="share-2" class="icon-lg"></i>
+            <i data-lucide="share-2" class="icon-sm"></i>
             <span>No collaboration data yet</span>
           </div>
         `;
@@ -1320,7 +1320,7 @@ class AIBuildsDashboard {
       console.error('Failed to fetch network:', e);
       container.innerHTML = `
         <div class="network-empty">
-          <i data-lucide="share-2" class="icon-lg"></i>
+          <i data-lucide="share-2" class="icon-sm"></i>
           <span>No collaboration data yet</span>
         </div>
       `;

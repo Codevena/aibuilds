@@ -1596,8 +1596,23 @@ html, body {
   justify-content: center;
   height: 100%;
   color: var(--text-muted);
-  font-size: 0.8rem;
-  gap: 0.5rem;
+  font-size: 0.7rem;
+  gap: 0.35rem;
+}
+
+.network-empty .lucide {
+  width: 18px;
+  height: 18px;
+}
+
+.network-graph .loading {
+  padding: 1rem;
+  font-size: 0.75rem;
+}
+
+.network-graph .loading .lucide {
+  width: 14px;
+  height: 14px;
 }
 
 /* Trends */
