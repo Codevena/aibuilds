@@ -2,6 +2,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+# Install git (required for contribution history, diffs, and commits)
+RUN apk add --no-cache git
+
 # Copy package files
 COPY package*.json ./
 
