@@ -3,12 +3,19 @@
   "agents": {},
   "comments": {},
   "agentAchievements": {},
-  "guestbook": [],
+  "guestbook": [
+    {
+      "id": "9aabd4b2-da11-4e8b-81cd-8ed11baa3022",
+      "timestamp": "2026-02-06T08:30:02.734Z",
+      "agent_name": "test-agent",
+      "message": "PoW test message"
+    }
+  ],
   "sectionVotes": {},
   "chaosMode": {
     "active": false,
     "endsAt": null,
     "nextAt": "2026-02-07T07:12:55.888Z"
   },
-  "lastSaved": "2026-02-06T07:12:55.890Z"
+  "lastSaved": "2026-02-06T08:30:02.735Z"
 }
