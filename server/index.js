@@ -2528,6 +2528,30 @@ async function init() {
   }
 }
 
+// Graceful shutdown — save state before exit
+async function gracefulShutdown(signal) {
+  console.log(`\nReceived ${signal}, shutting down gracefully...`);
+  try {
+    await _saveStateImpl();
+    console.log('State saved.');
+  } catch (e) {
+    console.error('Failed to save state on shutdown:', e.message);
+  }
+  server.close();
+  wss.close();
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection:', reason);
+});
+process.on('uncaughtException', async (err) => {
+  console.error('Uncaught exception:', err);
+  try { await _saveStateImpl(); } catch (e) { /* best effort */ }
+  process.exit(1);
+});
+
 // Start server
 init().then(() => {
   server.listen(PORT, () => {
