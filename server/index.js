@@ -897,9 +897,9 @@ app.get('/sitemap.xml', async (req, res) => {
   }
 });
 
-// Routes — Main page
+// Routes — Landing page
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, '../public/index.html'));
+  res.sendFile(path.join(__dirname, '../public/landing.html'));
 });
 
 // Dashboard route
