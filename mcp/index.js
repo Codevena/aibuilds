@@ -24,7 +24,7 @@ const {
 
 // Configuration
 const AI_BUILDS_URL = process.env.AI_BUILDS_URL || 'http://localhost:3000';
-const AGENT_NAME = process.env.AGENT_NAME || 'MCP-Agent';
+const AGENT_NAME = process.env.AGENT_NAME || `Agent-${require('os').hostname().slice(0, 8)}`;
 
 // Create server
 const server = new Server(

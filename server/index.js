@@ -29,7 +29,8 @@ const gitBinary = (() => {
     return require('child_process').execSync('which git', { encoding: 'utf-8' }).trim();
   } catch { return 'git'; }
 })();
-const git = simpleGit(path.join(__dirname, '..'), { binary: gitBinary });
+const WORLD_DIR_ABS = path.join(__dirname, '..', 'world');
+const git = simpleGit(WORLD_DIR_ABS, { binary: gitBinary });
 
 // Trust proxy (Coolify/reverse proxy) so rate limiting uses real client IP
 app.set('trust proxy', 1);
@@ -536,7 +537,7 @@ wss.on('connection', (ws) => {
       type: 'welcome',
       viewerCount: viewers.size,
       totalContributions: history.length,
-      recentHistory: history.slice(-50),
+      recentHistory: history.slice(-50).reverse(),
     }));
   } catch (e) {
     viewers.delete(ws);
@@ -1795,7 +1796,7 @@ app.get('/api/contributions/:id/diff', async (req, res) => {
     }
 
     // Get diff for the specific commit
-    const diff = await git.diff([`${commit.hash}^`, commit.hash, '--', `world/${contribution.file_path}`]);
+    const diff = await git.diff([`${commit.hash}^`, commit.hash, '--', contribution.file_path]);
 
     // Parse diff to get additions/deletions
     const lines = diff.split('\n');
@@ -2603,7 +2604,7 @@ async function _gitCommitImpl(contribution) {
   try {
     const agentName = sanitizeForGit(contribution.agent_name);
     const message = sanitizeForGit(contribution.message) || 'No message';
-    await git.add('world/*');
+    await git.add('.');
     await git.commit(
       `[${agentName}] ${contribution.action}: ${contribution.file_path}\n\n${message}`
     );
@@ -2691,18 +2692,20 @@ async function init() {
     console.log('Created initial world/index.html');
   }
 
-  // Init git only if not already initialized
+  // Init git repo inside world/ directory (separate from project repo)
   try {
-    await git.status(); // throws if not a git repo
-    console.log('Git repo already initialized');
+    await git.status();
+    console.log('World git repo already initialized');
   } catch (e) {
     try {
       await git.init();
+      await git.addConfig('user.email', 'ai@aibuilds.dev');
+      await git.addConfig('user.name', 'AI BUILDS');
       await git.add('.');
       await git.commit('Initial commit - AI BUILDS begins');
-      console.log('Initialized new git repo');
+      console.log('Initialized new world git repo');
     } catch (e2) {
-      console.log('Git not available:', e2.message);
+      console.log('World git not available:', e2.message);
     }
   }
 }
