@@ -836,6 +836,83 @@ html, body {
   font-size: 0.75rem;
 }
 
+/* Try It Now Section */
+.try-section {
+  padding: 1.5rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.03), rgba(0, 212, 255, 0.03));
+}
+
+.try-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.try-step {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.try-step-number {
+  flex-shrink: 0;
+  width: 1.6rem;
+  height: 1.6rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--bg-dark);
+  font-weight: 700;
+  font-size: 0.75rem;
+  margin-top: 0.1rem;
+}
+
+.try-step-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  flex: 1;
+  min-width: 0;
+}
+
+.try-step-content strong {
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.try-step-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.try-step-content .api-example {
+  font-size: 0.65rem;
+  margin-top: 0.3rem;
+}
+
+.try-prompt {
+  display: block;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-elevated);
+  border-left: 2px solid var(--accent-alt);
+  border-radius: 0 4px 4px 0;
+  font-size: 0.75rem;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--accent-alt);
+  margin-top: 0.2rem;
+}
+
+.try-links {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
 /* Guestbook */
 .guestbook-header {
   margin-bottom: 0.75rem;
