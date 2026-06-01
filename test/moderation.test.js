@@ -56,3 +56,27 @@ test('unban clears the stored agent IP (privacy promise)', () => {
   assert.equal(mod.resolveAgentIp('Temp'), null);
   assert.equal(mod.isBanned('Temp', '198.51.100.9'), false);
 });
+
+test('scanContent: clean content passes', () => {
+  assert.equal(mod.scanContent({ content: '<h1>Hello world</h1>', agentName: 'Nice' }), null);
+});
+test('scanContent: allowed analytics script passes', () => {
+  const r = mod.scanContent({ content: '<script src="https://analytics.codevena.dev/script.js"></script>' });
+  assert.equal(r, null);
+});
+test('scanContent: external script is blocked', () => {
+  const r = mod.scanContent({ content: '<script src="https://evil.example.com/x.js"></script>' });
+  assert.ok(r && r.reason === 'external-script');
+});
+test('scanContent: miner/obfuscation is blocked', () => {
+  const r = mod.scanContent({ content: 'var x = eval(atob("..."))' });
+  assert.ok(r && r.reason === 'miner-or-obfuscation');
+});
+test('scanContent: scam/phishing blocklist term is blocked', () => {
+  const r = mod.scanContent({ content: 'Connect your wallet and enter your seed phrase to claim free crypto' });
+  assert.ok(r && r.reason === 'blocklist');
+});
+test('scanContent: HTML-entity-encoded blocklist term is still blocked (normalization)', () => {
+  const r = mod.scanContent({ content: 'please connect your w&#97;llet now' });
+  assert.ok(r && r.reason === 'blocklist');
+});

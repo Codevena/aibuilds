@@ -83,8 +83,59 @@ function listBans() {
   return { bannedAgents: Array.from(bannedAgents), bannedIps: Array.from(bannedIps) };
 }
 
+// High-confidence scam/phishing markers (word-boundary, case-insensitive). Tuned for precision.
+const BLOCKLIST = [
+  /\bseed phrase\b/i,
+  /\bconnect your wallet\b/i,
+  /\bprivate key\b/i,
+  /\bfree crypto\b/i,
+  /\bclaim (your )?(free )?(airdrop|reward|prize)\b/i,
+  /\bwallet validation\b/i,
+];
+// Operator-supplied hate/slur terms (locale-specific). Intentionally empty by default —
+// extend this array in your deployment; the scanner runs regardless.
+const SLUR_TERMS = [];
+
+const MINER_RE = /(coinhive|cryptonight|eval\s*\(\s*atob\s*\(|new\s+function\s*\(\s*atob\s*\()/i;
+const ALLOWED_SCRIPT_HOSTS = new Set(['analytics.codevena.dev']);
+
+// Decode the tricks an attacker uses to render a blocked phrase while dodging raw-string regexes:
+// HTML numeric/named entities, zero-width & soft-hyphen separators, and compatibility forms.
+function normalizeForScan(s) {
+  return String(s || '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ''; } })
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch { return ''; } })
+    .replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
+    .replace(/[​-‍⁠﻿­]/g, '') // strip zero-width/joiner/word-joiner/BOM/soft-hyphen
+    .normalize('NFKC');
+}
+
+function scanContent({ content = '', message = '', agentName = '', filePath = '' } = {}) {
+  const haystack = normalizeForScan(`${content}\n${message}\n${agentName}\n${filePath}`);
+  for (const rule of BLOCKLIST) if (rule.test(haystack)) return { reason: 'blocklist', rule: rule.source };
+  const lower = haystack.toLowerCase();
+  for (const term of SLUR_TERMS) if (lower.includes(term.toLowerCase())) return { reason: 'blocklist', rule: 'slur' };
+  if (MINER_RE.test(haystack)) return { reason: 'miner-or-obfuscation', rule: MINER_RE.source };
+  // Construct the script-src regex inline (fresh, no shared /g lastIndex state). Executable
+  // <script src> must be literal HTML, so this scans raw content (not the entity-decoded haystack).
+  const scriptSrcRe = /<script\b[^>]*\bsrc\s*=\s*["']?([^"'>\s]+)/gi;
+  for (const m of content.matchAll(scriptSrcRe)) {
+    let src = m[1];
+    if (src.startsWith('//')) src = 'https:' + src;
+    if (/^https?:\/\//i.test(src)) {
+      let host;
+      try { host = new URL(src).hostname.toLowerCase(); }
+      catch { return { reason: 'external-script', rule: 'malformed-src' }; }
+      if (!ALLOWED_SCRIPT_HOSTS.has(host)) return { reason: 'external-script', rule: host };
+    }
+  }
+  return null;
+}
+
 module.exports = {
   loadModeration, serializeModeration,
   isHidden, hide, unhide, listHidden,
   isBanned, recordAgentIp, resolveAgentIp, ban, unban, listBans,
+  scanContent,
 };
