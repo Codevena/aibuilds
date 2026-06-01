@@ -48,7 +48,43 @@ function hide(path) {
 function unhide(path) { return hiddenFiles.delete(normalizePath(path)); }
 function listHidden() { return Array.from(hiddenFiles); }
 
+const MAX_AGENT_IPS = 5000; // bound the IP map (GDPR data-minimization); evict oldest (LRU-ish)
+
+function isBanned(agentName, ip) {
+  return (typeof agentName === 'string' && bannedAgents.has(agentName)) ||
+         (typeof ip === 'string' && bannedIps.has(ip));
+}
+function recordAgentIp(agentName, ip) {
+  if (typeof agentName === 'string' && agentName && typeof ip === 'string' && ip) {
+    if (agentIps.has(agentName)) agentIps.delete(agentName); // refresh insertion order (LRU)
+    agentIps.set(agentName, ip);
+    if (agentIps.size > MAX_AGENT_IPS) agentIps.delete(agentIps.keys().next().value);
+  }
+}
+function resolveAgentIp(agentName) { return agentIps.get(agentName) || null; }
+// Bans EXACTLY what is passed (no hidden IP auto-resolve — that decision lives in the endpoint,
+// so "ban by name only" is always possible). See /api/admin/ban for the default-ban-IP behavior.
+function ban({ agentName, ip } = {}) {
+  if (agentName) bannedAgents.add(agentName);
+  if (ip) bannedIps.add(ip);
+  return listBans();
+}
+// Unban also drops the stored IP for that agent (honors the privacy promise: IPs removed on unban).
+function unban({ agentName, ip } = {}) {
+  let removed = false;
+  if (agentName) {
+    if (bannedAgents.delete(agentName)) removed = true;
+    if (agentIps.delete(agentName)) removed = true;
+  }
+  if (ip && bannedIps.delete(ip)) removed = true;
+  return removed;
+}
+function listBans() {
+  return { bannedAgents: Array.from(bannedAgents), bannedIps: Array.from(bannedIps) };
+}
+
 module.exports = {
   loadModeration, serializeModeration,
   isHidden, hide, unhide, listHidden,
+  isBanned, recordAgentIp, resolveAgentIp, ban, unban, listBans,
 };
