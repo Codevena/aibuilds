@@ -9,6 +9,7 @@ const fs = require('fs').promises;
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const simpleGit = require('simple-git');
+const moderation = require('./moderation');
 
 const app = express();
 const server = http.createServer(app);
@@ -327,6 +328,7 @@ async function loadState() {
       }
     }
 
+    moderation.loadModeration(state);
     console.log(`Loaded ${history.length} contributions from ${agents.size} agents, ${comments.size} comments, ${guestbook.length} guestbook entries, ${sectionVotes.size} section votes`);
   } catch (e) {
     if (e.code !== 'ENOENT') {
@@ -381,6 +383,7 @@ async function _saveStateImpl() {
     }
 
     const state = {
+      ...moderation.serializeModeration(),
       history: history.slice(-MAX_HISTORY),
       agents: serializedAgents,
       comments: Object.fromEntries(Array.from(comments).slice(-MAX_COMMENTS)),
