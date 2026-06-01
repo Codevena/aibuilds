@@ -626,6 +626,17 @@ const worldCSP = (req, res, next) => {
   next();
 };
 
+// Block direct access to hidden world files (static handler would otherwise serve the raw file).
+// decodeURIComponent throws URIError on malformed percent-encoding (e.g. /world/%ff) — an
+// unauthenticated client could crash the process, so guard it and return 400 instead.
+app.use('/world', (req, res, next) => {
+  let rel;
+  try { rel = decodeURIComponent(req.path).replace(/^\/+/, ''); }
+  catch { return res.status(400).send('Bad request'); }
+  if (rel && moderation.isHidden(rel)) return res.status(404).send('Not found');
+  next();
+});
+
 // World homepage — render through layout
 app.get('/world/', worldCSP, async (req, res, next) => {
   try {
@@ -987,14 +998,12 @@ app.get('/api/stats', async (req, res) => {
 // API: Get contribution history
 app.get('/api/history', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, MAX_HISTORY);
-  // Clamp offset to >= 0; a negative offset previously yielded an empty page with hasMore=true.
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  const visible = history.filter(c => !moderation.isHidden(c.file_path));
   res.json({
-    // .reverse() => newest-first, matching the WebSocket welcome payload (history.slice(-50).reverse()).
-    // slice() returns a fresh array, so reversing it does not mutate `history`.
-    items: history.slice(-(limit + offset), offset ? -offset : undefined).reverse(),
-    total: history.length,
-    hasMore: history.length > limit + offset,
+    items: visible.slice(-(limit + offset), offset ? -offset : undefined).reverse(),
+    total: visible.length,
+    hasMore: visible.length > limit + offset,
   });
 });
 
@@ -1699,6 +1708,9 @@ app.get('/api/contributions/:id', (req, res) => {
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
+  if (moderation.isHidden(contribution.file_path)) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
   res.json(contribution);
 });
 
@@ -2388,6 +2400,7 @@ app.get('/api/world/sections', async (req, res) => {
 
     const sections = [];
     for (const file of sectionFiles) {
+      if (moderation.isHidden(`sections/${file.name}`)) continue;
       const filePath = path.join(sectionsDir, file.name);
       const content = await fs.readFile(filePath, 'utf-8');
       const stats = await fs.stat(filePath);
@@ -2631,7 +2644,7 @@ async function getWorldFiles(dir = WORLD_DIR, prefix = '') {
   } catch (e) {
     // Directory might not exist yet
   }
-  return files;
+  return files.filter(f => !moderation.isHidden(f.path));
 }
 
 // Helper: Get all pages from world/pages/*.html with metadata
@@ -2674,7 +2687,7 @@ async function getPages() {
 
   // Sort by navOrder
   pages.sort((a, b) => a.navOrder - b.navOrder);
-  return pages;
+  return pages.filter(p => !moderation.isHidden(`pages/${p.file}`));
 }
 
 // Helper: Generate navigation HTML from discovered pages
@@ -2722,6 +2735,7 @@ async function renderSectionsPage(req, res) {
 
     const sections = [];
     for (const file of sectionFiles) {
+      if (moderation.isHidden(`sections/${file.name}`)) continue;
       const content = await fs.readFile(path.join(sectionsDir, file.name), 'utf-8');
       const tag = (content.match(/<section[^>]*>/i) || [''])[0];
       const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
