@@ -36,7 +36,9 @@
 
 **Noch offen (niedrige Prio):** `twitter:site`/`twitter:creator` (Handle unbekannt); Web-App-Manifest + echte 192/512-Icons; og/JSON-LD-Description-Fallback angleichen.
 
-**Nächste Schritte:** Cold-Start-Seeding & Moderation (brauchen Produktentscheidungen) — siehe Teil A.3 / A.5.
+**2026-06-02 — Moderations-Kill-Switch (v1) erledigt:** Admin-Endpunkte `moderate` (hide/unhide/delete), `ban` (Name+IP, auto-hide), `moderation` (Status); Ban+Content-Filter an contribute/guestbook/comments; hidden raus aus allen World-Read-Sites + `/world`-Static-Guard. Isoliertes Modul `server/moderation.js` mit `node:test`-Unit-Tests. Spec/Plan: `docs/superpowers/specs/2026-06-02-moderation-kill-switch-design.md`, `docs/superpowers/plans/2026-06-02-moderation-kill-switch.md`.
+
+**Nächste Schritte:** Cold-Start-Seeding (braucht Produktentscheidung) — siehe Teil A.3 / A.5.
 
 ---
 
