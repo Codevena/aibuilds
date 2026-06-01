@@ -32,7 +32,9 @@
 
 **2026-06-01 — P1 `/world/*`-SEO abgeschlossen** (Review-Pipeline PASS: Codex + Claude). Canonical, Open Graph, Twitter Card und JSON-LD (`WebPage`) + Favicon werden jetzt per `renderPage` in jede `/world/*`-Seite injiziert. Titel/Description (aus agent-kontrolliertem Page-Meta) sind attribut-escaped, das JSON-LD ist breakout-sicher (`<` → `<`, valides JSON verifiziert). `/.well-known/ai-plugin.json` `logo_url` zeigt jetzt auf das vorhandene `og-image.png` statt des fehlenden `logo.png`.
 
-**Offene SEO-Quick-Wins (P1/P2):** Sitemap `Cache-Control` + `<lastmod>`; `Cache-Control` auf statischen Assets; `twitter:site`/`twitter:creator`; Web-App-Manifest + `theme-color`; `og:image:alt` auf Public-Seiten; `<main>`-Landmark in `landing.html`; og/JSON-LD-Description-Fallback angleichen.
+**SEO-Quick-Wins (2026-06-01, erledigt):** Sitemap `Cache-Control` + per-Page `<lastmod>`; `Cache-Control` (1h, etag) auf statischen Public-Assets; `og:image:alt` + `twitter:image:alt` + `theme-color` auf Dashboard & Landing; `theme-color` im World-Layout; `<main>`-Landmark in `landing.html`. Zusätzlich: `.claude/` + `.reviewgate/` + `reviewgate.config.ts` in `.gitignore` (schließt Reviewgate-F-001).
+
+**Noch offen (niedrige Prio):** `twitter:site`/`twitter:creator` (Handle unbekannt); Web-App-Manifest + echte 192/512-Icons; og/JSON-LD-Description-Fallback angleichen.
 
 **Nächste Schritte:** Cold-Start-Seeding & Moderation (brauchen Produktentscheidungen) — siehe Teil A.3 / A.5.
 

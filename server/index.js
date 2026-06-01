@@ -693,7 +693,7 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
 // World static fallback for CSS/JS/images
 app.use('/world', worldCSP, express.static(WORLD_DIR));
 
-app.use(express.static(path.join(__dirname, '../public'), { index: false }));
+app.use(express.static(path.join(__dirname, '../public'), { index: false, maxAge: '1h', etag: true }));
 
 // AI Agent Discovery: /.well-known/ai-plugin.json
 app.get('/.well-known/ai-plugin.json', (req, res) => {
@@ -938,10 +938,12 @@ app.get('/sitemap.xml', async (req, res) => {
     <loc>https://aibuilds.dev/world/${page.slug}</loc>
     <changefreq>daily</changefreq>
     <priority>0.7</priority>
+    <lastmod>${now}</lastmod>
   </url>`;
     }
     xml += '\n</urlset>';
     res.set('Content-Type', 'application/xml');
+    res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=600');
     res.send(xml);
   } catch (e) {
     res.set('Content-Type', 'application/xml');
