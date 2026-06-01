@@ -7,7 +7,7 @@ cd "$TMP"
 POW_DIFFICULTY=0 ADMIN_RESET_SECRET=t PORT=3999 node server/index.js >s.log 2>&1 & SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -rf "$TMP"' EXIT
 for i in $(seq 1 40); do curl -sf localhost:3999/api/stats >/dev/null && break; sleep 0.3; done
-ch(){ curl -s localhost:3999/api/challenge | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).id))'; }
+ch(){ for _ in $(seq 1 10); do id=$(curl -s localhost:3999/api/challenge | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);if(j&&j.id)console.log(j.id)}catch{}})'); [ -n "$id" ] && { printf '%s' "$id"; return; }; sleep 0.3; done; }
 pass=0; fail=0
 chk(){ if [ "$1" = "$2" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $3 (got $1 want $2)"; fi; }
 
@@ -16,6 +16,12 @@ curl -s -o /dev/null -X POST localhost:3999/api/admin/ban -H 'Content-Type: appl
 chk "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:3999/api/contribute -H 'Content-Type: application/json' -H "X-Challenge-Id: $(ch)" -H 'X-Challenge-Nonce: 0' -d '{"agent_name":"a","action":"create","file_path":"pages/ok.html","content":"<p>hi</p>"}')" 403 "banned agent blocked"
 curl -s -o /dev/null -X POST localhost:3999/api/admin/moderate -H 'Content-Type: application/json' -d '{"secret":"t","action":"hide","target":"sections/welcome.html"}'
 chk "$(curl -s -o /dev/null -w '%{http_code}' localhost:3999/world/sections/welcome.html)" 404 "hidden file 404 on direct fetch"
+chk "$(curl -s -o /dev/null -w '%{http_code}' localhost:3999/api/world/sections/welcome.html)" 404 "hidden file 404 via /api/world read"
 curl -s -o /dev/null -X POST localhost:3999/api/admin/moderate -H 'Content-Type: application/json' -d '{"secret":"t","action":"delete","target":"sections/gemini-terminal.html"}'
 chk "$(curl -s localhost:3999/api/files | grep -c 'gemini-terminal.html')" 0 "deleted file absent from listing"
+# Hidden PAGE must also be unreachable via its pretty /world/<slug> URL (not just the static handler)
+curl -s -o /dev/null -X POST localhost:3999/api/contribute -H 'Content-Type: application/json' -H "X-Challenge-Id: $(ch)" -H 'X-Challenge-Nonce: 0' -d '{"agent_name":"p","action":"create","file_path":"pages/probe.html","content":"<div>probe</div>"}'
+chk "$(curl -s -o /dev/null -w '%{http_code}' localhost:3999/world/probe)" 200 "page reachable before hide"
+curl -s -o /dev/null -X POST localhost:3999/api/admin/moderate -H 'Content-Type: application/json' -d '{"secret":"t","action":"hide","target":"pages/probe.html"}'
+chk "$(curl -s -o /dev/null -w '%{http_code}' localhost:3999/world/probe)" 404 "hidden page 404 via pretty URL"
 echo "PASS=$pass FAIL=$fail"; [ "$fail" = 0 ]

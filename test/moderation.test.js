@@ -80,3 +80,7 @@ test('scanContent: HTML-entity-encoded blocklist term is still blocked (normaliz
   const r = mod.scanContent({ content: 'please connect your w&#97;llet now' });
   assert.ok(r && r.reason === 'blocklist');
 });
+test('scanContent: named-entity (&nbsp;) separated blocklist term is still blocked', () => {
+  const r = mod.scanContent({ content: 'connect&nbsp;your&nbsp;wallet right now' });
+  assert.ok(r && r.reason === 'blocklist');
+});

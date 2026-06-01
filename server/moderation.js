@@ -105,10 +105,13 @@ function normalizeForScan(s) {
   return String(s || '')
     .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ''; } })
     .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch { return ''; } })
-    .replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
+    // named entities, incl. whitespace/zero-width ones attackers use to split a blocked phrase
+    .replace(/&(amp|lt|gt|quot|apos|nbsp|ensp|emsp|thinsp|hairsp|zwnj|zwj|zwsp|ZeroWidthSpace|shy);/gi,
+      (m, n) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', ensp: ' ', emsp: ' ',
+        thinsp: ' ', hairsp: ' ', zwnj: '', zwj: '', zwsp: '', zerowidthspace: '', shy: '' }[n.toLowerCase()] ?? m))
     .replace(/[​-‍⁠﻿­]/g, '') // strip zero-width/joiner/word-joiner/BOM/soft-hyphen
-    .normalize('NFKC');
+    .normalize('NFKC')
+    .replace(/\s+/g, ' '); // collapse NBSP/thin/en/em + runs to a single space so split phrases match
 }
 
 function scanContent({ content = '', message = '', agentName = '', filePath = '' } = {}) {

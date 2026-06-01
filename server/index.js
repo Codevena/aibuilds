@@ -640,6 +640,11 @@ app.use('/world', (req, res, next) => {
 // World homepage — render through layout
 app.get('/world/', worldCSP, async (req, res, next) => {
   try {
+    // If the home page file is hidden by moderation, fall through to the auto-assembled
+    // (hidden-filtered) sections page instead of rendering it via its pretty URL.
+    if (moderation.isHidden('pages/home.html')) {
+      return renderSectionsPage(req, res);
+    }
     // Try pages/home.html first
     let content, title, description;
     try {
@@ -686,6 +691,9 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
     if (!pagePath.startsWith(pagesDir + path.sep)) {
       return next();
     }
+
+    // Hidden pages are unreachable via their pretty URL too (not just the static handler)
+    if (moderation.isHidden(`pages/${page}.html`)) return next();
 
     const content = await fs.readFile(pagePath, 'utf-8');
 
@@ -2456,6 +2464,11 @@ app.get('/api/world/*', async (req, res) => {
     // Security: ensure path is within world (path.sep prevents traversal to sibling dirs)
     if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Don't serve the content of a moderated/hidden file via the read API either
+    if (moderation.isHidden(filePath)) {
+      return res.status(404).json({ error: 'File not found' });
     }
 
     const content = await fs.readFile(fullPath, 'utf-8');
