@@ -1233,6 +1233,106 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
   }
 });
 
+// Admin: moderate a single contribution/file — hide (reversible), unhide, or delete (hard)
+app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
+  const { secret, action, target } = req.body || {};
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!['hide', 'unhide', 'delete'].includes(action)) {
+    return res.status(400).json({ error: 'action must be hide, unhide, or delete' });
+  }
+  if (!target || typeof target !== 'string') {
+    return res.status(400).json({ error: 'target (file path or contribution id) is required' });
+  }
+  // Resolve a contribution id to its file path; otherwise treat target as a path.
+  const filePath = contributions.has(target) ? contributions.get(target).file_path : target;
+  const fullPath = path.join(WORLD_DIR, filePath);
+  // The WORLD_DIR containment check is the ONLY path guard. path.join already normalizes ../,
+  // // and . segments, so a manual `.replace(/\.\./g,'')` is both broken (e.g. '....//' -> '../')
+  // and a false-trust anchor — omit it deliberately.
+  if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+
+  if (action === 'hide') {
+    moderation.hide(filePath);
+  } else if (action === 'unhide') {
+    moderation.unhide(filePath);
+  } else { // delete
+    try { await fs.unlink(fullPath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    // Purge from in-memory history + index
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i].file_path === filePath) {
+        contributions.delete(history[i].id);
+        history.splice(i, 1);
+      }
+    }
+    moderation.unhide(filePath);
+    // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
+    // `git add <deleted path>` stages the file's removal.
+    try { await git.add(filePath); await git.commit(`moderation: remove ${filePath}`); } catch (e) { /* best effort */ }
+  }
+
+  await saveState();
+  broadcast({ type: 'moderation', data: { action, target: filePath } });
+  res.json({ success: true, action, target: filePath, hidden: moderation.listHidden() });
+});
+
+// Admin: ban/unban an agent name and/or IP
+app.post('/api/admin/ban', adminLimiter, async (req, res) => {
+  const { secret, action, agent_name, ip, hideContent, banIp } = req.body || {};
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!['ban', 'unban'].includes(action)) {
+    return res.status(400).json({ error: 'action must be ban or unban' });
+  }
+  if (!agent_name && !ip) {
+    return res.status(400).json({ error: 'agent_name or ip is required' });
+  }
+
+  let hidden = [];
+  if (action === 'ban') {
+    // Default (operator's chosen behavior): banning by name also bans the agent's last-known IP.
+    // Pass banIp:false to ban the name only — avoids collateral bans on shared/NAT/Tor/CI IPs.
+    let effectiveIp = ip;
+    if (agent_name && !effectiveIp && banIp !== false) {
+      effectiveIp = moderation.resolveAgentIp(agent_name) || undefined;
+    }
+    moderation.ban({ agentName: agent_name, ip: effectiveIp });
+    if (hideContent && agent_name) {
+      // Hide the latest file authored by this agent (one entry per distinct file).
+      const seen = new Set();
+      for (let i = history.length - 1; i >= 0; i--) {
+        const h = history[i];
+        if (h.agent_name === agent_name && h.file_path && !seen.has(h.file_path)) {
+          seen.add(h.file_path);
+          if (moderation.hide(h.file_path)) hidden.push(h.file_path);
+        }
+      }
+    }
+  } else {
+    moderation.unban({ agentName: agent_name, ip });
+  }
+
+  await saveState();
+  res.json({ success: true, action, ...moderation.listBans(), hidden });
+});
+
+// Admin: inspect current moderation state. Returns hidden/banned lists + an agent-IP COUNT only
+// (GDPR data minimization — no bulk IP dump). Pass agent_name to look up that single agent's IP.
+app.post('/api/admin/moderation', adminLimiter, (req, res) => {
+  const { secret, agent_name } = req.body || {};
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const snap = moderation.serializeModeration();
+  const body = { ...snap.moderation, agentIpCount: Object.keys(snap.agentIps).length };
+  if (agent_name) body.ip = moderation.resolveAgentIp(agent_name);
+  res.json(body);
+});
+
 // API: Get all agents
 app.get('/api/agents', (req, res) => {
   const agentList = Array.from(agents.values()).map(agent => ({
