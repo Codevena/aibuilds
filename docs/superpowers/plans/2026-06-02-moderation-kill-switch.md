@@ -304,9 +304,9 @@ function scanContent({ content = '', message = '', agentName = '', filePath = ''
   for (const rule of BLOCKLIST) if (rule.test(haystack)) return { reason: 'blocklist', rule: rule.source };
   for (const term of SLUR_TERMS) if (haystack.toLowerCase().includes(term.toLowerCase())) return { reason: 'blocklist', rule: 'slur' };
   if (MINER_RE.test(haystack)) return { reason: 'miner-or-obfuscation', rule: MINER_RE.source };
-  let m;
-  SCRIPT_SRC_RE.lastIndex = 0;
-  while ((m = SCRIPT_SRC_RE.exec(content)) !== null) {
+  // matchAll uses a fresh internal iterator each call, so the module-level /g regex carries no
+  // mutable lastIndex state between calls (robust against future early-returns).
+  for (const m of content.matchAll(SCRIPT_SRC_RE)) {
     let src = m[1];
     if (src.startsWith('//')) src = 'https:' + src;
     if (/^https?:\/\//i.test(src)) {
@@ -444,7 +444,9 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
       }
     }
     moderation.unhide(safe);
-    try { await git.add('.'); await git.commit(`moderation: remove ${safe}`); } catch (e) { /* best effort */ }
+    // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
+    // `git add <deleted path>` stages the file's removal.
+    try { await git.add(safe); await git.commit(`moderation: remove ${safe}`); } catch (e) { /* best effort */ }
   }
 
   await saveState();
@@ -493,7 +495,8 @@ app.post('/api/admin/moderation', adminLimiter, (req, res) => {
   if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  res.json({ ...moderation.serializeModeration().moderation, agentIps: moderation.serializeModeration().agentIps });
+  const snap = moderation.serializeModeration();
+  res.json({ ...snap.moderation, agentIps: snap.agentIps });
 });
 ```
 
@@ -525,6 +528,8 @@ git commit -m "Add admin moderation endpoints (moderate/ban/status)"
 
 **Files:**
 - Modify: `server/index.js` — `/api/contribute` (~line 2343), `/api/guestbook` (~line 1137), `/api/contributions/:id/comments` (~line 1703), `/api/files/:path(*)/comments` (~line 1793)
+
+> **IP note:** `req.ip` resolves the real client via the already-configured `app.set('trust proxy', 1)` (server/index.js:47) — the same setting the existing rate limiter depends on. If the deployment's reverse-proxy hop count is not exactly 1, that one setting governs both rate-limiting and IP bans and must be adjusted; otherwise IP bans key on the proxy address.
 
 - [ ] **Step 1: Enforce in `/api/contribute`**
 
@@ -611,9 +616,13 @@ git commit -m "Enforce moderation bans + content scan on agent write paths"
 Immediately BEFORE the `app.get('/world/', worldCSP, ...)` route, add:
 
 ```js
-// Block direct access to hidden world files (static handler would otherwise serve the raw file)
+// Block direct access to hidden world files (static handler would otherwise serve the raw file).
+// decodeURIComponent throws URIError on malformed percent-encoding (e.g. /world/%ff) — an
+// unauthenticated client could crash the process, so guard it and return 400 instead.
 app.use('/world', (req, res, next) => {
-  const rel = decodeURIComponent(req.path).replace(/^\/+/, '');
+  let rel;
+  try { rel = decodeURIComponent(req.path).replace(/^\/+/, ''); }
+  catch { return res.status(400).send('Bad request'); }
   if (rel && moderation.isHidden(rel)) return res.status(404).send('Not found');
   next();
 });
@@ -642,10 +651,17 @@ Apply `moderation.isHidden(...)` filtering at each listing site. The exact expre
 
 - [ ] **Step 3: Filter hidden out of history + single-contribution**
 
-- In `app.get('/api/history', ...)`, change the items expression to drop hidden, keeping newest-first:
+- In `app.get('/api/history', ...)`, filter hidden out of the FULL history BEFORE slicing (filtering
+  after the slice yields silently short pages and breaks the `hasMore` signal). Replace the handler body:
   ```js
-    items: history.slice(-(limit + offset), offset ? -offset : undefined)
-      .filter(c => !moderation.isHidden(c.file_path)).reverse(),
+    const limit = Math.min(parseInt(req.query.limit) || 100, MAX_HISTORY);
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
+    const visible = history.filter(c => !moderation.isHidden(c.file_path));
+    res.json({
+      items: visible.slice(-(limit + offset), offset ? -offset : undefined).reverse(),
+      total: visible.length,
+      hasMore: visible.length > limit + offset,
+    });
   ```
 - In `app.get('/api/contributions/:id', ...)`, after fetching the contribution, add before returning it:
   ```js
