@@ -9,6 +9,37 @@
 
 ---
 
+## Umsetzungsstatus
+
+**2026-06-01 — Woche-1-P0 abgeschlossen.** Implementiert in Commit `f200b81`, via PR #1 nach `main` gemerged (Merge-Commit `70d7dac`). Review-Pipeline bestanden: Codex- und Claude-Code-Quality-Review je **VERDICT PASS** (nach einer Fix-Runde — Codex fand einen zusätzlichen CRITICAL: der PROTECTED-Check umging `./`/`//`, jetzt auf dem kanonisch aufgelösten Pfad). Live-Smoke-Test grün.
+
+| Fix | Status |
+|---|---|
+| C-1 Shutdown-Race (Mutex) | ✅ erledigt |
+| C-2 Admin-Reset: Limiter (5/min) + timing-safe Vergleich | ✅ erledigt |
+| C-3 LiveActivity blank | ✅ erledigt |
+| S-1 PROTECTED-Set + iframe-Sandbox + SECURITY.md (inkl. Bypass-Härtung) | ✅ erledigt |
+| B-1 WS-error-Listener | ✅ erledigt |
+| B-2 Chaos-Timer Re-Arm (+ Clear bei Reset) | ✅ erledigt |
+| B-3 POW_DIFFICULTY=0 | ✅ erledigt |
+| B-4 History-Ordering (newest-first) | ✅ erledigt |
+| B-5 offset-Clamp | ✅ erledigt |
+| M-1…M-8 MCP-Härtung | ✅ im Code — ⚠️ braucht Version-Bump 1.3.1→1.4.0 + `npm publish`, damit Nutzer es bekommen |
+
+**Offene Punkte (Owner-Entscheidung):**
+- **Reviewgate F-001 (Security, out-of-scope):** `.claude/settings.json` enthält Auto-Exec-Hooks (`.reviewgate/bin/*`) → Supply-Chain-/RCE-Footgun, falls ins Repo committet. Aktuell untracked. Empfehlung: `.claude/` (+ ggf. `reviewgate.config.ts`) in `.gitignore`. In `.reviewgate/decisions/1.jsonl` als out-of-scope abgelehnt + an Owner eskaliert.
+- **INFO-Advisories** (optional): `deactivateChaosMode` ruft bei Doppel-Aufruf `saveState` zweimal (Guard `if (!chaosMode.active) return;`); `scheduleChaosMode`-Timer bei Reset nicht abbrechbar (pre-existing); `allow-forms`-Hinweis für World-Autoren in SECURITY.md.
+
+**2026-06-01 — P1 `/world/*`-SEO abgeschlossen** (Review-Pipeline PASS: Codex + Claude). Canonical, Open Graph, Twitter Card und JSON-LD (`WebPage`) + Favicon werden jetzt per `renderPage` in jede `/world/*`-Seite injiziert. Titel/Description (aus agent-kontrolliertem Page-Meta) sind attribut-escaped, das JSON-LD ist breakout-sicher (`<` → `<`, valides JSON verifiziert). `/.well-known/ai-plugin.json` `logo_url` zeigt jetzt auf das vorhandene `og-image.png` statt des fehlenden `logo.png`.
+
+**SEO-Quick-Wins (2026-06-01, erledigt):** Sitemap `Cache-Control` + per-Page `<lastmod>`; `Cache-Control` (1h, etag) auf statischen Public-Assets; `og:image:alt` + `twitter:image:alt` + `theme-color` auf Dashboard & Landing; `theme-color` im World-Layout; `<main>`-Landmark in `landing.html`. Zusätzlich: `.claude/` + `.reviewgate/` + `reviewgate.config.ts` in `.gitignore` (schließt Reviewgate-F-001).
+
+**Noch offen (niedrige Prio):** `twitter:site`/`twitter:creator` (Handle unbekannt); Web-App-Manifest + echte 192/512-Icons; og/JSON-LD-Description-Fallback angleichen.
+
+**Nächste Schritte:** Cold-Start-Seeding & Moderation (brauchen Produktentscheidungen) — siehe Teil A.3 / A.5.
+
+---
+
 # TEIL A — Synthese-Bericht
 
 ## A.1 Management Summary

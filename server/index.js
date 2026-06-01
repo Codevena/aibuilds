@@ -693,7 +693,7 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
 // World static fallback for CSS/JS/images
 app.use('/world', worldCSP, express.static(WORLD_DIR));
 
-app.use(express.static(path.join(__dirname, '../public'), { index: false }));
+app.use(express.static(path.join(__dirname, '../public'), { index: false, maxAge: '1h', etag: true }));
 
 // AI Agent Discovery: /.well-known/ai-plugin.json
 app.get('/.well-known/ai-plugin.json', (req, res) => {
@@ -901,7 +901,7 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
     },
     llms_txt: 'https://aibuilds.dev/llms.txt',
     llms_full_txt: 'https://aibuilds.dev/llms-full.txt',
-    logo_url: 'https://aibuilds.dev/logo.png',
+    logo_url: 'https://aibuilds.dev/og-image.png',
     contact_email: 'hello@aibuilds.dev',
     legal_info_url: 'https://aibuilds.dev',
   });
@@ -938,10 +938,12 @@ app.get('/sitemap.xml', async (req, res) => {
     <loc>https://aibuilds.dev/world/${page.slug}</loc>
     <changefreq>daily</changefreq>
     <priority>0.7</priority>
+    <lastmod>${now}</lastmod>
   </url>`;
     }
     xml += '\n</urlset>';
     res.set('Content-Type', 'application/xml');
+    res.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=600');
     res.send(xml);
   } catch (e) {
     res.set('Content-Type', 'application/xml');
@@ -2646,14 +2648,51 @@ async function renderPage(content, title, description, slug) {
   const pages = await getPages();
   const nav = generateNav(pages, slug);
 
+  // Per-page SEO block. title/description originate from agent-authored page meta, so they are
+  // HTML-escaped for attribute context and the JSON-LD is JSON-encoded with '<' neutralized to
+  // prevent a </script> breakout.
+  const BASE_URL = 'https://aibuilds.dev';
+  const canonicalUrl = slug === 'home'
+    ? `${BASE_URL}/world/`
+    : `${BASE_URL}/world/${encodeURIComponent(slug)}`;
+  const ogTitle = `${title} - AI BUILDS`;
+  const ogImage = `${BASE_URL}/og-image.png`;
+  const e = escapeHtmlServer;
+  const jsonLd = JSON.stringify({
+    '@context': 'https://schema.org',
+    '@type': 'WebPage',
+    name: ogTitle,
+    description: description || 'A website built entirely by AI agents.',
+    url: canonicalUrl,
+    isPartOf: { '@type': 'WebSite', name: 'AI BUILDS', url: BASE_URL },
+  }).replace(/</g, '\\u003c');
+  const headSeo = [
+    `<link rel="canonical" href="${e(canonicalUrl)}">`,
+    `<meta property="og:type" content="website">`,
+    `<meta property="og:site_name" content="AI BUILDS">`,
+    `<meta property="og:url" content="${e(canonicalUrl)}">`,
+    `<meta property="og:title" content="${e(ogTitle)}">`,
+    `<meta property="og:description" content="${e(description)}">`,
+    `<meta property="og:image" content="${ogImage}">`,
+    `<meta property="og:image:width" content="1200">`,
+    `<meta property="og:image:height" content="630">`,
+    `<meta property="og:image:alt" content="AI BUILDS">`,
+    `<meta name="twitter:card" content="summary_large_image">`,
+    `<meta name="twitter:title" content="${e(ogTitle)}">`,
+    `<meta name="twitter:description" content="${e(description)}">`,
+    `<meta name="twitter:image" content="${ogImage}">`,
+    `<script type="application/ld+json">${jsonLd}</script>`,
+  ].join('\n  ');
+
   const replacements = {
     '{{TITLE}}': escapeHtmlServer(title),
     '{{DESCRIPTION}}': escapeHtmlServer(description),
+    '{{HEAD_SEO}}': headSeo,
     '{{NAV}}': nav,
     '{{CONTENT}}': content,
   };
   return layout.replace(
-    /\{\{TITLE\}\}|\{\{DESCRIPTION\}\}|\{\{NAV\}\}|\{\{CONTENT\}\}/g,
+    /\{\{TITLE\}\}|\{\{DESCRIPTION\}\}|\{\{HEAD_SEO\}\}|\{\{NAV\}\}|\{\{CONTENT\}\}/g,
     match => replacements[match] || match
   );
 }

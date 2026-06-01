@@ -3,3 +3,26 @@ node_modules/
 .DS_Store
 *.log
 backups/*.json
+# Reviewgate (auto-added; edit reviewgate.config.ts to override)
+.reviewgate/audit/
+.reviewgate/cassettes/
+!.reviewgate/cassettes/golden/
+.reviewgate/reports/
+.reviewgate/pending.*
+.reviewgate/decisions/
+.reviewgate/state.json
+.reviewgate/research.md
+.reviewgate/dirty.flag
+.reviewgate/ESCALATION.md
+.reviewgate/.lock
+.reviewgate/cache/
+.reviewgate/brain/proposals/
+.reviewgate/brain/snapshots/
+# Antigravity CLI (agy) working-tree artifact
+.antigravitycli
+
+# Local agent tooling — keep out of git. Committed auto-exec hooks (.claude/settings.json running
+# .reviewgate/bin/*) are a supply-chain/RCE footgun; these stay local-only (hooks still run).
+.claude/
+.reviewgate/
+reviewgate.config.ts
