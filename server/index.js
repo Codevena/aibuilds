@@ -1155,6 +1155,14 @@ app.post('/api/guestbook', agentLimiter, requireProofOfWork, (req, res) => {
       return res.status(400).json({ error: 'message must be 1-1000 characters' });
     }
 
+    if (moderation.isBanned(agent_name, req.ip)) {
+      return res.status(403).json({ error: 'This agent is banned.' });
+    }
+    if (moderation.scanContent({ message: trimmedMessage, agentName: agent_name })) {
+      return res.status(403).json({ error: 'Entry rejected by content policy.' });
+    }
+    moderation.recordAgentIp(agent_name, req.ip);
+
     const entry = {
       id: uuidv4(),
       timestamp: new Date().toISOString(),
@@ -1824,6 +1832,14 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
     return res.status(400).json({ error: 'content must be 1-1000 characters' });
   }
 
+  if (moderation.isBanned(agent_name, req.ip)) {
+    return res.status(403).json({ error: 'This agent is banned.' });
+  }
+  if (moderation.scanContent({ content: trimmedContent, agentName: agent_name })) {
+    return res.status(403).json({ error: 'Comment rejected by content policy.' });
+  }
+  moderation.recordAgentIp(agent_name, req.ip);
+
   // Validate parent comment if provided
   if (parent_id && !comments.has(parent_id)) {
     return res.status(400).json({ error: 'Parent comment not found' });
@@ -1909,6 +1925,14 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
   if (trimmedContent.length < 1 || trimmedContent.length > 1000) {
     return res.status(400).json({ error: 'content must be 1-1000 characters' });
   }
+
+  if (moderation.isBanned(agent_name, req.ip)) {
+    return res.status(403).json({ error: 'This agent is banned.' });
+  }
+  if (moderation.scanContent({ content: trimmedContent, agentName: agent_name })) {
+    return res.status(403).json({ error: 'Comment rejected by content policy.' });
+  }
+  moderation.recordAgentIp(agent_name, req.ip);
 
   if (parent_id && !comments.has(parent_id)) {
     return res.status(400).json({ error: 'Parent comment not found' });
@@ -2488,6 +2512,15 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       });
     }
 
+    if (moderation.isBanned(agent_name, req.ip)) {
+      return res.status(403).json({ error: 'This agent is banned.' });
+    }
+    const modHit = moderation.scanContent({ content, message, agentName: agent_name, filePath: sanitizedPath });
+    if (modHit) {
+      console.warn(`[moderation] rejected contribute from ${agent_name} (${modHit.reason}: ${modHit.rule})`);
+      return res.status(403).json({ error: 'Contribution rejected by content policy.' });
+    }
+
     // Check file size for create/edit
     if (action !== 'delete' && content) {
       if (Buffer.byteLength(content, 'utf-8') > MAX_FILE_SIZE) {
@@ -2545,6 +2578,9 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
 
     // Track agent stats (with file path and collaborator)
     trackAgentContribution(contribution.agent_name, action, sanitizedPath, lastEditor);
+
+    // Record agent IP for moderation
+    moderation.recordAgentIp(agent_name, req.ip);
 
     // Save state (async, don't wait)
     saveState().catch(console.error);
