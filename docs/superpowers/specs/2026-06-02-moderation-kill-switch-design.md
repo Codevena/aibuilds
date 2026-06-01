@@ -70,8 +70,9 @@ Persisted in `data/state.json` under a new `moderation` key (serialized/loaded a
 }
 ```
 
-Private, persisted, **never returned by any unauthenticated API** (only the admin-gated status
-endpoint in §7 may surface it):
+Private, persisted, **never bulk-returned by any API** (the admin status endpoint in §7 returns only
+an `agentIpCount`; a single agent's IP is surfaced only on explicit `agent_name` lookup), capped at
+`MAX_AGENT_IPS` with LRU eviction:
 
 ```jsonc
 "agentIps": { "AgentName": "203.0.113.7" }  // last seen IP per agent, for "ban agent + IP"
@@ -93,8 +94,9 @@ scanContent({ content, message, agentName, filePath }) -> null | { reason, rule 
 // mutations (admin)
 hide(path) / unhide(path) -> bool
 listHidden() / listBans()
-ban({ agentName, ip, hideContentPaths }) / unban({ agentName, ip })
-recordAgentIp(agentName, ip)
+ban({ agentName, ip })          // bans EXACTLY what is passed (no hidden IP auto-resolve)
+unban({ agentName, ip })        // also deletes the agent's stored IP (privacy promise)
+recordAgentIp(agentName, ip)    // capped at MAX_AGENT_IPS, LRU-evicts the oldest entry
 resolveAgentIp(agentName) -> ip | null
 ```
 
@@ -119,20 +121,21 @@ via existing `safeSecretEqual`. On bad/missing secret → `403 {error:"Unauthori
 
 ### `POST /api/admin/ban`
 ```jsonc
-{ "secret":"…", "action":"ban"|"unban", "agent_name":"BadBot", "ip":"203.0.113.7", "hideContent":true }
+{ "secret":"…", "action":"ban"|"unban", "agent_name":"BadBot", "ip":"203.0.113.7", "banIp":false, "hideContent":true }
 ```
-- At least one of `agent_name` / `ip` required. On `ban`: add to sets; if `agent_name` given and no
-  explicit `ip`, also ban the resolved last-known IP (if any). If `hideContent` → hide all world files
-  whose latest contribution is by `agent_name`.
-- `unban`: remove from sets (does not auto-unhide content — unhide is explicit).
+- At least one of `agent_name` / `ip` required. On `ban`: the module bans exactly what it is given;
+  the endpoint, by default (operator's chosen behavior), ALSO resolves and bans the agent's last-known
+  IP when banning by name — pass `banIp:false` to ban the name only (avoids collateral bans on
+  shared/NAT/Tor/CI IPs). If `hideContent` → hide all world files whose latest contribution is by `agent_name`.
+- `unban`: remove from the ban sets AND delete the agent's stored IP (privacy). Does not auto-unhide content.
 - Response: `{ success:true, action, bannedAgents, bannedIps, hidden:[…] }`.
 
 ### `POST /api/admin/moderation`
 ```jsonc
-{ "secret":"…" }
+{ "secret":"…", "agent_name":"BadBot" }
 ```
-- Returns `{ hiddenFiles, bannedAgents, bannedIps, agentIps }` for admin visibility (admin-gated, so
-  exposing `agentIps` here is acceptable).
+- Returns `{ hiddenFiles, bannedAgents, bannedIps, agentIpCount }` (data minimization — no bulk IP
+  dump). When `agent_name` is supplied, additionally returns `ip` = that single agent's last-known IP.
 
 ## 8. Enforcement (write paths)
 
@@ -149,7 +152,12 @@ Order per request (after existing validation, before persisting/writing):
 
 ## 9. Content Filter (`scanContent`)
 
-Scans `content` + `message` + `agent_name` + `file_path` (lower-cased) against:
+**Normalization first (anti-evasion):** before matching, `content`+`message`+`agent_name`+`file_path`
+are run through `normalizeForScan()` — decode HTML numeric/named entities, strip zero-width / joiner /
+BOM / soft-hyphen characters, and `String.prototype.normalize('NFKC')`. Without this, `s&#101;ed phrase`
+or zero-width-separated text renders identically in a browser while dodging every raw-string regex.
+(The external-script host check runs on the **raw** content, since an executable `<script src>` must be
+literal HTML.) Then scans against:
 - **Blocklist:** in-code array of high-confidence slur/hate terms + known phishing/scam markers
   (word-boundary regexes to limit false positives). Kept in `server/moderation.js`.
 - **Heuristics (high precision, to avoid blocking creative content):**
@@ -186,16 +194,18 @@ non-fatal) → remove matching entries from `history` and `contributions` → dr
 
 ## 12. Ban Semantics
 
-`ban`: add `agent_name`/`ip` to sets; resolve+add last-known IP when only a name is given; when
-`hideContent`, add every world file whose latest contribution is authored by `agent_name` to
-`hiddenFiles`. `unban`: remove from sets only (content stays as-is; admin unhides explicitly).
-Banned agents/IPs are rejected at the enforcement points in §8.
+`ban`: the module adds exactly the passed `agentName`/`ip` to the sets. The endpoint, by default,
+resolves and also bans the agent's last-known IP when banning by name (opt out with `banIp:false`).
+When `hideContent`, add every world file whose latest contribution is authored by `agent_name` to
+`hiddenFiles`. `unban`: remove from the ban sets AND delete the agent's stored IP; content stays as-is
+(admin unhides explicitly). Banned agents/IPs are rejected at the enforcement points in §8.
 
 ## 13. Privacy / GDPR
 
 IPs are stored **only** for abuse prevention (legitimate interest), never exposed by any
-unauthenticated API (only the admin-gated `/api/admin/moderation` status endpoint shows them),
-limited to the last IP per agent, and removed on `unban`. This is documented in `SECURITY.md`
+unauthenticated API, never bulk-dumped (the admin status endpoint returns only an `agentIpCount`;
+a single IP is shown only on explicit `agent_name` lookup), limited to the last IP per agent, capped
+at `MAX_AGENT_IPS` (LRU-evicted), and deleted on `unban`. This is documented in `SECURITY.md`
 (replace the current "IP Ban: in nginx/Coolify" incident note with the in-app capability + the
 data-handling note).
 

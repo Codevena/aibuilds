@@ -166,14 +166,23 @@ test('ban/unban by name and ip', () => {
   assert.equal(mod.isBanned('Bad', null), false);
 });
 
-test('ban resolves the agent last-known IP', () => {
+test('ban bans exactly what is passed; resolveAgentIp is separate', () => {
   mod.loadModeration({});
   mod.recordAgentIp('Spammer', '203.0.113.5');
   assert.equal(mod.resolveAgentIp('Spammer'), '203.0.113.5');
-  mod.ban({ agentName: 'Spammer' });        // no explicit ip -> resolves last-known
-  assert.equal(mod.isBanned('Someone', '203.0.113.5'), true);
-  const bans = mod.listBans();
-  assert.ok(bans.bannedIps.includes('203.0.113.5'));
+  mod.ban({ agentName: 'Spammer' });                 // name only -> IP NOT auto-banned
+  assert.equal(mod.isBanned('Other', '203.0.113.5'), false);
+  mod.ban({ agentName: 'Spammer', ip: '203.0.113.5' }); // explicit IP
+  assert.equal(mod.isBanned('Other', '203.0.113.5'), true);
+});
+
+test('unban clears the stored agent IP (privacy promise)', () => {
+  mod.loadModeration({});
+  mod.recordAgentIp('Temp', '198.51.100.9');
+  mod.ban({ agentName: 'Temp', ip: '198.51.100.9' });
+  mod.unban({ agentName: 'Temp', ip: '198.51.100.9' });
+  assert.equal(mod.resolveAgentIp('Temp'), null);
+  assert.equal(mod.isBanned('Temp', '198.51.100.9'), false);
 });
 ```
 
@@ -187,27 +196,34 @@ Expected: FAIL — `mod.isBanned is not a function`.
 In `server/moderation.js`, add these functions before `module.exports`:
 
 ```js
+const MAX_AGENT_IPS = 5000; // bound the IP map (GDPR data-minimization); evict oldest (LRU-ish)
+
 function isBanned(agentName, ip) {
   return (typeof agentName === 'string' && bannedAgents.has(agentName)) ||
          (typeof ip === 'string' && bannedIps.has(ip));
 }
 function recordAgentIp(agentName, ip) {
   if (typeof agentName === 'string' && agentName && typeof ip === 'string' && ip) {
+    if (agentIps.has(agentName)) agentIps.delete(agentName); // refresh insertion order (LRU)
     agentIps.set(agentName, ip);
+    if (agentIps.size > MAX_AGENT_IPS) agentIps.delete(agentIps.keys().next().value);
   }
 }
 function resolveAgentIp(agentName) { return agentIps.get(agentName) || null; }
+// Bans EXACTLY what is passed (no hidden IP auto-resolve — that decision lives in the endpoint,
+// so "ban by name only" is always possible). See /api/admin/ban for the default-ban-IP behavior.
 function ban({ agentName, ip } = {}) {
-  if (agentName) {
-    bannedAgents.add(agentName);
-    if (!ip) { const known = resolveAgentIp(agentName); if (known) ip = known; }
-  }
+  if (agentName) bannedAgents.add(agentName);
   if (ip) bannedIps.add(ip);
   return listBans();
 }
+// Unban also drops the stored IP for that agent (honors the privacy promise: IPs removed on unban).
 function unban({ agentName, ip } = {}) {
   let removed = false;
-  if (agentName && bannedAgents.delete(agentName)) removed = true;
+  if (agentName) {
+    if (bannedAgents.delete(agentName)) removed = true;
+    if (agentIps.delete(agentName)) removed = true;
+  }
   if (ip && bannedIps.delete(ip)) removed = true;
   return removed;
 }
@@ -229,7 +245,7 @@ module.exports = {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test test/moderation.test.js`
-Expected: PASS (4 tests).
+Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -270,6 +286,10 @@ test('scanContent: scam/phishing blocklist term is blocked', () => {
   const r = mod.scanContent({ content: 'Connect your wallet and enter your seed phrase to claim free crypto' });
   assert.ok(r && r.reason === 'blocklist');
 });
+test('scanContent: HTML-entity-encoded blocklist term is still blocked (normalization)', () => {
+  const r = mod.scanContent({ content: 'please connect your w&#97;llet now' });
+  assert.ok(r && r.reason === 'blocklist');
+});
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -296,17 +316,30 @@ const BLOCKLIST = [
 const SLUR_TERMS = [];
 
 const MINER_RE = /(coinhive|cryptonight|eval\s*\(\s*atob\s*\(|new\s+function\s*\(\s*atob\s*\()/i;
-const SCRIPT_SRC_RE = /<script\b[^>]*\bsrc\s*=\s*["']?([^"'>\s]+)/gi;
 const ALLOWED_SCRIPT_HOSTS = new Set(['analytics.codevena.dev']);
 
+// Decode the tricks an attacker uses to render a blocked phrase while dodging raw-string regexes:
+// HTML numeric/named entities, zero-width & soft-hyphen separators, and compatibility forms.
+function normalizeForScan(s) {
+  return String(s || '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ''; } })
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch { return ''; } })
+    .replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
+    .replace(/[​-‍⁠﻿­]/g, '') // strip U+200B..U+200D, U+2060, U+FEFF, U+00AD (zero-width/joiner/word-joiner/BOM/soft-hyphen)
+    .normalize('NFKC');
+}
+
 function scanContent({ content = '', message = '', agentName = '', filePath = '' } = {}) {
-  const haystack = `${content}\n${message}\n${agentName}\n${filePath}`;
+  const haystack = normalizeForScan(`${content}\n${message}\n${agentName}\n${filePath}`);
   for (const rule of BLOCKLIST) if (rule.test(haystack)) return { reason: 'blocklist', rule: rule.source };
-  for (const term of SLUR_TERMS) if (haystack.toLowerCase().includes(term.toLowerCase())) return { reason: 'blocklist', rule: 'slur' };
+  const lower = haystack.toLowerCase();
+  for (const term of SLUR_TERMS) if (lower.includes(term.toLowerCase())) return { reason: 'blocklist', rule: 'slur' };
   if (MINER_RE.test(haystack)) return { reason: 'miner-or-obfuscation', rule: MINER_RE.source };
-  // matchAll uses a fresh internal iterator each call, so the module-level /g regex carries no
-  // mutable lastIndex state between calls (robust against future early-returns).
-  for (const m of content.matchAll(SCRIPT_SRC_RE)) {
+  // Construct the script-src regex inline (fresh, no shared /g lastIndex state). Executable
+  // <script src> must be literal HTML, so this scans raw content (not the entity-decoded haystack).
+  const scriptSrcRe = /<script\b[^>]*\bsrc\s*=\s*["']?([^"'>\s]+)/gi;
+  for (const m of content.matchAll(scriptSrcRe)) {
     let src = m[1];
     if (src.startsWith('//')) src = 'https:' + src;
     if (/^https?:\/\//i.test(src)) {
@@ -334,7 +367,7 @@ module.exports = {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `node --test test/moderation.test.js`
-Expected: PASS (9 tests).
+Expected: PASS (11 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -424,39 +457,41 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
   }
   // Resolve a contribution id to its file path; otherwise treat target as a path.
   const filePath = contributions.has(target) ? contributions.get(target).file_path : target;
-  const safe = filePath.replace(/\.\./g, '').replace(/^\/+/, '');
-  const fullPath = path.join(WORLD_DIR, safe);
+  const fullPath = path.join(WORLD_DIR, filePath);
+  // The WORLD_DIR containment check is the ONLY path guard. path.join already normalizes ../,
+  // // and . segments, so a manual `.replace(/\.\./g,'')` is both broken (e.g. '....//' -> '../')
+  // and a false-trust anchor — omit it deliberately.
   if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
     return res.status(403).json({ error: 'Access denied' });
   }
 
   if (action === 'hide') {
-    moderation.hide(safe);
+    moderation.hide(filePath);
   } else if (action === 'unhide') {
-    moderation.unhide(safe);
+    moderation.unhide(filePath);
   } else { // delete
     try { await fs.unlink(fullPath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     // Purge from in-memory history + index
     for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].file_path === safe) {
+      if (history[i].file_path === filePath) {
         contributions.delete(history[i].id);
         history.splice(i, 1);
       }
     }
-    moderation.unhide(safe);
+    moderation.unhide(filePath);
     // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
     // `git add <deleted path>` stages the file's removal.
-    try { await git.add(safe); await git.commit(`moderation: remove ${safe}`); } catch (e) { /* best effort */ }
+    try { await git.add(filePath); await git.commit(`moderation: remove ${filePath}`); } catch (e) { /* best effort */ }
   }
 
   await saveState();
-  broadcast({ type: 'moderation', data: { action, target: safe } });
-  res.json({ success: true, action, target: safe, hidden: moderation.listHidden() });
+  broadcast({ type: 'moderation', data: { action, target: filePath } });
+  res.json({ success: true, action, target: filePath, hidden: moderation.listHidden() });
 });
 
 // Admin: ban/unban an agent name and/or IP
 app.post('/api/admin/ban', adminLimiter, async (req, res) => {
-  const { secret, action, agent_name, ip, hideContent } = req.body || {};
+  const { secret, action, agent_name, ip, hideContent, banIp } = req.body || {};
   if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
@@ -469,7 +504,13 @@ app.post('/api/admin/ban', adminLimiter, async (req, res) => {
 
   let hidden = [];
   if (action === 'ban') {
-    moderation.ban({ agentName: agent_name, ip });
+    // Default (operator's chosen behavior): banning by name also bans the agent's last-known IP.
+    // Pass banIp:false to ban the name only — avoids collateral bans on shared/NAT/Tor/CI IPs.
+    let effectiveIp = ip;
+    if (agent_name && !effectiveIp && banIp !== false) {
+      effectiveIp = moderation.resolveAgentIp(agent_name) || undefined;
+    }
+    moderation.ban({ agentName: agent_name, ip: effectiveIp });
     if (hideContent && agent_name) {
       // Hide the latest file authored by this agent (one entry per distinct file).
       const seen = new Set();
@@ -489,14 +530,17 @@ app.post('/api/admin/ban', adminLimiter, async (req, res) => {
   res.json({ success: true, action, ...moderation.listBans(), hidden });
 });
 
-// Admin: inspect current moderation state
+// Admin: inspect current moderation state. Returns hidden/banned lists + an agent-IP COUNT only
+// (GDPR data minimization — no bulk IP dump). Pass agent_name to look up that single agent's IP.
 app.post('/api/admin/moderation', adminLimiter, (req, res) => {
-  const { secret } = req.body || {};
+  const { secret, agent_name } = req.body || {};
   if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
   const snap = moderation.serializeModeration();
-  res.json({ ...snap.moderation, agentIps: snap.agentIps });
+  const body = { ...snap.moderation, agentIpCount: Object.keys(snap.agentIps).length };
+  if (agent_name) body.ip = moderation.resolveAgentIp(agent_name);
+  res.json(body);
 });
 ```
 
