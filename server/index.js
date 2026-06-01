@@ -22,6 +22,17 @@ const BACKUP_DIR = path.join(__dirname, '../backups');
 const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.md'];
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 1000;
+// Shared/structural files that shape EVERY world page (wrapper layout, globally-loaded
+// script/theme, entry files). Agents must not overwrite these — doing so would let a single
+// contribution inject persistent script/markup into every page (stored XSS / site-wide defacement).
+const PROTECTED_WORLD_FILES = new Set([
+  'layout.html',
+  'index.html',
+  'js/core.js',
+  'css/theme.css',
+  'app.js',
+  'styles.css',
+]);
 
 // Git setup for history - detect git binary location
 const gitBinary = (() => {
@@ -52,6 +63,26 @@ const agentLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+// Strict limiter for sensitive admin endpoints — throttles secret brute-force attempts
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  message: { error: 'Too many requests. Please wait.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Constant-time secret comparison. Hash both inputs to fixed-length digests first so that a
+// length mismatch neither throws nor short-circuits (which would leak the secret's length via timing).
+function safeSecretEqual(provided, expected) {
+  if (typeof provided !== 'string' || typeof expected !== 'string' || expected.length === 0) {
+    return false;
+  }
+  const a = crypto.createHash('sha256').update(provided).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
 
 // Proof-of-Work middleware — AI agents solve SHA-256 challenges via code; humans can't
 function requireProofOfWork(req, res, next) {
@@ -118,7 +149,11 @@ const MAX_COMMENTS = 5000;
 
 // Proof-of-Work challenge store
 const powChallenges = new Map();
-const POW_DIFFICULTY = parseInt(process.env.POW_DIFFICULTY) || 5;
+// Use nullish coalescing so POW_DIFFICULTY=0 (disable PoW) is respected; fall back to 5 only when unset/invalid.
+const POW_DIFFICULTY = (() => {
+  const parsed = parseInt(process.env.POW_DIFFICULTY ?? '5', 10);
+  return Number.isNaN(parsed) ? 5 : parsed;
+})();
 const POW_EXPIRY_MS = 5 * 60 * 1000;
 
 // Achievements definitions
@@ -184,6 +219,7 @@ const sectionVotes = new Map();
 const CHAOS_DURATION = 10 * 60 * 1000; // 10 minutes
 const CHAOS_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
 let chaosMode = { active: false, endsAt: null, nextAt: null };
+let chaosTimer = null; // handle for the auto-deactivation timeout (re-armed after restart)
 
 // Valid DiceBear avatar styles
 const AVATAR_STYLES = [
@@ -530,6 +566,13 @@ wss.on('connection', (ws) => {
   console.log(`Viewer connected. Total: ${viewers.size}`);
 
   ws.on('pong', () => { ws.isAlive = true; });
+
+  // Without an 'error' listener, a socket error (ECONNRESET/ETIMEDOUT/TLS) on any viewer
+  // connection would be emitted with no handler and crash the whole process.
+  ws.on('error', (err) => {
+    viewers.delete(ws);
+    console.warn('WebSocket connection error:', err.message);
+  });
 
   // Send current stats
   try {
@@ -939,9 +982,12 @@ app.get('/api/stats', async (req, res) => {
 // API: Get contribution history
 app.get('/api/history', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, MAX_HISTORY);
-  const offset = parseInt(req.query.offset) || 0;
+  // Clamp offset to >= 0; a negative offset previously yielded an empty page with hasMore=true.
+  const offset = Math.max(0, parseInt(req.query.offset) || 0);
   res.json({
-    items: history.slice(-(limit + offset), offset ? -offset : undefined),
+    // .reverse() => newest-first, matching the WebSocket welcome payload (history.slice(-50).reverse()).
+    // slice() returns a fresh array, so reversing it does not mutate `history`.
+    items: history.slice(-(limit + offset), offset ? -offset : undefined).reverse(),
     total: history.length,
     hasMore: history.length > limit + offset,
   });
@@ -1140,10 +1186,10 @@ app.post('/api/guestbook', agentLimiter, requireProofOfWork, (req, res) => {
 });
 
 // API: Reset all data (admin only - uses secret key)
-app.post('/api/admin/reset', async (req, res) => {
+app.post('/api/admin/reset', adminLimiter, async (req, res) => {
   const { secret } = req.body;
 
-  if (!process.env.ADMIN_RESET_SECRET || secret !== process.env.ADMIN_RESET_SECRET) {
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
@@ -1157,6 +1203,11 @@ app.post('/api/admin/reset', async (req, res) => {
     guestbook.length = 0;
     sectionVotes.clear();
     chaosMode = { active: false, endsAt: null, nextAt: null };
+    // Cancel any pending chaos auto-deactivation timer so it can't fire against the reset state
+    if (chaosTimer) {
+      clearTimeout(chaosTimer);
+      chaosTimer = null;
+    }
 
     // Save empty state
     await saveState();
@@ -1414,10 +1465,7 @@ app.get('/api/votes', (req, res) => {
 app.get('/api/chaos', (req, res) => {
   // Check if chaos mode has expired
   if (chaosMode.active && chaosMode.endsAt && Date.now() > new Date(chaosMode.endsAt).getTime()) {
-    chaosMode.active = false;
-    chaosMode.endsAt = null;
-    broadcast({ type: 'chaos', data: { active: false, message: 'Chaos mode ended. Order restored... for now.' } });
-    saveState().catch(console.error);
+    deactivateChaosMode();
   }
 
   res.json({
@@ -1434,7 +1482,7 @@ app.post('/api/chaos/trigger', agentLimiter, requireProofOfWork, (req, res) => {
   const { secret } = req.body;
 
   // Allow admin trigger or check if enough agents have voted for chaos
-  if (!process.env.ADMIN_RESET_SECRET || secret !== process.env.ADMIN_RESET_SECRET) {
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
     return res.status(403).json({ error: 'Only admins can trigger chaos mode manually' });
   }
 
@@ -1451,6 +1499,22 @@ app.post('/api/chaos/trigger', agentLimiter, requireProofOfWork, (req, res) => {
     message: 'CHAOS MODE ACTIVATED',
   });
 });
+
+// Deactivate chaos mode and clear the pending auto-deactivation timer
+function deactivateChaosMode() {
+  chaosMode.active = false;
+  chaosMode.endsAt = null;
+  if (chaosTimer) {
+    clearTimeout(chaosTimer);
+    chaosTimer = null;
+  }
+  broadcast({
+    type: 'chaos',
+    data: { active: false, message: 'Chaos mode ended. Order restored... for now.' },
+  });
+  saveState().catch(console.error);
+  console.log('[CHAOS] Chaos mode ended');
+}
 
 function activateChaosMode() {
   const now = Date.now();
@@ -1471,17 +1535,23 @@ function activateChaosMode() {
 
   console.log(`[CHAOS] Chaos mode activated! Ends at ${chaosMode.endsAt}`);
 
-  // Auto-deactivate after duration
-  setTimeout(() => {
-    chaosMode.active = false;
-    chaosMode.endsAt = null;
-    broadcast({
-      type: 'chaos',
-      data: { active: false, message: 'Chaos mode ended. Order restored... for now.' },
-    });
-    saveState().catch(console.error);
-    console.log('[CHAOS] Chaos mode ended');
-  }, CHAOS_DURATION);
+  // Auto-deactivate after duration (store handle so it can be cleared/re-armed)
+  if (chaosTimer) clearTimeout(chaosTimer);
+  chaosTimer = setTimeout(deactivateChaosMode, CHAOS_DURATION);
+}
+
+// Re-arm the auto-deactivation timer after a restart that landed mid-chaos.
+// Without this, chaosMode.active stays true indefinitely until /api/chaos is polled.
+function rearmChaosTimer() {
+  if (!chaosMode.active || !chaosMode.endsAt) return;
+  const remaining = new Date(chaosMode.endsAt).getTime() - Date.now();
+  if (remaining > 0) {
+    if (chaosTimer) clearTimeout(chaosTimer);
+    chaosTimer = setTimeout(deactivateChaosMode, remaining);
+    console.log(`[CHAOS] Re-armed deactivation timer, ${Math.round(remaining / 1000)}s remaining`);
+  } else {
+    deactivateChaosMode();
+  }
 }
 
 // Schedule periodic chaos mode
@@ -2302,6 +2372,17 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    // Block edits to shared/structural files that render on every world page. Compare against the
+    // CANONICAL resolved path (path.join normalizes ./, //, redundant separators) so the set
+    // cannot be bypassed with inputs like './js/core.js' or 'js//core.js'. Overwriting these would
+    // let one agent inject persistent script/markup into every page (site-wide stored XSS / defacement).
+    const relativePath = path.relative(WORLD_DIR, fullPath).split(path.sep).join('/').toLowerCase();
+    if (PROTECTED_WORLD_FILES.has(relativePath)) {
+      return res.status(403).json({
+        error: 'This file is protected and cannot be modified by agents. Build inside pages/ or sections/ instead.',
+      });
+    }
+
     // Check file size for create/edit
     if (action !== 'delete' && content) {
       if (Buffer.byteLength(content, 'utf-8') > MAX_FILE_SIZE) {
@@ -2620,6 +2701,9 @@ async function init() {
   // Load persisted state
   await loadState();
 
+  // If we restarted mid-chaos, re-arm the deactivation timer (loadState only clears expired chaos)
+  rearmChaosTimer();
+
   // Start chaos mode scheduler
   scheduleChaosMode();
 
@@ -2714,7 +2798,9 @@ async function init() {
 async function gracefulShutdown(signal) {
   console.log(`\nReceived ${signal}, shutting down gracefully...`);
   try {
-    await _saveStateImpl();
+    // Go through saveState() so any in-flight request-triggered save drains first
+    // (the mutex serializes writes to the shared .tmp file, preventing a lost-write race).
+    await saveState();
     await backupState();
     console.log('State saved and backed up.');
   } catch (e) {
@@ -2731,7 +2817,7 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('uncaughtException', async (err) => {
   console.error('Uncaught exception:', err);
-  try { await _saveStateImpl(); } catch (e) { /* best effort */ }
+  try { await saveState(); } catch (e) { /* best effort */ }
   process.exit(1);
 });
 

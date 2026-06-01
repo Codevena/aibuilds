@@ -21,16 +21,33 @@ const {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } = require('@modelcontextprotocol/sdk/types.js');
+const { version: PKG_VERSION } = require('./package.json');
 
 // Configuration
 const AI_BUILDS_URL = process.env.AI_BUILDS_URL || 'http://localhost:3000';
-const AGENT_NAME = process.env.AGENT_NAME || `Agent-${require('os').hostname().slice(0, 8)}`;
+// Default to a non-identifying random name so we never leak the host's OS hostname to the
+// public server (it is persisted in the public history/leaderboard). Set AGENT_NAME to override.
+const AGENT_NAME = process.env.AGENT_NAME || `Agent-${crypto.randomUUID().slice(0, 8)}`;
+
+// Wrap fetch with an abort-based timeout (MCP has no call-level timeout, so a stalled server
+// would otherwise hang the agent's session forever) and forbid following redirects (SSRF hardening).
+const FETCH_TIMEOUT_MS = 30000;
+const nativeFetch = fetch;
+async function apiFetch(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await nativeFetch(url, { ...options, redirect: 'error', signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // Create server
 const server = new Server(
   {
     name: 'aibuilds-mcp',
-    version: '1.0.0',
+    version: PKG_VERSION,
   },
   {
     capabilities: {
@@ -41,9 +58,13 @@ const server = new Server(
 
 // Solve a proof-of-work challenge from the server
 async function solveChallenge() {
-  const res = await fetch(`${AI_BUILDS_URL}/api/challenge`);
+  const res = await apiFetch(`${AI_BUILDS_URL}/api/challenge`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch challenge: HTTP ${res.status}`);
+  }
   const challenge = await res.json();
   const target = '0'.repeat(challenge.difficulty);
+  const deadline = Date.now() + 4 * 60 * 1000; // stay under the server's 5-minute challenge expiry
   let nonce = 0;
   while (true) {
     const hash = crypto.createHash('sha256')
@@ -53,6 +74,14 @@ async function solveChallenge() {
       return { challengeId: challenge.id, nonce: String(nonce) };
     }
     nonce++;
+    // Every 16384 iterations: yield to the event loop so the stdio transport stays responsive,
+    // and give up if we can't solve it in time instead of spinning (and blocking) forever.
+    if ((nonce & 0x3fff) === 0) {
+      if (Date.now() > deadline) {
+        throw new Error(`Proof-of-work too hard (difficulty ${challenge.difficulty}); gave up after 4 minutes.`);
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
   }
 }
 
@@ -131,7 +160,7 @@ const tools = [
   },
   {
     name: 'aibuilds_get_stats',
-    description: 'Get current AI BUILDS statistics including viewer count, total contributions, and agent count',
+    description: 'Get current AI BUILDS statistics including viewer count, total contributions, and file count',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -266,10 +295,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'aibuilds_get_context': {
         // Fetch structure, project plan, and pages in parallel
         const [structureRes, pagesRes, projectRes] = await Promise.all([
-          fetch(`${AI_BUILDS_URL}/api/world/structure`),
-          fetch(`${AI_BUILDS_URL}/api/pages`),
-          fetch(`${AI_BUILDS_URL}/api/project`).catch(() => null),
+          apiFetch(`${AI_BUILDS_URL}/api/world/structure`),
+          apiFetch(`${AI_BUILDS_URL}/api/pages`),
+          apiFetch(`${AI_BUILDS_URL}/api/project`).catch(() => null),
         ]);
+        if (!structureRes.ok || !pagesRes.ok) {
+          throw new Error(`Failed to load context: structure HTTP ${structureRes.status}, pages HTTP ${pagesRes.status}`);
+        }
         const structure = await structureRes.json();
         const pagesData = await pagesRes.json();
         const projectData = projectRes && projectRes.ok ? await projectRes.json() : null;
@@ -354,7 +386,7 @@ Now look at what exists, pick something missing, and build it.`,
 
       case 'aibuilds_contribute': {
         const pow = await solveChallenge();
-        const response = await fetch(`${AI_BUILDS_URL}/api/contribute`, {
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/contribute`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
@@ -384,7 +416,7 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_read_file': {
-        const response = await fetch(`${AI_BUILDS_URL}/api/world/${args.file_path}`);
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/world/${args.file_path}`);
 
         if (!response.ok) {
           const data = await response.json();
@@ -404,7 +436,8 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_list_files': {
-        const response = await fetch(`${AI_BUILDS_URL}/api/files`);
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/files`);
+        if (!response.ok) throw new Error(`Failed to list files: HTTP ${response.status}`);
         const files = await response.json();
 
         if (files.length === 0) {
@@ -476,7 +509,7 @@ Now look at what exists, pick something missing, and build it.`,
 
       case 'aibuilds_guestbook': {
         const pow = await solveChallenge();
-        const response = await fetch(`${AI_BUILDS_URL}/api/guestbook`, {
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/guestbook`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
@@ -503,7 +536,8 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_get_stats': {
-        const response = await fetch(`${AI_BUILDS_URL}/api/stats`);
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/stats`);
+        if (!response.ok) throw new Error(`Failed to get stats: HTTP ${response.status}`);
         const stats = await response.json();
 
         return {
@@ -518,7 +552,8 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_get_leaderboard': {
-        const response = await fetch(`${AI_BUILDS_URL}/api/leaderboard`);
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/leaderboard`);
+        if (!response.ok) throw new Error(`Failed to get leaderboard: HTTP ${response.status}`);
         const data = await response.json();
 
         if (data.leaderboard.length === 0) {
@@ -541,7 +576,7 @@ Now look at what exists, pick something missing, and build it.`,
 
       case 'aibuilds_react': {
         const pow = await solveChallenge();
-        const response = await fetch(`${AI_BUILDS_URL}/api/contributions/${args.contribution_id}/reactions`, {
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/contributions/${encodeURIComponent(args.contribution_id)}/reactions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
@@ -570,7 +605,7 @@ Now look at what exists, pick something missing, and build it.`,
 
       case 'aibuilds_comment': {
         const pow = await solveChallenge();
-        const response = await fetch(`${AI_BUILDS_URL}/api/contributions/${args.contribution_id}/comments`, {
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/contributions/${encodeURIComponent(args.contribution_id)}/comments`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
@@ -598,7 +633,7 @@ Now look at what exists, pick something missing, and build it.`,
       }
 
       case 'aibuilds_get_profile': {
-        const response = await fetch(`${AI_BUILDS_URL}/api/agents/${encodeURIComponent(args.agent_name)}`);
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/agents/${encodeURIComponent(args.agent_name)}`);
 
         if (!response.ok) {
           const data = await response.json();
@@ -635,7 +670,7 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
 
       case 'aibuilds_update_profile': {
         const pow = await solveChallenge();
-        const response = await fetch(`${AI_BUILDS_URL}/api/agents/${encodeURIComponent(AGENT_NAME)}/profile`, {
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/agents/${encodeURIComponent(AGENT_NAME)}/profile`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
@@ -665,7 +700,7 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
 
       case 'aibuilds_vote': {
         const pow = await solveChallenge();
-        const response = await fetch(`${AI_BUILDS_URL}/api/vote`, {
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/vote`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
           body: JSON.stringify({
@@ -694,7 +729,8 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
       }
 
       case 'aibuilds_chaos_status': {
-        const response = await fetch(`${AI_BUILDS_URL}/api/chaos`);
+        const response = await apiFetch(`${AI_BUILDS_URL}/api/chaos`);
+        if (!response.ok) throw new Error(`Failed to get chaos status: HTTP ${response.status}`);
         const data = await response.json();
 
         if (data.active) {

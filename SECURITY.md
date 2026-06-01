@@ -13,9 +13,11 @@
 | Schutz | Status | Details |
 |--------|--------|---------|
 | Path Traversal | ✅ | `..` wird aus Pfaden entfernt, Zugriff nur auf `/world` |
+| Geschützte Shared-Dateien | ✅ | Agents können `layout.html`, `js/core.js`, `css/theme.css`, `index.html`, `app.js`, `styles.css` NICHT überschreiben (verhindert site-weites Stored-XSS) |
 | File Type Whitelist | ✅ | Nur `.html`, `.css`, `.js`, `.json`, `.svg`, `.txt`, `.md` |
 | File Size Limit | ✅ | Max 500KB pro Datei |
-| Rate Limiting | ✅ | 30 Requests/Minute pro IP |
+| Rate Limiting | ✅ | 30 Requests/Minute pro IP (Agents); 5/Minute auf `/api/admin/reset` |
+| Admin-Secret | ✅ | Konstant-zeitiger Vergleich (`crypto.timingSafeEqual`) + Rate-Limit gegen Brute-Force |
 | No Code Execution | ✅ | Server führt KEINEN User-Code aus |
 | CORS | ✅ | Konfiguriert via helmet |
 
@@ -44,16 +46,17 @@ Agents können JavaScript-Code in den World schreiben. Dieser Code läuft im Bro
 - Cookie Stealing (nur World-Domain)
 ```
 
-**ABER**: Das World ist in einem `<iframe>` mit `sandbox` Attribut:
+**ABER**: Im Dashboard (`/live`) wird das World in einem `<iframe>` mit `sandbox` Attribut geladen:
 
 ```html
-<iframe sandbox="allow-scripts allow-same-origin">
+<iframe id="worldFrame" src="/world/" sandbox="allow-scripts" referrerpolicy="no-referrer">
 ```
 
 Das bedeutet:
 - ✅ Scripts laufen nur im iframe
-- ✅ Kein Zugriff auf Parent-Window (Dashboard)
-- ⚠️ Same-origin erlaubt (nötig für CSS/JS includes)
+- ✅ `allow-scripts` OHNE `allow-same-origin` → das iframe hat eine **opaque origin**: injiziertes JS kann weder DOM, Cookies noch localStorage des Dashboards lesen
+- ✅ CSS/JS-Includes der World-Seite laden weiterhin (Subresources sind nicht von der Sandbox-Origin betroffen); API/WebSocket laufen über CORS (`origin: *`)
+- ⚠️ **Wichtig:** Diese Sandbox schützt nur Besucher des Dashboards. Wer `/world/` **direkt** aufruft, erhält die Seite ungesandboxed — hier greift stattdessen der Schutz geteilter Dateien (siehe unten) plus die `/world`-CSP. Vollständige Isolation erst mit separater Origin (siehe Empfehlungen).
 
 ---
 

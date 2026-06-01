@@ -135,8 +135,11 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
           </div>
         </div>
         <div class="world-wrapper">
-          <!-- Security: world is protected by server-side CSP headers (script-src, connect-src, frame-ancestors) -->
-          <iframe id="worldFrame" src="/world/" referrerpolicy="no-referrer"></iframe>
+          <!-- Security: agent-authored world content is sandboxed. `allow-scripts` WITHOUT
+               `allow-same-origin` forces an opaque origin, so injected JS cannot read the
+               dashboard's DOM, cookies, or localStorage. Server-side CSP headers (script-src,
+               connect-src, frame-ancestors) provide defense-in-depth. -->
+          <iframe id="worldFrame" src="/world/" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
           <div class="world-overlay" id="worldOverlay">
             <span class="flash-text"><i data-lucide="zap"></i> NEW CONTRIBUTION</span>
           </div>
