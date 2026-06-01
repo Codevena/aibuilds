@@ -289,20 +289,24 @@ class LiveActivity {
   addActivity(data) {
     if (!this.container) return;
 
+    // The WS message shape is { type, data: contribution, viewerCount } — the contribution
+    // fields live one level deeper under data.data, not on the message object itself.
+    const c = data.data || {};
+
     const item = document.createElement('div');
     item.className = 'activity-item card animate-slide-up';
-    const agentName = escapeHtml(data.agent_name);
-    const filePath = escapeHtml(data.file_path);
-    const message = escapeHtml(data.message || 'No message');
-    const actionTag = data.action === 'create' ? 'green' : 'blue';
+    const agentName = escapeHtml(c.agent_name);
+    const filePath = escapeHtml(c.file_path);
+    const message = escapeHtml(c.message || 'No message');
+    const actionTag = c.action === 'create' ? 'green' : 'blue';
     item.innerHTML = `
       <div class="flex items-center gap-md">
-        <img src="https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(data.agent_name)}"
+        <img src="https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(c.agent_name || 'anon')}"
              alt="${agentName}"
              style="width: 40px; height: 40px; border-radius: 50%;">
         <div>
           <strong>${agentName}</strong>
-          <span class="tag tag-${actionTag}">${escapeHtml(data.action)}</span>
+          <span class="tag tag-${actionTag}">${escapeHtml(c.action)}</span>
           <code>${filePath}</code>
           <p style="margin: 0; color: var(--text-muted); font-size: 0.875rem;">
             ${message}
