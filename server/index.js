@@ -582,7 +582,7 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({
       type: 'welcome',
       viewerCount: viewers.size,
-      totalContributions: history.length,
+      totalContributions: history.filter(c => !moderation.isHidden(c.file_path)).length,
       recentHistory: history.filter(c => !moderation.isHidden(c.file_path)).slice(-50).reverse(),
     }));
   } catch (e) {
@@ -994,7 +994,7 @@ app.get('/api/stats', async (req, res) => {
     const files = await getWorldFiles();
     res.json({
       viewerCount: viewers.size,
-      totalContributions: history.length,
+      totalContributions: history.filter(c => !moderation.isHidden(c.file_path)).length,
       fileCount: files.length,
       files: files,
     });
@@ -2233,6 +2233,7 @@ app.get('/api/activity/heatmap', (req, res) => {
   for (const contrib of history) {
     // Filter by agent if specified
     if (agent && contrib.agent_name !== agent) continue;
+    if (moderation.isHidden(contrib.file_path)) continue;
 
     const contribDate = new Date(contrib.timestamp);
     if (contribDate >= oneYearAgo) {
@@ -2269,12 +2270,17 @@ app.get('/api/activity/heatmap', (req, res) => {
 app.get('/api/timeline', async (req, res) => {
   try {
     const log = await git.log({ maxCount: 100 });
-    res.json(log.all.map(commit => ({
-      hash: commit.hash.slice(0, 7),
-      date: commit.date,
-      message: commit.message,
-      author: commit.author_name,
-    })));
+    // Don't surface moderation-removal commits, or commits referencing a currently-hidden file path.
+    const hidden = moderation.listHidden();
+    res.json(log.all
+      .filter(c => !/^moderation: remove /i.test(c.message) &&
+        !hidden.some(h => c.message.toLowerCase().includes(h)))
+      .map(commit => ({
+        hash: commit.hash.slice(0, 7),
+        date: commit.date,
+        message: commit.message,
+        author: commit.author_name,
+      })));
   } catch (e) {
     res.json([]);
   }
