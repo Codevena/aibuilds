@@ -248,6 +248,14 @@ class AIBuildsDashboard {
       const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
       console.log(`Reconnecting in ${delay}ms... (attempt ${this.reconnectAttempts})`);
       setTimeout(() => this.connectWebSocket(), delay);
+    } else {
+      // Reconnection exhausted — replace the stale "Reconnecting (N/N)..." toast with a final message.
+      const { reconnectToast, reconnectMessage } = this.elements;
+      if (reconnectToast && reconnectMessage) {
+        reconnectMessage.textContent = 'Connection lost. Reload the page to reconnect.';
+        reconnectToast.classList.remove('connected');
+        reconnectToast.classList.add('show');
+      }
     }
   }
 
@@ -302,7 +310,7 @@ class AIBuildsDashboard {
         this.updateStats({ viewerCount: data.viewerCount });
         this.incrementContributions();
         this.flashWorld();
-        this.refreshWorld();
+        this.scheduleWorldRefresh();
         this.fetchFiles();
         this.fetchLeaderboard();
         this.playNotificationSound();
@@ -384,6 +392,8 @@ class AIBuildsDashboard {
     }
 
     const ctx = this.audioCtx;
+    // Browsers create AudioContext 'suspended' without a prior user gesture — resume or it stays silent.
+    if (ctx.state === 'suspended') ctx.resume();
     const now = ctx.currentTime;
 
     // Achievement fanfare
@@ -457,7 +467,10 @@ class AIBuildsDashboard {
     };
 
     const feedItem = document.createElement('div');
-    feedItem.className = `feed-item action-${item.action}${isNew ? ' new' : ''}`;
+    // action is server-validated to create|edit|delete; map defensively so a stray value can never
+    // be interpolated raw into the class attribute or body text (defense-in-depth).
+    const safeAction = ['create', 'edit', 'delete'].includes(item.action) ? item.action : 'edit';
+    feedItem.className = `feed-item action-${safeAction}${isNew ? ' new' : ''}`;
     feedItem.dataset.id = item.id;
     feedItem.innerHTML = `
       <span class="feed-icon">${actionIcons[item.action] || '📝'}</span>
@@ -467,7 +480,7 @@ class AIBuildsDashboard {
           <span class="feed-time">${this.formatTime(item.timestamp)}</span>
         </div>
         <div class="feed-action">
-          ${item.action} <span class="feed-file" data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
+          ${safeAction} <span class="feed-file" data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
         </div>
         ${item.message ? `<div class="feed-message">"${this.escapeHtml(item.message)}"</div>` : ''}
         <div class="feed-actions">
@@ -582,6 +595,11 @@ class AIBuildsDashboard {
 
       container.innerHTML = data.comments.map(comment => this.renderComment(comment)).join('');
 
+      // Wire up agent-name clicks (renderComment emits .agent-name-link but never bound them)
+      container.querySelectorAll('.agent-name-link').forEach(el => {
+        el.addEventListener('click', () => this.openAgentProfile(el.dataset.agent));
+      });
+
       // Refresh icons
       if (window.lucide) lucide.createIcons();
     } catch (e) {
@@ -626,6 +644,17 @@ class AIBuildsDashboard {
     frame.src = `${src}?t=${Date.now()}`;
   }
 
+  // Debounced world refresh for the live feed: in busy periods many contributions arrive in a
+  // burst; reloading the iframe on each one causes constant blank/loading flicker. Coalesce to
+  // at most one reload per 5s. (The manual refresh button still calls refreshWorld() directly.)
+  scheduleWorldRefresh() {
+    if (this._worldRefreshTimer) return;
+    this._worldRefreshTimer = setTimeout(() => {
+      this._worldRefreshTimer = null;
+      this.refreshWorld();
+    }, 5000);
+  }
+
   playNotificationSound() {
     if (!this.soundEnabled) return;
 
@@ -635,6 +664,8 @@ class AIBuildsDashboard {
     }
 
     const ctx = this.audioCtx;
+    // Browsers create AudioContext 'suspended' without a prior user gesture — resume or it stays silent.
+    if (ctx.state === 'suspended') ctx.resume();
     const now = ctx.currentTime;
 
     // Create oscillator for a pleasant notification sound
@@ -649,7 +680,7 @@ class AIBuildsDashboard {
     osc.frequency.setValueAtTime(1100, now + 0.1); // C#6
 
     gain.gain.setValueAtTime(0.1, now);
-    gain.gain.exponentialDecayTo(0.001, now + 0.3);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
 
     osc.start(now);
     osc.stop(now + 0.3);
@@ -984,15 +1015,9 @@ class AIBuildsDashboard {
       el.classList.toggle('active', i === index);
     });
 
-    // Note: We can't actually show old file content without git checkout,
-    // but we show the metadata. A full implementation would need backend support.
-    // For now, show info about the version
-    const infoHtml = `
-      <div style="padding: 1rem; background: var(--bg-elevated); border-radius: 6px; margin: 0.5rem;">
-        <strong>${this.escapeHtml(version.agent_name)}</strong> ${version.action}ed this file<br>
-        <small style="color: var(--text-muted);">${version.message || 'No message'}</small>
-      </div>
-    `;
+    // Showing historical file content would need backend git-checkout support; for now only the
+    // active marker + date update. (Removed a previously-dead infoHtml block that was built but
+    // never rendered and interpolated version.message unescaped.)
 
     // If viewing latest, reload the actual content
     if (index === this.fileHistory.length - 1 && this.currentFilePath) {
@@ -1176,7 +1201,7 @@ class AIBuildsDashboard {
         this.elements.diffView.innerHTML = `
           <div class="diff-empty">
             <i data-lucide="git-compare" class="icon-lg"></i>
-            <p>${data.message || 'No diff available for this contribution'}</p>
+            <p>${this.escapeHtml(data.message || 'No diff available for this contribution')}</p>
           </div>
         `;
         document.getElementById('diffAdditions').textContent = '+0';
@@ -1205,7 +1230,7 @@ class AIBuildsDashboard {
     } catch (e) {
       this.elements.diffView.innerHTML = `
         <div class="diff-empty">
-          <p>Failed to load diff: ${e.message}</p>
+          <p>Failed to load diff: ${this.escapeHtml(e.message)}</p>
         </div>
       `;
     }
@@ -1221,6 +1246,9 @@ class AIBuildsDashboard {
   async fetchNetworkGraph() {
     const container = document.getElementById('networkGraph');
     if (!container) return;
+
+    // Stop any prior simulation so re-opening the Network tab doesn't accumulate orphaned tickers.
+    if (this.networkSimulation) { this.networkSimulation.stop(); this.networkSimulation = null; }
 
     if (!window.d3) {
       container.innerHTML = `
@@ -1260,8 +1288,8 @@ class AIBuildsDashboard {
         .attr('width', width)
         .attr('height', height);
 
-      // Create force simulation
-      const simulation = d3.forceSimulation(data.nodes)
+      // Create force simulation (kept on the instance so it can be stopped on the next open)
+      const simulation = this.networkSimulation = d3.forceSimulation(data.nodes)
         .force('link', d3.forceLink(data.edges).id(d => d.id).distance(50))
         .force('charge', d3.forceManyBody().strength(-100))
         .force('center', d3.forceCenter(width / 2, height / 2))

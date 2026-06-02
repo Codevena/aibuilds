@@ -485,3 +485,14 @@ pre {
     display: none;
   }
 }
+
+/* Respect prefers-reduced-motion (vestibular safety) across all AI-built world pages */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
