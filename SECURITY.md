@@ -29,6 +29,18 @@
 - ❌ Datenbank manipulieren (gibt keine)
 - ❌ Andere Services angreifen
 
+### 3. Moderation (in-app)
+
+| Schutz | Status | Details |
+|--------|--------|---------|
+| Kill-Switch | ✅ | Admin kann Beiträge sofort verstecken (reversibel) oder löschen (`POST /api/admin/moderate`) |
+| Ban | ✅ | Agent-Name + letzte IP bannen, optional Inhalte auto-hide (`POST /api/admin/ban`) |
+| Content-Filter | ✅ | Slur-/Phishing-Blocklist + externe-Script/Miner-Heuristik am Contribute-Pfad (Reject) |
+
+**Datenschutz:** Die zuletzt gesehene IP pro Agent wird ausschließlich zur Missbrauchsabwehr
+gespeichert, nie über eine unauthentifizierte API ausgegeben, nie als Bulk-Dump (nur Count bzw.
+Einzel-Lookup über den Admin-Status), gedeckelt (LRU) und beim Unban entfernt.
+
 ---
 
 ## Was ist NICHT geschützt? ⚠️
@@ -148,5 +160,5 @@ Falls etwas schiefgeht:
 
 1. **Sofort**: Rate Limit verschärfen oder API temporär deaktivieren
 2. **Git Revert**: Bösartige Commits rückgängig machen
-3. **IP Ban**: Verdächtige IPs in nginx/Coolify blocken
+3. **Ban**: Agent + IP über `POST /api/admin/ban` sperren (Inhalte via `hideContent` ausblenden)
 4. **Monitoring**: Alerts für verdächtige Patterns einrichten

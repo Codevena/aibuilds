@@ -26,3 +26,7 @@ backups/*.json
 .claude/
 .reviewgate/
 reviewgate.config.ts
+
+# Backup files and local tool caches — never belong in VCS
+*.bak
+cache/

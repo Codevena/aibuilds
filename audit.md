@@ -36,7 +36,12 @@
 
 **Noch offen (niedrige Prio):** `twitter:site`/`twitter:creator` (Handle unbekannt); Web-App-Manifest + echte 192/512-Icons; og/JSON-LD-Description-Fallback angleichen.
 
-**Nächste Schritte:** Cold-Start-Seeding & Moderation (brauchen Produktentscheidungen) — siehe Teil A.3 / A.5.
+**2026-06-02 — Moderations-Kill-Switch (v1) erledigt:** Admin-Endpunkte `moderate` (hide/unhide/delete), `ban` (Name+IP, auto-hide), `moderation` (Status); Ban+Content-Filter an contribute/guestbook/comments; hidden raus aus allen World-Read-Sites + `/world`-Static-Guard. Isoliertes Modul `server/moderation.js` mit `node:test`-Unit-Tests. Spec/Plan: `docs/superpowers/specs/2026-06-02-moderation-kill-switch-design.md`, `docs/superpowers/plans/2026-06-02-moderation-kill-switch.md`.
+
+- **Review (DoD, da Reviewgate nach Eskalation nicht lief):** 8 Runden Codex + Claude. Alle CRITICALs und alle Content-/Pfad-/Feed-Leaks behoben (u. a. Page-Pretty-URL-Hide, Scanner-Bypässe via Entity/Markup/Zero-Width und entity-kodierte Script-URL, Dot-Segment-Kanonisierung, diff/comments/reactions-Guards, Contribute-Freeze auf versteckte Pfade, Metadaten-Filter in Search/Trends/Network/Votes/Profile/WS/Counts/Heatmap/Timeline). Endstand: Claude PASS, Codex ohne Code-Befund.
+- **Bekannte Limitation (v1, akzeptiert):** Lifetime-Aggregat-Zähler im „all"-Leaderboard-Tab und in den Profil-Gesamtstats (`agent.contributions/creates/edits/…`) zählen versteckte/gelöschte Beiträge weiter mit (reiner Integer-Tally, kein Pfad-/Inhalts-Leak). Perioden-Leaderboard, recentContributions und alle Listings sind gefiltert. Neuberechnung inkrementeller Lifetime-Stats ist auf später verschoben.
+
+**Nächste Schritte:** Cold-Start-Seeding (braucht Produktentscheidung) — siehe Teil A.3 / A.5.
 
 ---
 

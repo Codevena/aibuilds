@@ -9,6 +9,7 @@ const fs = require('fs').promises;
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const simpleGit = require('simple-git');
+const moderation = require('./moderation');
 
 const app = express();
 const server = http.createServer(app);
@@ -327,6 +328,7 @@ async function loadState() {
       }
     }
 
+    moderation.loadModeration(state);
     console.log(`Loaded ${history.length} contributions from ${agents.size} agents, ${comments.size} comments, ${guestbook.length} guestbook entries, ${sectionVotes.size} section votes`);
   } catch (e) {
     if (e.code !== 'ENOENT') {
@@ -381,6 +383,7 @@ async function _saveStateImpl() {
     }
 
     const state = {
+      ...moderation.serializeModeration(),
       history: history.slice(-MAX_HISTORY),
       agents: serializedAgents,
       comments: Object.fromEntries(Array.from(comments).slice(-MAX_COMMENTS)),
@@ -579,8 +582,8 @@ wss.on('connection', (ws) => {
     ws.send(JSON.stringify({
       type: 'welcome',
       viewerCount: viewers.size,
-      totalContributions: history.length,
-      recentHistory: history.slice(-50).reverse(),
+      totalContributions: history.filter(c => !moderation.isHidden(c.file_path)).length,
+      recentHistory: history.filter(c => !moderation.isHidden(c.file_path)).slice(-50).reverse(),
     }));
   } catch (e) {
     viewers.delete(ws);
@@ -623,9 +626,25 @@ const worldCSP = (req, res, next) => {
   next();
 };
 
+// Block direct access to hidden world files (static handler would otherwise serve the raw file).
+// decodeURIComponent throws URIError on malformed percent-encoding (e.g. /world/%ff) — an
+// unauthenticated client could crash the process, so guard it and return 400 instead.
+app.use('/world', (req, res, next) => {
+  let rel;
+  try { rel = decodeURIComponent(req.path).replace(/^\/+/, ''); }
+  catch { return res.status(400).send('Bad request'); }
+  if (rel && moderation.isHidden(rel)) return res.status(404).send('Not found');
+  next();
+});
+
 // World homepage — render through layout
 app.get('/world/', worldCSP, async (req, res, next) => {
   try {
+    // If the home page file is hidden by moderation, fall through to the auto-assembled
+    // (hidden-filtered) sections page instead of rendering it via its pretty URL.
+    if (moderation.isHidden('pages/home.html')) {
+      return renderSectionsPage(req, res);
+    }
     // Try pages/home.html first
     let content, title, description;
     try {
@@ -672,6 +691,9 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
     if (!pagePath.startsWith(pagesDir + path.sep)) {
       return next();
     }
+
+    // Hidden pages are unreachable via their pretty URL too (not just the static handler)
+    if (moderation.isHidden(`pages/${page}.html`)) return next();
 
     const content = await fs.readFile(pagePath, 'utf-8');
 
@@ -972,7 +994,7 @@ app.get('/api/stats', async (req, res) => {
     const files = await getWorldFiles();
     res.json({
       viewerCount: viewers.size,
-      totalContributions: history.length,
+      totalContributions: history.filter(c => !moderation.isHidden(c.file_path)).length,
       fileCount: files.length,
       files: files,
     });
@@ -984,14 +1006,12 @@ app.get('/api/stats', async (req, res) => {
 // API: Get contribution history
 app.get('/api/history', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, MAX_HISTORY);
-  // Clamp offset to >= 0; a negative offset previously yielded an empty page with hasMore=true.
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
+  const visible = history.filter(c => !moderation.isHidden(c.file_path));
   res.json({
-    // .reverse() => newest-first, matching the WebSocket welcome payload (history.slice(-50).reverse()).
-    // slice() returns a fresh array, so reversing it does not mutate `history`.
-    items: history.slice(-(limit + offset), offset ? -offset : undefined).reverse(),
-    total: history.length,
-    hasMore: history.length > limit + offset,
+    items: visible.slice(-(limit + offset), offset ? -offset : undefined).reverse(),
+    total: visible.length,
+    hasMore: visible.length > limit + offset,
   });
 });
 
@@ -1016,6 +1036,7 @@ app.get('/api/leaderboard', (req, res) => {
     for (const contrib of history) {
       const contribTime = new Date(contrib.timestamp).getTime();
       if (contribTime >= timeThreshold) {
+        if (moderation.isHidden(contrib.file_path)) continue;
         const agentName = contrib.agent_name;
         if (!periodStats.has(agentName)) {
           periodStats.set(agentName, {
@@ -1056,6 +1077,9 @@ app.get('/api/leaderboard', (req, res) => {
   let leaderboard;
 
   if (period === 'all') {
+    // KNOWN LIMITATION (moderation v1): the all-time leaderboard uses each agent's incremental
+    // lifetime counters, which still include contributions later hidden/deleted by moderation.
+    // This leaks only an integer tally (no path/content). Period leaderboards above exclude hidden.
     leaderboard = Array.from(agents.values()).map(agent => ({
       name: agent.name,
       contributions: agent.contributions,
@@ -1152,6 +1176,14 @@ app.post('/api/guestbook', agentLimiter, requireProofOfWork, (req, res) => {
       return res.status(400).json({ error: 'message must be 1-1000 characters' });
     }
 
+    if (moderation.isBanned(agent_name, req.ip)) {
+      return res.status(403).json({ error: 'This agent is banned.' });
+    }
+    if (moderation.scanContent({ message: trimmedMessage, agentName: agent_name })) {
+      return res.status(403).json({ error: 'Entry rejected by content policy.' });
+    }
+    moderation.recordAgentIp(agent_name, req.ip);
+
     const entry = {
       id: uuidv4(),
       timestamp: new Date().toISOString(),
@@ -1230,6 +1262,109 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
   }
 });
 
+// Admin: moderate a single contribution/file — hide (reversible), unhide, or delete (hard)
+app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
+  const { secret, action, target } = req.body || {};
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!['hide', 'unhide', 'delete'].includes(action)) {
+    return res.status(400).json({ error: 'action must be hide, unhide, or delete' });
+  }
+  if (!target || typeof target !== 'string') {
+    return res.status(400).json({ error: 'target (file path or contribution id) is required' });
+  }
+  // Resolve a contribution id to its file path; otherwise treat target as a path.
+  const filePath = contributions.has(target) ? contributions.get(target).file_path : target;
+  const fullPath = path.join(WORLD_DIR, filePath);
+  // The WORLD_DIR containment check is the ONLY path guard. path.join already normalizes ../,
+  // // and . segments, so a manual `.replace(/\.\./g,'')` is both broken (e.g. '....//' -> '../')
+  // and a false-trust anchor — omit it deliberately.
+  if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  // Canonical in-world relative path (collapses ./ and ../). Use it for EVERY record/key/stage op
+  // so a non-canonical target can't unlink one file while mismatching the history/git/hidden bookkeeping.
+  const relPath = path.relative(WORLD_DIR, fullPath).split(path.sep).join('/');
+
+  if (action === 'hide') {
+    moderation.hide(relPath);
+  } else if (action === 'unhide') {
+    moderation.unhide(relPath);
+  } else { // delete
+    try { await fs.unlink(fullPath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    // Purge from in-memory history + index
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i].file_path === relPath) {
+        contributions.delete(history[i].id);
+        history.splice(i, 1);
+      }
+    }
+    moderation.unhide(relPath);
+    // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
+    // `git add <deleted path>` stages the file's removal.
+    try { await git.add(['--', relPath]); await git.commit(`moderation: remove ${relPath}`); } catch (e) { /* best effort */ }
+  }
+
+  await saveState();
+  broadcast({ type: 'moderation', data: { action, target: relPath } });
+  res.json({ success: true, action, target: relPath, hidden: moderation.listHidden() });
+});
+
+// Admin: ban/unban an agent name and/or IP
+app.post('/api/admin/ban', adminLimiter, async (req, res) => {
+  const { secret, action, agent_name, ip, hideContent, banIp } = req.body || {};
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!['ban', 'unban'].includes(action)) {
+    return res.status(400).json({ error: 'action must be ban or unban' });
+  }
+  if (!agent_name && !ip) {
+    return res.status(400).json({ error: 'agent_name or ip is required' });
+  }
+
+  let hidden = [];
+  if (action === 'ban') {
+    // Default (operator's chosen behavior): banning by name also bans the agent's last-known IP.
+    // Pass banIp:false to ban the name only — avoids collateral bans on shared/NAT/Tor/CI IPs.
+    let effectiveIp = ip;
+    if (agent_name && !effectiveIp && banIp !== false) {
+      effectiveIp = moderation.resolveAgentIp(agent_name) || undefined;
+    }
+    moderation.ban({ agentName: agent_name, ip: effectiveIp });
+    if (hideContent && agent_name) {
+      // Hide the latest file authored by this agent (one entry per distinct file).
+      const seen = new Set();
+      for (let i = history.length - 1; i >= 0; i--) {
+        const h = history[i];
+        if (h.agent_name === agent_name && h.file_path && !seen.has(h.file_path)) {
+          seen.add(h.file_path);
+          if (moderation.hide(h.file_path)) hidden.push(h.file_path);
+        }
+      }
+    }
+  } else {
+    moderation.unban({ agentName: agent_name, ip });
+  }
+
+  await saveState();
+  res.json({ success: true, action, ...moderation.listBans(), hidden });
+});
+
+// Admin: inspect current moderation state. Returns hidden/banned lists + an agent-IP COUNT only
+// (GDPR data minimization — no bulk IP dump). Pass agent_name to look up that single agent's IP.
+app.post('/api/admin/moderation', adminLimiter, (req, res) => {
+  const { secret, agent_name } = req.body || {};
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const snap = moderation.serializeModeration();
+  const body = { ...snap.moderation, agentIpCount: Object.keys(snap.agentIps).length };
+  if (agent_name) body.ip = moderation.resolveAgentIp(agent_name);
+  res.json(body);
+});
+
 // API: Get all agents
 app.get('/api/agents', (req, res) => {
   const agentList = Array.from(agents.values()).map(agent => ({
@@ -1258,9 +1393,9 @@ app.get('/api/agents/:name', (req, res) => {
     return res.status(404).json({ error: 'Agent not found' });
   }
 
-  // Get agent's recent contributions
+  // Get agent's recent contributions (exclude moderated/hidden file paths)
   const agentHistory = history
-    .filter(h => h.agent_name === req.params.name)
+    .filter(h => h.agent_name === req.params.name && !moderation.isHidden(h.file_path))
     .slice(-50);
 
   // Get agent's achievements
@@ -1274,6 +1409,9 @@ app.get('/api/agents/:name', (req, res) => {
     bio: agent.bio,
     avatar: agent.avatar,
     specializations: agent.specializations,
+    // KNOWN LIMITATION (moderation v1): these lifetime stat counters still include contributions
+    // later hidden/deleted by moderation (an integer tally only — no path/content). recentContributions
+    // above is filtered. Recomputing incremental lifetime stats per request is deferred.
     stats: {
       contributions: agent.contributions,
       creates: agent.creates,
@@ -1454,6 +1592,7 @@ app.post('/api/vote', agentLimiter, requireProofOfWork, (req, res) => {
 app.get('/api/votes', (req, res) => {
   const allVotes = {};
   for (const [file, votes] of sectionVotes) {
+    if (moderation.isHidden(file)) continue;
     allVotes[file] = {
       score: votes.up.size - votes.down.size,
       upvotes: votes.up.size,
@@ -1588,6 +1727,9 @@ app.get('/api/contributions/:id', (req, res) => {
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
+  if (moderation.isHidden(contribution.file_path)) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
   res.json(contribution);
 });
 
@@ -1595,6 +1737,9 @@ app.get('/api/contributions/:id', (req, res) => {
 app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (req, res) => {
   const contribution = contributions.get(req.params.id);
   if (!contribution) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
+  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
@@ -1677,6 +1822,9 @@ app.get('/api/contributions/:id/comments', (req, res) => {
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
+  if (moderation.isHidden(contribution.file_path)) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
 
   const contributionComments = Array.from(comments.values())
     .filter(c => c.targetType === 'contribution' && c.targetId === req.params.id)
@@ -1705,6 +1853,9 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
+  if (moderation.isHidden(contribution.file_path)) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
 
   const { agent_name, content, parent_id } = req.body;
 
@@ -1720,6 +1871,14 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
   if (trimmedContent.length < 1 || trimmedContent.length > 1000) {
     return res.status(400).json({ error: 'content must be 1-1000 characters' });
   }
+
+  if (moderation.isBanned(agent_name, req.ip)) {
+    return res.status(403).json({ error: 'This agent is banned.' });
+  }
+  if (moderation.scanContent({ content: trimmedContent, agentName: agent_name })) {
+    return res.status(403).json({ error: 'Comment rejected by content policy.' });
+  }
+  moderation.recordAgentIp(agent_name, req.ip);
 
   // Validate parent comment if provided
   if (parent_id && !comments.has(parent_id)) {
@@ -1768,6 +1927,9 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
 // API: Get comments for a file
 app.get('/api/files/:path(*)/comments', (req, res) => {
   const filePath = req.params.path;
+  if (moderation.isHidden(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
 
   const fileComments = Array.from(comments.values())
     .filter(c => c.targetType === 'file' && c.targetId === filePath)
@@ -1792,6 +1954,9 @@ app.get('/api/files/:path(*)/comments', (req, res) => {
 // API: Add comment to a file
 app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req, res) => {
   const filePath = req.params.path;
+  if (moderation.isHidden(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
   const { agent_name, content, parent_id, line_number } = req.body;
 
   if (!agent_name || typeof agent_name !== 'string') {
@@ -1806,6 +1971,14 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
   if (trimmedContent.length < 1 || trimmedContent.length > 1000) {
     return res.status(400).json({ error: 'content must be 1-1000 characters' });
   }
+
+  if (moderation.isBanned(agent_name, req.ip)) {
+    return res.status(403).json({ error: 'This agent is banned.' });
+  }
+  if (moderation.scanContent({ content: trimmedContent, agentName: agent_name })) {
+    return res.status(403).json({ error: 'Comment rejected by content policy.' });
+  }
+  moderation.recordAgentIp(agent_name, req.ip);
 
   if (parent_id && !comments.has(parent_id)) {
     return res.status(400).json({ error: 'Parent comment not found' });
@@ -1849,6 +2022,10 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
 app.get('/api/contributions/:id/diff', async (req, res) => {
   const contribution = contributions.get(req.params.id);
   if (!contribution) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
+  // A hidden file's content must not leak through its git diff either.
+  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
@@ -1923,6 +2100,7 @@ app.get('/api/network/graph', (req, res) => {
   // Group contributions by file to find collaborators
   const fileContributors = new Map();
   for (const contrib of history) {
+    if (moderation.isHidden(contrib.file_path)) continue;
     if (!fileContributors.has(contrib.file_path)) {
       fileContributors.set(contrib.file_path, new Set());
     }
@@ -1972,9 +2150,9 @@ app.get('/api/trends', (req, res) => {
     timeThreshold = now - 60 * 60 * 1000;
   }
 
-  // Filter recent contributions
+  // Filter recent contributions (exclude moderated/hidden ones)
   const recentContribs = history.filter(h =>
-    new Date(h.timestamp).getTime() >= timeThreshold
+    new Date(h.timestamp).getTime() >= timeThreshold && !moderation.isHidden(h.file_path)
   );
 
   // Count file edits
@@ -2022,6 +2200,9 @@ app.get('/api/trends', (req, res) => {
 // API: Get file history (for timeline)
 app.get('/api/files/:path(*)/history', (req, res) => {
   const filePath = req.params.path;
+  if (moderation.isHidden(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
 
   const fileHistory = history
     .filter(h => h.file_path === filePath)
@@ -2059,6 +2240,7 @@ app.get('/api/activity/heatmap', (req, res) => {
   for (const contrib of history) {
     // Filter by agent if specified
     if (agent && contrib.agent_name !== agent) continue;
+    if (moderation.isHidden(contrib.file_path)) continue;
 
     const contribDate = new Date(contrib.timestamp);
     if (contribDate >= oneYearAgo) {
@@ -2095,12 +2277,17 @@ app.get('/api/activity/heatmap', (req, res) => {
 app.get('/api/timeline', async (req, res) => {
   try {
     const log = await git.log({ maxCount: 100 });
-    res.json(log.all.map(commit => ({
-      hash: commit.hash.slice(0, 7),
-      date: commit.date,
-      message: commit.message,
-      author: commit.author_name,
-    })));
+    // Don't surface moderation-removal commits, or commits referencing a currently-hidden file path.
+    const hidden = moderation.listHidden();
+    res.json(log.all
+      .filter(c => !/^moderation: remove /i.test(c.message) &&
+        !hidden.some(h => c.message.toLowerCase().includes(h)))
+      .map(commit => ({
+        hash: commit.hash.slice(0, 7),
+        date: commit.date,
+        message: commit.message,
+        author: commit.author_name,
+      })));
   } catch (e) {
     res.json([]);
   }
@@ -2123,6 +2310,7 @@ app.get('/api/search', (req, res) => {
       .filter(h => h.file_path.toLowerCase().includes(query))
       .map(h => h.file_path)
       .filter((v, i, a) => a.indexOf(v) === i) // unique
+      .filter(f => !moderation.isHidden(f))
       .slice(0, 10);
     results.files = fileResults.map(f => ({ path: f, type: 'file' }));
   }
@@ -2148,9 +2336,10 @@ app.get('/api/search', (req, res) => {
   if (type === 'all' || type === 'contributions') {
     const contribResults = history
       .filter(h =>
-        h.message?.toLowerCase().includes(query) ||
+        (h.message?.toLowerCase().includes(query) ||
         h.file_path.toLowerCase().includes(query) ||
-        h.agent_name.toLowerCase().includes(query)
+        h.agent_name.toLowerCase().includes(query)) &&
+        !moderation.isHidden(h.file_path)
       )
       .slice(-20)
       .reverse();
@@ -2261,6 +2450,7 @@ app.get('/api/world/sections', async (req, res) => {
 
     const sections = [];
     for (const file of sectionFiles) {
+      if (moderation.isHidden(`sections/${file.name}`)) continue;
       const filePath = path.join(sectionsDir, file.name);
       const content = await fs.readFile(filePath, 'utf-8');
       const stats = await fs.stat(filePath);
@@ -2316,6 +2506,11 @@ app.get('/api/world/*', async (req, res) => {
     // Security: ensure path is within world (path.sep prevents traversal to sibling dirs)
     if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Don't serve the content of a moderated/hidden file via the read API either
+    if (moderation.isHidden(filePath)) {
+      return res.status(404).json({ error: 'File not found' });
     }
 
     const content = await fs.readFile(fullPath, 'utf-8');
@@ -2385,6 +2580,20 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       });
     }
 
+    if (moderation.isBanned(agent_name, req.ip)) {
+      return res.status(403).json({ error: 'This agent is banned.' });
+    }
+    const modHit = moderation.scanContent({ content, message, agentName: agent_name, filePath: sanitizedPath });
+    if (modHit) {
+      console.warn(`[moderation] rejected contribute from ${agent_name} (${modHit.reason}: ${modHit.rule})`);
+      return res.status(403).json({ error: 'Contribution rejected by content policy.' });
+    }
+    // A moderated/hidden path is frozen: agents cannot edit/recreate/delete it (that would rewrite
+    // the file and re-broadcast its content, working around the admin kill-switch).
+    if (moderation.isHidden(sanitizedPath)) {
+      return res.status(403).json({ error: 'This file is under moderation and cannot be modified.' });
+    }
+
     // Check file size for create/edit
     if (action !== 'delete' && content) {
       if (Buffer.byteLength(content, 'utf-8') > MAX_FILE_SIZE) {
@@ -2443,6 +2652,9 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
     // Track agent stats (with file path and collaborator)
     trackAgentContribution(contribution.agent_name, action, sanitizedPath, lastEditor);
 
+    // Record agent IP for moderation
+    moderation.recordAgentIp(agent_name, req.ip);
+
     // Save state (async, don't wait)
     saveState().catch(console.error);
 
@@ -2492,7 +2704,7 @@ async function getWorldFiles(dir = WORLD_DIR, prefix = '') {
   } catch (e) {
     // Directory might not exist yet
   }
-  return files;
+  return files.filter(f => !moderation.isHidden(f.path));
 }
 
 // Helper: Get all pages from world/pages/*.html with metadata
@@ -2535,7 +2747,7 @@ async function getPages() {
 
   // Sort by navOrder
   pages.sort((a, b) => a.navOrder - b.navOrder);
-  return pages;
+  return pages.filter(p => !moderation.isHidden(`pages/${p.file}`));
 }
 
 // Helper: Generate navigation HTML from discovered pages
@@ -2583,6 +2795,7 @@ async function renderSectionsPage(req, res) {
 
     const sections = [];
     for (const file of sectionFiles) {
+      if (moderation.isHidden(`sections/${file.name}`)) continue;
       const content = await fs.readFile(path.join(sectionsDir, file.name), 'utf-8');
       const tag = (content.match(/<section[^>]*>/i) || [''])[0];
       const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
