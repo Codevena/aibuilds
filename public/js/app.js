@@ -933,7 +933,6 @@ class AIBuildsDashboard {
       }
 
       this.elements.fileModal.classList.add('open');
-      this._lastFocused = document.activeElement;
       this._trapFocus(this.elements.fileModal);
       this.elements.modalClose?.focus();
 
@@ -1087,10 +1086,8 @@ class AIBuildsDashboard {
     this._releaseFocus();
   }
 
-  // Keep Tab/Shift+Tab focus inside an open modal (ARIA dialog pattern). One modal is open at a time.
-  _trapFocus(modalEl) {
-    this._trappedModal = modalEl;
-    this._focusTrapHandler = (e) => {
+  _makeTrapHandler(modalEl) {
+    return (e) => {
       if (e.key !== 'Tab') return;
       const nodes = Array.from(modalEl.querySelectorAll(
         'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
@@ -1101,17 +1098,37 @@ class AIBuildsDashboard {
       if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
       else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     };
-    modalEl.addEventListener('keydown', this._focusTrapHandler);
   }
 
-  // Remove the trap and return focus to whatever was focused before the modal opened.
-  _releaseFocus() {
-    if (this._trappedModal && this._focusTrapHandler) {
-      this._trappedModal.removeEventListener('keydown', this._focusTrapHandler);
+  // Keep Tab/Shift+Tab focus inside the topmost open modal (ARIA dialog pattern). A stack supports
+  // modal-over-modal (e.g. opening an agent profile from the file modal's comments) and re-opening
+  // the same modal, without leaking keydown listeners.
+  _trapFocus(modalEl) {
+    if (!this._focusTrapStack) this._focusTrapStack = [];
+    const stack = this._focusTrapStack;
+    const top = stack[stack.length - 1];
+    if (top && top.modal === modalEl) {
+      // Same modal re-trapped (content re-render) — refresh its handler in place, no new level.
+      modalEl.removeEventListener('keydown', top.handler);
+      top.handler = this._makeTrapHandler(modalEl);
+      modalEl.addEventListener('keydown', top.handler);
+      return;
     }
-    this._trappedModal = null;
-    this._focusTrapHandler = null;
-    if (this._lastFocused) { this._lastFocused.focus(); this._lastFocused = null; }
+    if (top) top.modal.removeEventListener('keydown', top.handler); // pause the modal underneath
+    const handler = this._makeTrapHandler(modalEl);
+    modalEl.addEventListener('keydown', handler);
+    stack.push({ modal: modalEl, handler, lastFocused: document.activeElement });
+  }
+
+  // Pop the topmost trap, resume the one beneath (if any), and return focus to that level's opener.
+  _releaseFocus() {
+    if (!this._focusTrapStack) this._focusTrapStack = [];
+    const entry = this._focusTrapStack.pop();
+    if (!entry) return;
+    entry.modal.removeEventListener('keydown', entry.handler);
+    const parent = this._focusTrapStack[this._focusTrapStack.length - 1];
+    if (parent) parent.modal.addEventListener('keydown', parent.handler);
+    if (entry.lastFocused && typeof entry.lastFocused.focus === 'function') entry.lastFocused.focus();
   }
 
   async openAgentProfile(agentName) {
@@ -1200,7 +1217,6 @@ class AIBuildsDashboard {
 
       // Show modal
       this.elements.agentModal.classList.add('open');
-      this._lastFocused = document.activeElement;
       this._trapFocus(this.elements.agentModal);
       this.elements.agentModalClose?.focus();
 
@@ -1229,7 +1245,6 @@ class AIBuildsDashboard {
       </div>
     `;
     this.elements.diffModal.classList.add('open');
-    this._lastFocused = document.activeElement;
     this._trapFocus(this.elements.diffModal);
     this.elements.diffModalClose?.focus();
 
@@ -1544,7 +1559,7 @@ class AIBuildsDashboard {
       } else {
         agentsEl.innerHTML = data.activeAgents.map(a => `
           <div class="trend-item">
-            <span class="trend-item-name agent-name-link" data-agent="${this.escapeHtml(a.name)}">${this.escapeHtml(a.name)}</span>
+            <span class="trend-item-name agent-name-link" tabindex="0" role="button" data-agent="${this.escapeHtml(a.name)}">${this.escapeHtml(a.name)}</span>
             <span class="trend-item-value">${a.contributions}</span>
           </div>
         `).join('');
