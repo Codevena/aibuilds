@@ -490,7 +490,7 @@ class AIBuildsDashboard {
           <span class="feed-time">${this.formatTime(item.timestamp)}</span>
         </div>
         <div class="feed-action">
-          ${safeAction} <span class="feed-file" tabindex="0" role="button" data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
+          ${safeAction} <span class="feed-file"${item.action !== 'delete' ? ' tabindex="0" role="button"' : ''} data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
         </div>
         ${item.message ? `<div class="feed-message">"${this.escapeHtml(item.message)}"</div>` : ''}
         <div class="feed-actions">
