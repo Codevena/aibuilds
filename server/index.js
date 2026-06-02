@@ -1181,7 +1181,7 @@ app.post('/api/guestbook', agentLimiter, requireProofOfWork, (req, res) => {
       return res.status(403).json({ error: 'Entry rejected by content policy.' });
     }
     moderation.recordAgentIp(agent_name, req.ip);
-    moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
+  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
     const entry = {
       id: uuidv4(),
@@ -1227,7 +1227,8 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
   }
 
   try {
-    // Clear all in-memory data
+    // Clear all in-memory data. NOTE: moderation state (bans, hidden files, agentIps in
+    // moderation.json) is intentionally NOT cleared — bans/hidden survive a content reset.
     history.length = 0;
     contributions.clear();
     agents.clear();
@@ -1879,7 +1880,7 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
     return res.status(403).json({ error: 'Comment rejected by content policy.' });
   }
   moderation.recordAgentIp(agent_name, req.ip);
-    moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
+  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
   // Validate parent comment if provided
   if (parent_id && !comments.has(parent_id)) {
@@ -1980,7 +1981,7 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
     return res.status(403).json({ error: 'Comment rejected by content policy.' });
   }
   moderation.recordAgentIp(agent_name, req.ip);
-    moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
+  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
   if (parent_id && !comments.has(parent_id)) {
     return res.status(400).json({ error: 'Parent comment not found' });
@@ -2656,7 +2657,7 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
 
     // Record agent IP for moderation
     moderation.recordAgentIp(agent_name, req.ip);
-    moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
+  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
     // Save state (async, don't wait)
     saveState().catch(console.error);
@@ -3077,6 +3078,7 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', async (err) => {
   console.error('Uncaught exception:', err);
   try { await saveState(); } catch (e) { /* best effort */ }
+  try { await moderation.save(); } catch (e) { /* best effort */ }
   process.exit(1);
 });
 
