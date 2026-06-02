@@ -1036,6 +1036,7 @@ app.get('/api/leaderboard', (req, res) => {
     for (const contrib of history) {
       const contribTime = new Date(contrib.timestamp).getTime();
       if (contribTime >= timeThreshold) {
+        if (moderation.isHidden(contrib.file_path)) continue;
         const agentName = contrib.agent_name;
         if (!periodStats.has(agentName)) {
           periodStats.set(agentName, {
@@ -2580,6 +2581,11 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
     if (modHit) {
       console.warn(`[moderation] rejected contribute from ${agent_name} (${modHit.reason}: ${modHit.rule})`);
       return res.status(403).json({ error: 'Contribution rejected by content policy.' });
+    }
+    // A moderated/hidden path is frozen: agents cannot edit/recreate/delete it (that would rewrite
+    // the file and re-broadcast its content, working around the admin kill-switch).
+    if (moderation.isHidden(sanitizedPath)) {
+      return res.status(403).json({ error: 'This file is under moderation and cannot be modified.' });
     }
 
     // Check file size for create/edit
