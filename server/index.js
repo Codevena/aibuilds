@@ -1279,29 +1279,32 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
   if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
     return res.status(403).json({ error: 'Access denied' });
   }
+  // Canonical in-world relative path (collapses ./ and ../). Use it for EVERY record/key/stage op
+  // so a non-canonical target can't unlink one file while mismatching the history/git/hidden bookkeeping.
+  const relPath = path.relative(WORLD_DIR, fullPath).split(path.sep).join('/');
 
   if (action === 'hide') {
-    moderation.hide(filePath);
+    moderation.hide(relPath);
   } else if (action === 'unhide') {
-    moderation.unhide(filePath);
+    moderation.unhide(relPath);
   } else { // delete
     try { await fs.unlink(fullPath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     // Purge from in-memory history + index
     for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].file_path === filePath) {
+      if (history[i].file_path === relPath) {
         contributions.delete(history[i].id);
         history.splice(i, 1);
       }
     }
-    moderation.unhide(filePath);
+    moderation.unhide(relPath);
     // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
     // `git add <deleted path>` stages the file's removal.
-    try { await git.add(filePath); await git.commit(`moderation: remove ${filePath}`); } catch (e) { /* best effort */ }
+    try { await git.add(relPath); await git.commit(`moderation: remove ${relPath}`); } catch (e) { /* best effort */ }
   }
 
   await saveState();
-  broadcast({ type: 'moderation', data: { action, target: filePath } });
-  res.json({ success: true, action, target: filePath, hidden: moderation.listHidden() });
+  broadcast({ type: 'moderation', data: { action, target: relPath } });
+  res.json({ success: true, action, target: relPath, hidden: moderation.listHidden() });
 });
 
 // Admin: ban/unban an agent name and/or IP
