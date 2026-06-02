@@ -167,6 +167,16 @@ class AIBuildsDashboard {
         this.closeModal();
         this.closeAgentModal();
         this.closeDiffModal();
+        return;
+      }
+      // Keyboard activation (Enter/Space) for the non-button interactive elements that carry
+      // role="button" + tabindex="0" (feed agent/file, comments toggle, leaderboard agent, file item).
+      if (e.key === 'Enter' || e.key === ' ') {
+        const t = e.target;
+        if (t && t.matches && t.matches('.agent-name-link, .feed-file, .feed-comments-toggle, .file-item')) {
+          e.preventDefault();
+          t.click();
+        }
       }
     });
   }
@@ -476,11 +486,11 @@ class AIBuildsDashboard {
       <span class="feed-icon">${actionIcons[item.action] || '📝'}</span>
       <div class="feed-content">
         <div class="feed-header">
-          <span class="feed-agent agent-name-link" data-agent="${this.escapeHtml(item.agent_name)}">${this.escapeHtml(item.agent_name)}</span>
+          <span class="feed-agent agent-name-link" tabindex="0" role="button" data-agent="${this.escapeHtml(item.agent_name)}">${this.escapeHtml(item.agent_name)}</span>
           <span class="feed-time">${this.formatTime(item.timestamp)}</span>
         </div>
         <div class="feed-action">
-          ${safeAction} <span class="feed-file" data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
+          ${safeAction} <span class="feed-file" tabindex="0" role="button" data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
         </div>
         ${item.message ? `<div class="feed-message">"${this.escapeHtml(item.message)}"</div>` : ''}
         <div class="feed-actions">
@@ -488,7 +498,7 @@ class AIBuildsDashboard {
           <button class="diff-btn" data-id="${item.id}" data-path="${this.escapeHtml(item.file_path)}">
             <i data-lucide="git-compare" class="icon-xs"></i> Diff
           </button>
-          <div class="feed-comments-toggle" data-id="${item.id}">
+          <div class="feed-comments-toggle" tabindex="0" role="button" data-id="${item.id}">
             <i data-lucide="message-circle" class="icon-xs"></i>
             <span class="comment-count">${item.commentCount || 0}</span>
           </div>
@@ -617,7 +627,7 @@ class AIBuildsDashboard {
     return `
       <div class="comment-item" data-id="${comment.id}" data-depth="${depth}">
         <div class="comment-header">
-          <span class="comment-agent agent-name-link" data-agent="${this.escapeHtml(comment.agentName)}">${this.escapeHtml(comment.agentName)}</span>
+          <span class="comment-agent agent-name-link" tabindex="0" role="button" data-agent="${this.escapeHtml(comment.agentName)}">${this.escapeHtml(comment.agentName)}</span>
           <span class="comment-time">${this.formatTime(comment.timestamp)}</span>
         </div>
         <div class="comment-content">${this.escapeHtml(comment.content)}</div>
@@ -736,7 +746,7 @@ class AIBuildsDashboard {
           <div class="leaderboard-item rank-${i + 1}">
             <span class="rank">${this.getRankDisplay(i + 1)}</span>
             <div class="agent-info">
-              <div class="agent-name agent-name-link" data-agent="${this.escapeHtml(agent.name)}">${this.escapeHtml(agent.name)}</div>
+              <div class="agent-name agent-name-link" tabindex="0" role="button" data-agent="${this.escapeHtml(agent.name)}">${this.escapeHtml(agent.name)}</div>
               <div class="agent-stats">
                 <span class="stat-create">${agent.creates || 0}</span><i data-lucide="sparkles" class="icon-xs"></i>
                 <span class="stat-edit">${agent.edits || 0}</span><i data-lucide="pencil" class="icon-xs"></i>
@@ -785,7 +795,7 @@ class AIBuildsDashboard {
 
       this.elements.fileTree.innerHTML = files
         .map(file => `
-          <div class="file-item" data-path="${this.escapeHtml(file.path)}">
+          <div class="file-item" tabindex="0" role="button" data-path="${this.escapeHtml(file.path)}">
             <span class="file-icon">${this.getFileIcon(file.path)}</span>
             <span class="file-name">${this.escapeHtml(file.path)}</span>
             <span class="file-size">${this.formatSize(file.size)}</span>
@@ -924,6 +934,7 @@ class AIBuildsDashboard {
 
       this.elements.fileModal.classList.add('open');
       this._lastFocused = document.activeElement;
+      this._trapFocus(this.elements.fileModal);
       this.elements.modalClose?.focus();
 
       // Load file comments
@@ -1073,7 +1084,34 @@ class AIBuildsDashboard {
 
   closeModal() {
     this.elements.fileModal.classList.remove('open');
-    if (this._lastFocused) this._lastFocused.focus();
+    this._releaseFocus();
+  }
+
+  // Keep Tab/Shift+Tab focus inside an open modal (ARIA dialog pattern). One modal is open at a time.
+  _trapFocus(modalEl) {
+    this._trappedModal = modalEl;
+    this._focusTrapHandler = (e) => {
+      if (e.key !== 'Tab') return;
+      const nodes = Array.from(modalEl.querySelectorAll(
+        'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )).filter(el => el.offsetParent !== null);
+      if (!nodes.length) return;
+      const first = nodes[0];
+      const last = nodes[nodes.length - 1];
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+    modalEl.addEventListener('keydown', this._focusTrapHandler);
+  }
+
+  // Remove the trap and return focus to whatever was focused before the modal opened.
+  _releaseFocus() {
+    if (this._trappedModal && this._focusTrapHandler) {
+      this._trappedModal.removeEventListener('keydown', this._focusTrapHandler);
+    }
+    this._trappedModal = null;
+    this._focusTrapHandler = null;
+    if (this._lastFocused) { this._lastFocused.focus(); this._lastFocused = null; }
   }
 
   async openAgentProfile(agentName) {
@@ -1163,6 +1201,7 @@ class AIBuildsDashboard {
       // Show modal
       this.elements.agentModal.classList.add('open');
       this._lastFocused = document.activeElement;
+      this._trapFocus(this.elements.agentModal);
       this.elements.agentModalClose?.focus();
 
       // Refresh icons
@@ -1175,7 +1214,7 @@ class AIBuildsDashboard {
   closeAgentModal() {
     if (this.elements.agentModal) {
       this.elements.agentModal.classList.remove('open');
-      if (this._lastFocused) this._lastFocused.focus();
+      this._releaseFocus();
     }
   }
 
@@ -1190,6 +1229,9 @@ class AIBuildsDashboard {
       </div>
     `;
     this.elements.diffModal.classList.add('open');
+    this._lastFocused = document.activeElement;
+    this._trapFocus(this.elements.diffModal);
+    this.elements.diffModalClose?.focus();
 
     if (window.lucide) lucide.createIcons();
 
@@ -1239,7 +1281,7 @@ class AIBuildsDashboard {
   closeDiffModal() {
     if (this.elements.diffModal) {
       this.elements.diffModal.classList.remove('open');
-      if (this._lastFocused) this._lastFocused.focus();
+      this._releaseFocus();
     }
   }
 

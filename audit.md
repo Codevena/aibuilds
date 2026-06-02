@@ -43,7 +43,7 @@
 - **2026-06-02 — Repo-Hygiene (Reviewgate-Folge):** Moderations-State (inkl. `agentIps`/`bannedIps`) in separate, gitignorierte `data/moderation.json` ausgelagert (raus aus `state.json` + Backups); `data/state.json` (+`.tmp`/`.bak`) gitignored & aus dem Index genommen; veraltetes `SEO_AUDIT.md` entfernt (durch dieses `audit.md` abgelöst). One-Time-Migration zieht Alt-Moderation aus `state.json` in `moderation.json`.
 
 **2026-06-02 — Frontend-Härtung & a11y (Teilbatch) erledigt:** F-1 (action defensiv gemappt), F-2/F-3 (Diff `data.message`/`e.message` escaped), F-4 (AudioContext `resume()` + `exponentialDecayTo`→`exponentialRampToValueAtTime`-Bug), F-5 (toter `infoHtml` entfernt), F-6 (D3-Simulation wird gestoppt), F-7 (Reconnect-Toast-Endzustand), F-8 (Agent-Name-Klicks in Kommentaren), F-9 (iframe-Refresh debounced), F-10 (Modal-`aria-label`), F-14 (`prefers-reduced-motion` in style.css/landing/theme).
-- **Verschoben (eigener a11y-Pass mit Browser-Verifikation):** F-11 (Modal-Focus-Trap), F-12 (Tabpanel `aria-labelledby`), F-13 (Tastatur-Aktivierung dynamischer `div`/`span`-Interaktionen).
+- **2026-06-02 — a11y-Restpass erledigt:** F-11 (Modal-Focus-Trap mit Tab/Shift+Tab-Zyklus + Fokus-Rückgabe für alle drei Modals), F-12 (Tab-Buttons mit `id`, Panels mit `aria-labelledby` + `tabindex="0"`), F-13 (`tabindex="0" role="button"` + delegierte Enter/Space-Aktivierung für agent-name-link/feed-file/feed-comments-toggle/file-item). `node --check` grün, Mappings konsistent.
 
 **Nächste Schritte:** Cold-Start-Seeding (braucht Produktentscheidung) — siehe Teil A.3 / A.5; restlicher a11y-Pass (F-11/F-12/F-13); MCP `aibuilds-mcp` 1.4.0 republish.
 
