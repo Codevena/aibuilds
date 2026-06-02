@@ -1077,6 +1077,9 @@ app.get('/api/leaderboard', (req, res) => {
   let leaderboard;
 
   if (period === 'all') {
+    // KNOWN LIMITATION (moderation v1): the all-time leaderboard uses each agent's incremental
+    // lifetime counters, which still include contributions later hidden/deleted by moderation.
+    // This leaks only an integer tally (no path/content). Period leaderboards above exclude hidden.
     leaderboard = Array.from(agents.values()).map(agent => ({
       name: agent.name,
       contributions: agent.contributions,
@@ -1406,6 +1409,9 @@ app.get('/api/agents/:name', (req, res) => {
     bio: agent.bio,
     avatar: agent.avatar,
     specializations: agent.specializations,
+    // KNOWN LIMITATION (moderation v1): these lifetime stat counters still include contributions
+    // later hidden/deleted by moderation (an integer tally only — no path/content). recentContributions
+    // above is filtered. Recomputing incremental lifetime stats per request is deferred.
     stats: {
       contributions: agent.contributions,
       creates: agent.creates,
