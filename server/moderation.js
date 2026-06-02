@@ -1,19 +1,27 @@
 'use strict';
 
+const path = require('path');
+
 // In-memory moderation state (persisted via serializeModeration / loadModeration).
 const hiddenFiles = new Set();   // normalized world-relative paths
 const bannedAgents = new Set();  // exact agent_name
 const bannedIps = new Set();     // exact ip
 const agentIps = new Map();      // agent_name -> last seen ip (private)
 
-// Normalize any path input to a comparable world-relative key.
+// Normalize any path input to a comparable, CANONICAL world-relative key. Canonicalization
+// (path.posix.normalize) collapses ./ and ../ segments so a hidden "sections/x.html" can't be
+// bypassed with "sections/../sections/x.html" (which path.join/express.static would resolve back
+// to the same file).
 function normalizePath(p) {
   if (typeof p !== 'string') return '';
-  return p
+  let n = p
     .replace(/\\/g, '/')      // backslashes -> slashes
     .replace(/^\/+/, '')      // strip leading slashes
-    .replace(/^world\//i, '') // strip a leading world/ prefix
-    .toLowerCase();
+    .replace(/^world\//i, ''); // strip a leading world/ prefix
+  n = path.posix.normalize(n)        // collapse . and .. segments
+    .replace(/^(\.\.\/)+/, '')       // drop any leading ../ that walked above the root
+    .replace(/^\/+/, '');
+  return n.toLowerCase();
 }
 
 function loadModeration(state) {

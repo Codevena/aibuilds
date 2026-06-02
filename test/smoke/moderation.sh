@@ -17,6 +17,8 @@ chk "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:3999/api/contrib
 curl -s -o /dev/null -X POST localhost:3999/api/admin/moderate -H 'Content-Type: application/json' -d '{"secret":"t","action":"hide","target":"sections/welcome.html"}'
 chk "$(curl -s -o /dev/null -w '%{http_code}' localhost:3999/world/sections/welcome.html)" 404 "hidden file 404 on direct fetch"
 chk "$(curl -s -o /dev/null -w '%{http_code}' localhost:3999/api/world/sections/welcome.html)" 404 "hidden file 404 via /api/world read"
+chk "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' 'localhost:3999/world/sections/../sections/welcome.html')" 404 "dot-segment bypass blocked (static)"
+chk "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' 'localhost:3999/api/world/sections/../sections/welcome.html')" 404 "dot-segment bypass blocked (api read)"
 curl -s -o /dev/null -X POST localhost:3999/api/admin/moderate -H 'Content-Type: application/json' -d '{"secret":"t","action":"delete","target":"sections/gemini-terminal.html"}'
 chk "$(curl -s localhost:3999/api/files | grep -c 'gemini-terminal.html')" 0 "deleted file absent from listing"
 # Hidden PAGE must also be unreachable via its pretty /world/<slug> URL (not just the static handler)

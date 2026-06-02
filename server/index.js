@@ -583,7 +583,7 @@ wss.on('connection', (ws) => {
       type: 'welcome',
       viewerCount: viewers.size,
       totalContributions: history.length,
-      recentHistory: history.slice(-50).reverse(),
+      recentHistory: history.filter(c => !moderation.isHidden(c.file_path)).slice(-50).reverse(),
     }));
   } catch (e) {
     viewers.delete(ws);
@@ -1808,6 +1808,9 @@ app.get('/api/contributions/:id/comments', (req, res) => {
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
+  if (moderation.isHidden(contribution.file_path)) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
 
   const contributionComments = Array.from(comments.values())
     .filter(c => c.targetType === 'contribution' && c.targetId === req.params.id)
@@ -1834,6 +1837,9 @@ app.get('/api/contributions/:id/comments', (req, res) => {
 app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (req, res) => {
   const contribution = contributions.get(req.params.id);
   if (!contribution) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
+  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
@@ -1907,6 +1913,9 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
 // API: Get comments for a file
 app.get('/api/files/:path(*)/comments', (req, res) => {
   const filePath = req.params.path;
+  if (moderation.isHidden(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
 
   const fileComments = Array.from(comments.values())
     .filter(c => c.targetType === 'file' && c.targetId === filePath)
@@ -1931,6 +1940,9 @@ app.get('/api/files/:path(*)/comments', (req, res) => {
 // API: Add comment to a file
 app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req, res) => {
   const filePath = req.params.path;
+  if (moderation.isHidden(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
   const { agent_name, content, parent_id, line_number } = req.body;
 
   if (!agent_name || typeof agent_name !== 'string') {
@@ -1996,6 +2008,10 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
 app.get('/api/contributions/:id/diff', async (req, res) => {
   const contribution = contributions.get(req.params.id);
   if (!contribution) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
+  // A hidden file's content must not leak through its git diff either.
+  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
@@ -2169,6 +2185,9 @@ app.get('/api/trends', (req, res) => {
 // API: Get file history (for timeline)
 app.get('/api/files/:path(*)/history', (req, res) => {
   const filePath = req.params.path;
+  if (moderation.isHidden(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
 
   const fileHistory = history
     .filter(h => h.file_path === filePath)
@@ -2270,6 +2289,7 @@ app.get('/api/search', (req, res) => {
       .filter(h => h.file_path.toLowerCase().includes(query))
       .map(h => h.file_path)
       .filter((v, i, a) => a.indexOf(v) === i) // unique
+      .filter(f => !moderation.isHidden(f))
       .slice(0, 10);
     results.files = fileResults.map(f => ({ path: f, type: 'file' }));
   }
@@ -2295,9 +2315,10 @@ app.get('/api/search', (req, res) => {
   if (type === 'all' || type === 'contributions') {
     const contribResults = history
       .filter(h =>
-        h.message?.toLowerCase().includes(query) ||
+        (h.message?.toLowerCase().includes(query) ||
         h.file_path.toLowerCase().includes(query) ||
-        h.agent_name.toLowerCase().includes(query)
+        h.agent_name.toLowerCase().includes(query)) &&
+        !moderation.isHidden(h.file_path)
       )
       .slice(-20)
       .reverse();
