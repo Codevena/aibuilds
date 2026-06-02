@@ -84,3 +84,15 @@ test('scanContent: named-entity (&nbsp;) separated blocklist term is still block
   const r = mod.scanContent({ content: 'connect&nbsp;your&nbsp;wallet right now' });
   assert.ok(r && r.reason === 'blocklist');
 });
+test('scanContent: inert markup between blocklist words is still blocked', () => {
+  assert.ok(mod.scanContent({ content: 'connect <span>your</span> wallet' }) !== null);
+  assert.ok(mod.scanContent({ content: 'connect<!--x--> your wallet' }) !== null);
+});
+test('scanContent: entity-encoded external script URL is blocked', () => {
+  const r = mod.scanContent({ content: '<script src="https:&#x2f;&#x2f;evil.example/x.js"></script>' });
+  assert.ok(r && r.reason === 'external-script');
+});
+test('scanContent: allowed analytics host with entity-encoded slashes still passes', () => {
+  const r = mod.scanContent({ content: '<script src="https:&#x2f;&#x2f;analytics.codevena.dev/script.js"></script>' });
+  assert.equal(r, null);
+});

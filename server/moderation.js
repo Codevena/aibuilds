@@ -107,16 +107,24 @@ const SLUR_TERMS = [];
 const MINER_RE = /(coinhive|cryptonight|eval\s*\(\s*atob\s*\(|new\s+function\s*\(\s*atob\s*\()/i;
 const ALLOWED_SCRIPT_HOSTS = new Set(['analytics.codevena.dev']);
 
-// Decode the tricks an attacker uses to render a blocked phrase while dodging raw-string regexes:
-// HTML numeric/named entities, zero-width & soft-hyphen separators, and compatibility forms.
-function normalizeForScan(s) {
+// Decode HTML numeric/named entities (incl. whitespace/zero-width ones attackers use to split a
+// blocked phrase). Used both to normalize text for matching and to resolve a <script src> URL.
+function decodeHtmlEntities(s) {
   return String(s || '')
     .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ''; } })
     .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch { return ''; } })
-    // named entities, incl. whitespace/zero-width ones attackers use to split a blocked phrase
     .replace(/&(amp|lt|gt|quot|apos|nbsp|ensp|emsp|thinsp|hairsp|zwnj|zwj|zwsp|ZeroWidthSpace|shy);/gi,
       (m, n) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', ensp: ' ', emsp: ' ',
-        thinsp: ' ', hairsp: ' ', zwnj: '', zwj: '', zwsp: '', zerowidthspace: '', shy: '' }[n.toLowerCase()] ?? m))
+        thinsp: ' ', hairsp: ' ', zwnj: '', zwj: '', zwsp: '', zerowidthspace: '', shy: '' }[n.toLowerCase()] ?? m));
+}
+
+// Normalize text for blocklist/keyword matching: decode entities, strip HTML comments & inert tags
+// (so `connect <span>your</span> wallet` and `connect<!--x--> your wallet` are caught), drop
+// zero-width chars, NFKC, collapse whitespace.
+function normalizeForScan(s) {
+  return decodeHtmlEntities(s)
+    .replace(/<!--[\s\S]*?-->/g, ' ')   // HTML comments inserted between words
+    .replace(/<\/?[a-z][^>]*>/gi, ' ')  // inert markup tags between words
     .replace(/[​-‍⁠﻿­]/g, '') // strip zero-width/joiner/word-joiner/BOM/soft-hyphen
     .normalize('NFKC')
     .replace(/\s+/g, ' '); // collapse NBSP/thin/en/em + runs to a single space so split phrases match
@@ -128,11 +136,12 @@ function scanContent({ content = '', message = '', agentName = '', filePath = ''
   const lower = haystack.toLowerCase();
   for (const term of SLUR_TERMS) if (lower.includes(term.toLowerCase())) return { reason: 'blocklist', rule: 'slur' };
   if (MINER_RE.test(haystack)) return { reason: 'miner-or-obfuscation', rule: MINER_RE.source };
-  // Construct the script-src regex inline (fresh, no shared /g lastIndex state). Executable
-  // <script src> must be literal HTML, so this scans raw content (not the entity-decoded haystack).
+  // Find <script src=...> in raw content (the tag must be literal HTML). The URL VALUE, however,
+  // is HTML-decoded by the browser, so decode + de-whitespace it before the host check — otherwise
+  // `https:&#x2f;&#x2f;evil/x.js` (executable after decoding) would slip past the allowlist.
   const scriptSrcRe = /<script\b[^>]*\bsrc\s*=\s*["']?([^"'>\s]+)/gi;
   for (const m of content.matchAll(scriptSrcRe)) {
-    let src = m[1];
+    let src = decodeHtmlEntities(m[1]).replace(/\s+/g, '');
     if (src.startsWith('//')) src = 'https:' + src;
     if (/^https?:\/\//i.test(src)) {
       let host;

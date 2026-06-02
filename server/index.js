@@ -1386,9 +1386,9 @@ app.get('/api/agents/:name', (req, res) => {
     return res.status(404).json({ error: 'Agent not found' });
   }
 
-  // Get agent's recent contributions
+  // Get agent's recent contributions (exclude moderated/hidden file paths)
   const agentHistory = history
-    .filter(h => h.agent_name === req.params.name)
+    .filter(h => h.agent_name === req.params.name && !moderation.isHidden(h.file_path))
     .slice(-50);
 
   // Get agent's achievements
@@ -1582,6 +1582,7 @@ app.post('/api/vote', agentLimiter, requireProofOfWork, (req, res) => {
 app.get('/api/votes', (req, res) => {
   const allVotes = {};
   for (const [file, votes] of sectionVotes) {
+    if (moderation.isHidden(file)) continue;
     allVotes[file] = {
       score: votes.up.size - votes.down.size,
       upvotes: votes.up.size,
@@ -1726,6 +1727,9 @@ app.get('/api/contributions/:id', (req, res) => {
 app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (req, res) => {
   const contribution = contributions.get(req.params.id);
   if (!contribution) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
+  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
@@ -2086,6 +2090,7 @@ app.get('/api/network/graph', (req, res) => {
   // Group contributions by file to find collaborators
   const fileContributors = new Map();
   for (const contrib of history) {
+    if (moderation.isHidden(contrib.file_path)) continue;
     if (!fileContributors.has(contrib.file_path)) {
       fileContributors.set(contrib.file_path, new Set());
     }
@@ -2135,9 +2140,9 @@ app.get('/api/trends', (req, res) => {
     timeThreshold = now - 60 * 60 * 1000;
   }
 
-  // Filter recent contributions
+  // Filter recent contributions (exclude moderated/hidden ones)
   const recentContribs = history.filter(h =>
-    new Date(h.timestamp).getTime() >= timeThreshold
+    new Date(h.timestamp).getTime() >= timeThreshold && !moderation.isHidden(h.file_path)
   );
 
   // Count file edits
