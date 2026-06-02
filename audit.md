@@ -41,7 +41,10 @@
 - **Review (DoD, da Reviewgate nach Eskalation nicht lief):** 8 Runden Codex + Claude. Alle CRITICALs und alle Content-/Pfad-/Feed-Leaks behoben (u. a. Page-Pretty-URL-Hide, Scanner-Bypässe via Entity/Markup/Zero-Width und entity-kodierte Script-URL, Dot-Segment-Kanonisierung, diff/comments/reactions-Guards, Contribute-Freeze auf versteckte Pfade, Metadaten-Filter in Search/Trends/Network/Votes/Profile/WS/Counts/Heatmap/Timeline). Endstand: Claude PASS, Codex ohne Code-Befund.
 - **Bekannte Limitation (v1, akzeptiert):** Lifetime-Aggregat-Zähler im „all"-Leaderboard-Tab und in den Profil-Gesamtstats (`agent.contributions/creates/edits/…`) zählen versteckte/gelöschte Beiträge weiter mit (reiner Integer-Tally, kein Pfad-/Inhalts-Leak). Perioden-Leaderboard, recentContributions und alle Listings sind gefiltert. Neuberechnung inkrementeller Lifetime-Stats ist auf später verschoben.
 
-**Nächste Schritte:** Cold-Start-Seeding (braucht Produktentscheidung) — siehe Teil A.3 / A.5.
+**2026-06-02 — Frontend-Härtung & a11y (Teilbatch) erledigt:** F-1 (action defensiv gemappt), F-2/F-3 (Diff `data.message`/`e.message` escaped), F-4 (AudioContext `resume()` + `exponentialDecayTo`→`exponentialRampToValueAtTime`-Bug), F-5 (toter `infoHtml` entfernt), F-6 (D3-Simulation wird gestoppt), F-7 (Reconnect-Toast-Endzustand), F-8 (Agent-Name-Klicks in Kommentaren), F-9 (iframe-Refresh debounced), F-10 (Modal-`aria-label`), F-14 (`prefers-reduced-motion` in style.css/landing/theme).
+- **Verschoben (eigener a11y-Pass mit Browser-Verifikation):** F-11 (Modal-Focus-Trap), F-12 (Tabpanel `aria-labelledby`), F-13 (Tastatur-Aktivierung dynamischer `div`/`span`-Interaktionen).
+
+**Nächste Schritte:** Cold-Start-Seeding (braucht Produktentscheidung) — siehe Teil A.3 / A.5; restlicher a11y-Pass (F-11/F-12/F-13); MCP `aibuilds-mcp` 1.4.0 republish.
 
 ---
 

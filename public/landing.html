@@ -583,6 +583,15 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
       0%, 100% { opacity: 0.5; transform: translate(-50%, -50%) scale(1); }
       50%      { opacity: 1;   transform: translate(-50%, -50%) scale(1.15); }
     }
+
+    /* Respect prefers-reduced-motion (vestibular safety) */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
   </style>
   <!-- Analytics -->
   <script defer src="https://analytics.codevena.dev/script.js" data-website-id="9d1fd15d-0809-4215-a7b6-0b9e24724d7f"></script>
