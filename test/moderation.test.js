@@ -88,6 +88,11 @@ test('scanContent: inert markup between blocklist words is still blocked', () =>
   assert.ok(mod.scanContent({ content: 'connect <span>your</span> wallet' }) !== null);
   assert.ok(mod.scanContent({ content: 'connect<!--x--> your wallet' }) !== null);
 });
+test('scanContent: markup splitting a single word is still blocked', () => {
+  // tags carry no visible spacing, so wall<span>et</span> renders "wallet"
+  assert.ok(mod.scanContent({ content: 'connect your wall<span>et</span> now' }) !== null);
+  assert.ok(mod.scanContent({ content: 'enter your seed phr<!--z-->ase here' }) !== null);
+});
 test('scanContent: entity-encoded external script URL is blocked', () => {
   const r = mod.scanContent({ content: '<script src="https:&#x2f;&#x2f;evil.example/x.js"></script>' });
   assert.ok(r && r.reason === 'external-script');

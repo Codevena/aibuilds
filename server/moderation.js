@@ -123,8 +123,8 @@ function decodeHtmlEntities(s) {
 // zero-width chars, NFKC, collapse whitespace.
 function normalizeForScan(s) {
   return decodeHtmlEntities(s)
-    .replace(/<!--[\s\S]*?-->/g, ' ')   // HTML comments inserted between words
-    .replace(/<\/?[a-z][^>]*>/gi, ' ')  // inert markup tags between words
+    .replace(/<!--[\s\S]*?-->/g, '')   // remove HTML comments (so wall<!--x-->et -> wallet)
+    .replace(/<\/?[a-z][^>]*>/gi, '')  // remove inert tags (visible spacing comes from real whitespace, not tags)
     .replace(/[​-‍⁠﻿­]/g, '') // strip zero-width/joiner/word-joiner/BOM/soft-hyphen
     .normalize('NFKC')
     .replace(/\s+/g, ' '); // collapse NBSP/thin/en/em + runs to a single space so split phrases match

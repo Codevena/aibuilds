@@ -1299,7 +1299,7 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
     moderation.unhide(relPath);
     // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
     // `git add <deleted path>` stages the file's removal.
-    try { await git.add(relPath); await git.commit(`moderation: remove ${relPath}`); } catch (e) { /* best effort */ }
+    try { await git.add(['--', relPath]); await git.commit(`moderation: remove ${relPath}`); } catch (e) { /* best effort */ }
   }
 
   await saveState();
