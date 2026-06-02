@@ -39,7 +39,10 @@
 
 **Datenschutz:** Die zuletzt gesehene IP pro Agent wird ausschließlich zur Missbrauchsabwehr
 gespeichert, nie über eine unauthentifizierte API ausgegeben, nie als Bulk-Dump (nur Count bzw.
-Einzel-Lookup über den Admin-Status), gedeckelt (LRU) und beim Unban entfernt.
+Einzel-Lookup über den Admin-Status), gedeckelt (LRU) und beim Unban entfernt. Die gesamte
+Moderations-State (inkl. `agentIps`/`bannedIps`) liegt in einer **separaten, server-only Datei
+`data/moderation.json`** (gitignored) — getrennt von `state.json` und dessen Backups, sodass IPs
+nie in die Versionskontrolle oder einen geteilten State gelangen.
 
 ---
 

@@ -1,6 +1,12 @@
 'use strict';
 
 const path = require('path');
+const fs = require('fs').promises;
+
+// Moderation state lives in its OWN server-only file (gitignored) so agent IPs / banned IPs are
+// never written into the shared/tracked state.json or its backups.
+const MODERATION_FILE = path.join(__dirname, '../data/moderation.json');
+const LEGACY_STATE_FILE = path.join(__dirname, '../data/state.json');
 
 // In-memory moderation state (persisted via serializeModeration / loadModeration).
 const hiddenFiles = new Set();   // normalized world-relative paths
@@ -43,6 +49,47 @@ function serializeModeration() {
     },
     agentIps: Object.fromEntries(agentIps),
   };
+}
+
+// ---- file persistence (separate from state.json) ----
+let saveChain = Promise.resolve();
+
+// Load moderation state from its own file. Missing file => empty state, with a one-time migration
+// from older builds that stored moderation inside data/state.json.
+async function load() {
+  try {
+    loadModeration(JSON.parse(await fs.readFile(MODERATION_FILE, 'utf-8')));
+    return;
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      console.error('Failed to load moderation state:', e.message);
+      loadModeration({});
+      return;
+    }
+  }
+  // One-time migration: pull moderation/agentIps out of a legacy state.json if present.
+  try {
+    const legacy = JSON.parse(await fs.readFile(LEGACY_STATE_FILE, 'utf-8'));
+    if (legacy && (legacy.moderation || legacy.agentIps)) {
+      loadModeration(legacy);
+      await save();
+      console.warn('Migrated moderation state out of state.json into moderation.json');
+      return;
+    }
+  } catch (e) { /* no legacy state to migrate */ }
+  loadModeration({});
+}
+
+// Persist moderation state atomically, serialized via a mutex to prevent interleaved writes.
+function save() {
+  saveChain = saveChain.then(_saveImpl).catch((e) => console.error('Failed to save moderation state:', e.message));
+  return saveChain;
+}
+async function _saveImpl() {
+  await fs.mkdir(path.dirname(MODERATION_FILE), { recursive: true });
+  const tmp = MODERATION_FILE + '.tmp';
+  await fs.writeFile(tmp, JSON.stringify(serializeModeration(), null, 2));
+  await fs.rename(tmp, MODERATION_FILE);
 }
 
 function isHidden(path) { return hiddenFiles.has(normalizePath(path)); }
@@ -154,7 +201,7 @@ function scanContent({ content = '', message = '', agentName = '', filePath = ''
 }
 
 module.exports = {
-  loadModeration, serializeModeration,
+  loadModeration, serializeModeration, load, save,
   isHidden, hide, unhide, listHidden,
   isBanned, recordAgentIp, resolveAgentIp, ban, unban, listBans,
   scanContent,
