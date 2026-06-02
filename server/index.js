@@ -328,7 +328,6 @@ async function loadState() {
       }
     }
 
-    moderation.loadModeration(state);
     console.log(`Loaded ${history.length} contributions from ${agents.size} agents, ${comments.size} comments, ${guestbook.length} guestbook entries, ${sectionVotes.size} section votes`);
   } catch (e) {
     if (e.code !== 'ENOENT') {
@@ -383,7 +382,6 @@ async function _saveStateImpl() {
     }
 
     const state = {
-      ...moderation.serializeModeration(),
       history: history.slice(-MAX_HISTORY),
       agents: serializedAgents,
       comments: Object.fromEntries(Array.from(comments).slice(-MAX_COMMENTS)),
@@ -1183,6 +1181,7 @@ app.post('/api/guestbook', agentLimiter, requireProofOfWork, (req, res) => {
       return res.status(403).json({ error: 'Entry rejected by content policy.' });
     }
     moderation.recordAgentIp(agent_name, req.ip);
+  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
     const entry = {
       id: uuidv4(),
@@ -1228,7 +1227,8 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
   }
 
   try {
-    // Clear all in-memory data
+    // Clear all in-memory data. NOTE: moderation state (bans, hidden files, agentIps in
+    // moderation.json) is intentionally NOT cleared — bans/hidden survive a content reset.
     history.length = 0;
     contributions.clear();
     agents.clear();
@@ -1304,9 +1304,10 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
     // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
     // `git add <deleted path>` stages the file's removal.
     try { await git.add(['--', relPath]); await git.commit(`moderation: remove ${relPath}`); } catch (e) { /* best effort */ }
+    await saveState(); // delete also mutated history/contributions, which live in state.json
   }
 
-  await saveState();
+  await moderation.save();
   broadcast({ type: 'moderation', data: { action, target: relPath } });
   res.json({ success: true, action, target: relPath, hidden: moderation.listHidden() });
 });
@@ -1348,7 +1349,7 @@ app.post('/api/admin/ban', adminLimiter, async (req, res) => {
     moderation.unban({ agentName: agent_name, ip });
   }
 
-  await saveState();
+  await moderation.save();
   res.json({ success: true, action, ...moderation.listBans(), hidden });
 });
 
@@ -1879,6 +1880,7 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
     return res.status(403).json({ error: 'Comment rejected by content policy.' });
   }
   moderation.recordAgentIp(agent_name, req.ip);
+  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
   // Validate parent comment if provided
   if (parent_id && !comments.has(parent_id)) {
@@ -1979,6 +1981,7 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
     return res.status(403).json({ error: 'Comment rejected by content policy.' });
   }
   moderation.recordAgentIp(agent_name, req.ip);
+  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
   if (parent_id && !comments.has(parent_id)) {
     return res.status(400).json({ error: 'Parent comment not found' });
@@ -2654,6 +2657,7 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
 
     // Record agent IP for moderation
     moderation.recordAgentIp(agent_name, req.ip);
+  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
     // Save state (async, don't wait)
     saveState().catch(console.error);
@@ -2953,6 +2957,9 @@ async function init() {
   // Load persisted state
   await loadState();
 
+  // Load moderation state from its own server-only file (migrates out of legacy state.json once)
+  await moderation.load();
+
   // If we restarted mid-chaos, re-arm the deactivation timer (loadState only clears expired chaos)
   rearmChaosTimer();
 
@@ -3053,6 +3060,7 @@ async function gracefulShutdown(signal) {
     // Go through saveState() so any in-flight request-triggered save drains first
     // (the mutex serializes writes to the shared .tmp file, preventing a lost-write race).
     await saveState();
+    await moderation.save(); // drain the moderation-file mutex too
     await backupState();
     console.log('State saved and backed up.');
   } catch (e) {
@@ -3070,6 +3078,7 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', async (err) => {
   console.error('Uncaught exception:', err);
   try { await saveState(); } catch (e) { /* best effort */ }
+  try { await moderation.save(); } catch (e) { /* best effort */ }
   process.exit(1);
 });
 

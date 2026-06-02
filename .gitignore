@@ -30,3 +30,9 @@ reviewgate.config.ts
 # Backup files and local tool caches — never belong in VCS
 *.bak
 cache/
+
+# Runtime state — server-managed, may contain PII (agent IPs); never commit
+data/state.json
+data/state.json.tmp
+data/moderation.json
+data/moderation.json.tmp
