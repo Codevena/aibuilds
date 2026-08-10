@@ -6,6 +6,8 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
+const http = require('node:http');
+const { createRequire } = require('node:module');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const WebSocket = require('ws');
@@ -14,6 +16,9 @@ const { validateWorldWritePath } = require('../server/world-write-policy');
 const { CONTRIBUTE_CONTRACT } = require('../mcp/tool-contracts');
 
 const REPO_ROOT = path.join(__dirname, '..');
+const requireFromMcp = createRequire(path.join(REPO_ROOT, 'mcp/package.json'));
+const { Client } = requireFromMcp('@modelcontextprotocol/sdk/client/index.js');
+const { StdioClientTransport } = requireFromMcp('@modelcontextprotocol/sdk/client/stdio.js');
 
 async function getFreePort() {
   const listener = net.createServer();
@@ -111,6 +116,58 @@ test('static agent instruction configs use the production write policy', async (
     }
   }
   assert.ok(examples >= 4, `expected multiple machine-readable file_path examples, found ${examples}`);
+});
+
+test('MCP get_context preserves the operator-owned Chaos boundary', async (t) => {
+  // Mutation caught: restoring "all scoping rules are off" or a global-CSS allowance changes
+  // the real MCP tool response and violates the protected-global-files contract.
+  const backend = http.createServer((request, response) => {
+    response.setHeader('Content-Type', 'application/json');
+    if (request.url === '/api/world/structure') {
+      response.end(JSON.stringify({ sections: [] }));
+      return;
+    }
+    if (request.url === '/api/pages') {
+      response.end(JSON.stringify({ pages: [] }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end(JSON.stringify({ error: 'not found' }));
+  });
+  await new Promise((resolve, reject) => {
+    backend.once('error', reject);
+    backend.listen(0, '127.0.0.1', resolve);
+  });
+
+  const backendUrl = `http://127.0.0.1:${backend.address().port}`;
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ['mcp/index.js'],
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      AGENT_NAME: 'MCP-Contract-Agent',
+      AI_BUILDS_URL: backendUrl,
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'aibuilds-contract-test', version: '1.0.0' });
+  const stderr = [];
+  transport.stderr.on('data', chunk => stderr.push(chunk.toString()));
+  t.after(async () => {
+    await client.close().catch(() => {});
+    await new Promise(resolve => backend.close(resolve));
+  });
+
+  await client.connect(transport);
+  const result = await client.callTool({ name: 'aibuilds_get_context', arguments: {} });
+  assert.equal(result.isError, undefined, stderr.join(''));
+  const context = result.content.map(item => item.type === 'text' ? item.text : '').join('\n');
+  assert.ok(context.includes(
+    'page- and section-scoped styling rules are relaxed; protected global files remain operator-controlled',
+  ));
+  assert.equal(context.toLowerCase().includes('all scoping rules are off'), false);
+  assert.equal(context.toLowerCase().includes('global css allowed'), false);
 });
 
 test('real API publishes complete metrics and enforces the shared write contract', async (t) => {

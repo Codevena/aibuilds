@@ -11,6 +11,7 @@ const { once } = require('node:events');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const OPERATOR_MESSAGE = 'AI agents build the world. Humans operate the platform and watch it evolve.';
+const CHAOS_BOUNDARY = 'page- and section-scoped styling rules are relaxed; protected global files remain operator-controlled';
 const LEGACY_PROHIBITED_PHRASES = [
   'zero human intervention',
   'no human intervention',
@@ -19,9 +20,14 @@ const LEGACY_PROHIBITED_PHRASES = [
   'no control',
   'humans can only watch',
 ];
+const CHAOS_PROHIBITED_PHRASES = [
+  'all rules suspended',
+  'global css allowed',
+];
 const PROHIBITED_PHRASES = [
   ...LEGACY_PROHIBITED_PHRASES,
   'built entirely by ai agents',
+  ...CHAOS_PROHIBITED_PHRASES,
 ];
 
 function normalizePublicCorpus(value) {
@@ -64,9 +70,12 @@ async function waitForServer(baseUrl, child, logs) {
 
 test('delivered public copy states the operator boundary without absolute intervention claims', async (t) => {
   // Mutation caught: restoring the six legacy absolute phrases changes the prohibited count 0 -> 6;
-  // restoring the rendered "built entirely" metadata fallback also makes the delivered count nonzero.
+  // restoring the committed default World footer/meta or global-CSS Chaos claims makes the
+  // copied index/layout corpus prohibited and breaks each surface-specific boundary assertion.
   const negativeFixture = LEGACY_PROHIBITED_PHRASES.join(' | ');
   assert.equal(countProhibitedPhrases(negativeFixture), 6);
+  const chaosNegativeFixture = CHAOS_PROHIBITED_PHRASES.join(' | ');
+  assert.equal(countProhibitedPhrases(chaosNegativeFixture), 2);
 
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-public-copy-'));
   const worldDir = path.join(root, 'world');
@@ -76,6 +85,10 @@ test('delivered public copy states the operator boundary without absolute interv
     fs.mkdir(worldDir, { recursive: true }),
     fs.mkdir(dataDir, { recursive: true }),
     fs.mkdir(backupDir, { recursive: true }),
+  ]);
+  await Promise.all([
+    fs.copyFile(path.join(REPO_ROOT, 'world/layout.html'), path.join(worldDir, 'layout.html')),
+    fs.copyFile(path.join(REPO_ROOT, 'world/index.html'), path.join(worldDir, 'index.html')),
   ]);
 
   const port = await getFreePort();
@@ -111,20 +124,18 @@ test('delivered public copy states the operator boundary without absolute interv
   assert.ok(responses[0].includes('AGENT_NAME'));
   assert.ok(responses[0].includes('~/.aibuilds/agent-id'));
 
-  // Exercise normal page rendering without an agent-authored description, then the assembled
-  // sections renderer. Both must use the same operator-honest metadata default as empty init.
+  // Exercise the actual default layout through normal page rendering and the assembled sections
+  // renderer. This keeps both committed World surfaces in the spawned server contract.
   await Promise.all([
     fs.mkdir(path.join(worldDir, 'pages'), { recursive: true }),
     fs.mkdir(path.join(worldDir, 'sections'), { recursive: true }),
   ]);
-  await fs.writeFile(path.join(worldDir, 'layout.html'), `<!doctype html><html><head>
-    <title>{{TITLE}}</title><meta name="description" content="{{DESCRIPTION}}">
-    </head><body>{{NAV}}<main>{{CONTENT}}</main></body></html>`);
   await fs.writeFile(path.join(worldDir, 'pages/home.html'),
     '<div data-page-title="Home"><h1>Normal rendered page</h1></div>');
   const normalPage = await fetch(`${baseUrl}/world/`);
   assert.equal(normalPage.status, 200, logs.join(''));
-  responses.push(await normalPage.text());
+  const normalPageText = await normalPage.text();
+  responses.push(normalPageText);
 
   await Promise.all([
     fs.unlink(path.join(worldDir, 'pages/home.html')),
@@ -134,11 +145,21 @@ test('delivered public copy states the operator boundary without absolute interv
     '<section data-section-title="Demo"><h2>Assembled section</h2></section>');
   const assembledPage = await fetch(`${baseUrl}/world/`);
   assert.equal(assembledPage.status, 200, logs.join(''));
-  responses.push(await assembledPage.text());
+  const assembledPageText = await assembledPage.text();
+  responses.push(assembledPageText);
 
   const corpus = normalizePublicCorpus(responses.join('\n'));
+  const defaultWorldText = responses[paths.indexOf('/world/')];
 
   assert.ok(corpus.includes(OPERATOR_MESSAGE));
+  for (const [surface, delivered] of [
+    ['world/index.html', defaultWorldText],
+    ['world/layout.html normal renderer', normalPageText],
+    ['world/layout.html assembled renderer', assembledPageText],
+  ]) {
+    assert.ok(delivered.includes(OPERATOR_MESSAGE), surface);
+    assert.ok(normalizePublicCorpus(delivered).toLowerCase().includes(CHAOS_BOUNDARY), surface);
+  }
   assert.equal(countProhibitedPhrases(corpus), 0);
 });
 

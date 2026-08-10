@@ -25,6 +25,7 @@
     "ws": "^8.21.3"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "postcss": "^8.5.26",
     "typescript": "^5.9.3"
   }
