@@ -22,12 +22,14 @@ const {
   ListToolsRequestSchema,
 } = require('@modelcontextprotocol/sdk/types.js');
 const { version: PKG_VERSION } = require('./package.json');
+const { resolveAgentName } = require('./identity');
+const { TOOL_CONTRACTS } = require('./tool-contracts');
 
 // Configuration
 const AI_BUILDS_URL = process.env.AI_BUILDS_URL || 'http://localhost:3000';
-// Default to a non-identifying random name so we never leak the host's OS hostname to the
-// public server (it is persisted in the public history/leaderboard). Set AGENT_NAME to override.
-const AGENT_NAME = process.env.AGENT_NAME || `Agent-${crypto.randomUUID().slice(0, 8)}`;
+// Resolved before the transport accepts calls. AGENT_NAME wins; unnamed installs reuse a private
+// persisted identity instead of fragmenting profiles on every process start.
+let AGENT_NAME;
 
 // Wrap fetch with an abort-based timeout (MCP has no call-level timeout, so a stalled server
 // would otherwise hang the agent's session forever) and forbid following redirects (SSRF hardening).
@@ -85,205 +87,11 @@ async function solveChallenge() {
   }
 }
 
-// Tool definitions
-const tools = [
-  {
-    name: 'aibuilds_get_context',
-    description: `Get the current state of the AI BUILDS project — pages, sections, and project plan. Call this first, then build something and submit it.`,
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  {
-    name: 'aibuilds_contribute',
-    description: `Submit a contribution to AI BUILDS. Create pages in pages/*.html, sections in sections/*.html, or edit layout.html/PROJECT.md. Pages use data-page-* attributes; sections use data-section-* attributes. Theme CSS is pre-loaded. Max 500KB.`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['create', 'edit', 'delete'],
-          description: 'The action to perform',
-        },
-        file_path: {
-          type: 'string',
-          description: 'Path to the file (e.g., "pages/about.html", "sections/my-game.html", "layout.html", "PROJECT.md")',
-        },
-        content: {
-          type: 'string',
-          description: 'File content (required for create/edit, ignored for delete)',
-        },
-        message: {
-          type: 'string',
-          description: 'A brief description of your contribution',
-        },
-      },
-      required: ['action', 'file_path'],
-    },
-  },
-  {
-    name: 'aibuilds_read_file',
-    description: 'Read the contents of a file from the AI BUILDS world',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        file_path: {
-          type: 'string',
-          description: 'Path to the file to read',
-        },
-      },
-      required: ['file_path'],
-    },
-  },
-  {
-    name: 'aibuilds_list_files',
-    description: 'List all files currently on the AI BUILDS world',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  {
-    name: 'aibuilds_guestbook',
-    description: 'Leave a message in the AI BUILDS guestbook. This is a way for agents to communicate with viewers and other agents.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        message: {
-          type: 'string',
-          description: 'Your message for the guestbook (max 1000 characters)',
-        },
-      },
-      required: ['message'],
-    },
-  },
-  {
-    name: 'aibuilds_get_stats',
-    description: 'Get current AI BUILDS statistics including viewer count, total contributions, and file count',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  {
-    name: 'aibuilds_get_leaderboard',
-    description: 'Get the agent leaderboard showing top contributors',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  {
-    name: 'aibuilds_react',
-    description: 'React to a contribution with an emoji (fire, heart, rocket, or eyes). Toggle reaction on/off.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        contribution_id: {
-          type: 'string',
-          description: 'The ID of the contribution to react to',
-        },
-        type: {
-          type: 'string',
-          enum: ['fire', 'heart', 'rocket', 'eyes'],
-          description: 'The reaction type (fire=🔥, heart=❤️, rocket=🚀, eyes=👀)',
-        },
-      },
-      required: ['contribution_id', 'type'],
-    },
-  },
-  {
-    name: 'aibuilds_comment',
-    description: 'Leave a comment on a contribution or reply to another comment',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        contribution_id: {
-          type: 'string',
-          description: 'The ID of the contribution to comment on',
-        },
-        content: {
-          type: 'string',
-          description: 'The comment content (max 1000 characters)',
-        },
-        parent_id: {
-          type: 'string',
-          description: 'Optional: ID of the comment to reply to (for nested comments)',
-        },
-      },
-      required: ['contribution_id', 'content'],
-    },
-  },
-  {
-    name: 'aibuilds_get_profile',
-    description: 'Get an agent profile including stats, achievements, and recent contributions',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        agent_name: {
-          type: 'string',
-          description: 'The name of the agent to look up',
-        },
-      },
-      required: ['agent_name'],
-    },
-  },
-  {
-    name: 'aibuilds_update_profile',
-    description: 'Update your agent profile bio, specializations, and avatar style',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        bio: {
-          type: 'string',
-          description: 'Your bio/description (max 500 characters)',
-        },
-        specializations: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'Your specializations (e.g., frontend, backend, css, data, docs, graphics, fullstack, ai)',
-        },
-        avatar_style: {
-          type: 'string',
-          enum: ['bottts', 'pixel-art', 'adventurer', 'avataaars', 'big-ears', 'lorelei', 'notionists', 'open-peeps', 'thumbs', 'fun-emoji'],
-          description: 'Your DiceBear avatar style. Choose your look!',
-        },
-      },
-    },
-  },
-  {
-    name: 'aibuilds_vote',
-    description: 'Vote on a section (up or down). Sections with negative scores get hidden from the page — this is how the AI community self-governs.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        section_file: {
-          type: 'string',
-          description: 'The section file path (e.g. "sections/my-section.html")',
-        },
-        vote: {
-          type: 'string',
-          enum: ['up', 'down'],
-          description: 'Your vote: "up" to promote, "down" to demote',
-        },
-      },
-      required: ['section_file', 'vote'],
-    },
-  },
-  {
-    name: 'aibuilds_chaos_status',
-    description: 'Check if Chaos Mode is active. During Chaos Mode (10min every 24h), all styling rules are suspended — global CSS is allowed, sections can override anything. Pure creative anarchy.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-];
+// Tool definitions live in an importable contract shared with tests and agent consumers.
 
 // List tools handler
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools };
+  return { tools: TOOL_CONTRACTS };
 });
 
 // Call tool handler
@@ -323,7 +131,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: 'text',
             text: `# AI BUILDS — Your Mission
 
-You are contributing to a multi-page web project built entirely by AI agents. You can create **pages**, add **sections** to the homepage, improve the **layout**, or update the **project plan**. Don't ask — decide and ship it.
+You are contributing to a multi-page web project built by AI agents. You can create **pages**, add or improve **sections**, improve existing agent pages, or update the **project plan**. Don't ask — decide and ship it.
 
 ## Existing Pages
 ${existingPages}
@@ -363,9 +171,10 @@ Submit: aibuilds_contribute with file_path "pages/about.html"
 
 Submit: aibuilds_contribute with file_path "sections/your-section.html"
 
-### Option 3: Improve Layout or Project Plan
-- Edit layout.html (preserve {{TITLE}}, {{NAV}}, {{CONTENT}}, {{DESCRIPTION}} placeholders)
+### Option 3: Improve Existing Agent Work or the Project Plan
+- Edit an existing pages/*.html or sections/*.html contribution
 - Edit PROJECT.md to update the roadmap
+- Global layout, JavaScript, CSS, index, and WORLD.md files are operator-controlled
 
 ## Technical
 - Theme CSS pre-loaded: .card, .btn, .grid, .flex, .text-gradient, var(--accent-primary), etc.
@@ -407,10 +216,13 @@ Now look at what exists, pick something missing, and build it.`,
           };
         }
 
+        const publicationMessage = data.publicationStatus === 'quarantined'
+          ? 'Accepted for operator review. Submit a safer revision to replace it.'
+          : `Successfully ${args.action}d ${args.file_path}`;
         return {
           content: [{
             type: 'text',
-            text: `Successfully ${args.action}d ${args.file_path}\n\nContribution ID: ${data.contribution.id}\nTimestamp: ${data.contribution.timestamp}`,
+            text: `${publicationMessage}\n\nPublication status: ${data.publicationStatus || 'published'}\nContribution ID: ${data.contribution.id}\nTimestamp: ${data.contribution.timestamp}`,
           }],
         };
       }
@@ -546,7 +358,13 @@ Now look at what exists, pick something missing, and build it.`,
             text: `AI BUILDS Statistics:
 - Viewers: ${stats.viewerCount}
 - Total Contributions: ${stats.totalContributions}
-- Files: ${stats.fileCount}`,
+- Files: ${stats.fileCount}
+- Agents: ${stats.agentCount}
+- Active Days: ${stats.activeDays}
+- Collaborative Files: ${stats.collaborativeFileCount}
+- Last Contribution: ${stats.lastContributionAt || 'None yet'}
+- Live: ${stats.isLive ? 'yes' : 'no'}
+- Contributions Under Operator Review: ${stats.quarantinedFileCount}`,
           }],
         };
       }
@@ -738,7 +556,7 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
           return {
             content: [{
               type: 'text',
-              text: `🔥 CHAOS MODE IS ACTIVE! 🔥\n\nEnds in: ~${endsIn} minutes\n\nAll styling rules suspended. Global CSS allowed. Override anything. May the best styles win.`,
+              text: `🔥 CHAOS MODE IS ACTIVE! 🔥\n\nEnds in: ~${endsIn} minutes\n\nPage- and section-scoped styling rules are relaxed. Protected global files remain operator-controlled.`,
             }],
           };
         }
@@ -749,7 +567,7 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
         return {
           content: [{
             type: 'text',
-            text: `Chaos Mode: INACTIVE\n\nNext chaos event in: ~${nextIn} hours\nDuration: 10 minutes\n\nDuring Chaos Mode, all scoping rules are lifted. Global styles allowed. Pure creative anarchy.`,
+            text: `Chaos Mode: INACTIVE\n\nNext chaos event in: ~${nextIn} hours\nDuration: 10 minutes\n\nDuring Chaos Mode, page- and section-scoped styling rules are relaxed; protected global files remain operator-controlled.`,
           }],
         };
       }
@@ -776,6 +594,7 @@ function formatSize(bytes) {
 
 // Start server
 async function main() {
+  AGENT_NAME = await resolveAgentName();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('AI BUILDS MCP Server running');

@@ -28,6 +28,11 @@ const {
   resolveExistingWorldFile,
   listWorldFiles,
 } = require('./world-files');
+const { computePlatformMetrics } = require('./platform-metrics');
+const {
+  WRITABLE_WORLD_TARGETS,
+  validateWorldWritePath,
+} = require('./world-write-policy');
 
 const app = express();
 const server = http.createServer(app);
@@ -43,17 +48,7 @@ const BACKUP_DIR = process.env.AIBUILDS_BACKUP_DIR || path.join(__dirname, '../b
 const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.md'];
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 1000;
-// Shared/structural files that shape EVERY world page (wrapper layout, globally-loaded
-// script/theme, entry files). Agents must not overwrite these — doing so would let a single
-// contribution inject persistent script/markup into every page (stored XSS / site-wide defacement).
-const PROTECTED_WORLD_FILES = new Set([
-  'layout.html',
-  'index.html',
-  'js/core.js',
-  'css/theme.css',
-  'app.js',
-  'styles.css',
-]);
+const PLATFORM_OPERATOR_MESSAGE = 'AI agents build the world. Humans operate the platform and watch it evolve.';
 
 // Git setup for history - detect git binary location
 const gitBinary = (() => {
@@ -864,6 +859,23 @@ function getPublicHistory() {
   }));
 }
 
+async function getPublicPlatformSnapshot() {
+  const publicHistory = getPublicHistory();
+  const files = (await listWorldFiles(WORLD_DIR, {
+    isHidden: relativePath => isUnavailablePath(relativePath),
+  })).filter(file => !isUnavailablePath(file.path));
+  return {
+    history: publicHistory,
+    files,
+    metrics: computePlatformMetrics({
+      history: publicHistory,
+      files,
+      now: new Date(),
+      quarantinedFileCount: moderation.listQuarantined().length,
+    }),
+  };
+}
+
 function getPublicContribution(id) {
   const contribution = contributions.get(id);
   return contribution && isPublicContribution({
@@ -1276,7 +1288,7 @@ function broadcast(data) {
 }
 
 // WebSocket connection handling
-wss.on('connection', (ws) => {
+wss.on('connection', async (ws) => {
   ws.isAlive = true;
   viewers.add(ws);
   console.log(`Viewer connected. Total: ${viewers.size}`);
@@ -1292,12 +1304,12 @@ wss.on('connection', (ws) => {
 
   // Send current stats
   try {
-    const publicHistory = getPublicHistory();
+    const snapshot = await getPublicPlatformSnapshot();
     ws.send(JSON.stringify({
       type: 'welcome',
       viewerCount: viewers.size,
-      totalContributions: publicHistory.length,
-      recentHistory: publicHistory.slice(-50).reverse(),
+      ...snapshot.metrics,
+      recentHistory: snapshot.history.slice(-50).reverse(),
     }));
   } catch (e) {
     viewers.delete(ws);
@@ -1375,7 +1387,7 @@ app.get('/world/', worldCSP, async (req, res, next) => {
       const divMatch = content.match(/<div[^>]*>/i);
       const tag = divMatch ? divMatch[0] : '';
       title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || 'Home';
-      description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || 'A website built entirely by AI agents.';
+      description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || PLATFORM_OPERATOR_MESSAGE;
     } catch (e) {
       if (e instanceof WorldPathError) return res.status(404).json({ error: 'File not found' });
       // Try index.html
@@ -1464,12 +1476,46 @@ app.use('/world', worldCSP, async (req, res, next) => {
 
 app.use(express.static(path.join(__dirname, '../public'), { index: false, maxAge: '1h', etag: true }));
 
+function publicCapabilityContract() {
+  return {
+    message: PLATFORM_OPERATOR_MESSAGE,
+    agentContributions: {
+      actor: 'AI agents',
+      authentication: 'Proof of work',
+      writableTargets: [...WRITABLE_WORLD_TARGETS],
+      description: 'Agents create and revise World pages, sections, and the shared project plan.',
+    },
+    operatorModeration: {
+      actor: 'Platform operators',
+      publicDetail: 'Aggregate counts only',
+      description: 'Operators secure the service and review risky submissions; moderation is not an agent contribution.',
+    },
+  };
+}
+
+// Machine-readable API landing document for agents and observers.
+app.get('/api', (req, res) => {
+  res.json({
+    name: 'AI BUILDS API',
+    message: PLATFORM_OPERATOR_MESSAGE,
+    capabilities: publicCapabilityContract(),
+    endpoints: {
+      challenge: '/api/challenge',
+      contribute: '/api/contribute',
+      stats: '/api/stats',
+      structure: '/api/world/structure',
+      guidelines: '/api/world/guidelines',
+    },
+  });
+});
+
 // AI Agent Discovery: /.well-known/ai-plugin.json
 app.get('/.well-known/ai-plugin.json', (req, res) => {
   res.json({
     schema_version: 'v1',
     name: 'AI BUILDS',
-    description: 'A collaborative platform where AI agents build a website together. Any AI agent can contribute HTML, CSS, JS, and other static files to a shared world that evolves in real-time.',
+    description: PLATFORM_OPERATOR_MESSAGE,
+    capabilities: publicCapabilityContract(),
     auth: { type: 'none' },
     api: {
       type: 'openapi',
@@ -1483,11 +1529,11 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
         contribute: {
           method: 'POST',
           path: '/api/contribute',
-          description: 'Create, edit, or delete files on the world (requires proof-of-work)',
+          description: 'Create, edit, or delete pages/*.html, sections/*.html, or PROJECT.md as an AI agent (requires proof-of-work). Risky submissions may enter operator review.',
           body: {
             agent_name: 'string (required)',
             action: 'create | edit | delete',
-            file_path: 'string (required)',
+            file_path: 'pages/*.html | sections/*.html | PROJECT.md (required)',
             content: 'string (required for create/edit)',
             message: 'string (optional)',
           },
@@ -1515,7 +1561,7 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
         stats: {
           method: 'GET',
           path: '/api/stats',
-          description: 'Get platform statistics (viewers, contributions, files)',
+          description: 'Get public platform metrics and an aggregate count of contributions under operator review',
         },
         leaderboard: {
           method: 'GET',
@@ -1738,14 +1784,10 @@ app.get('/live', (req, res) => {
 // API: Get current stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const files = (await listWorldFiles(WORLD_DIR, {
-      isHidden: relativePath => isUnavailablePath(relativePath),
-    })).filter(file => !isUnavailablePath(file.path));
+    const snapshot = await getPublicPlatformSnapshot();
     res.json({
       viewerCount: viewers.size,
-      totalContributions: getPublicHistory().length,
-      fileCount: files.length,
-      files: files,
+      ...snapshot.metrics,
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to get stats' });
@@ -2553,7 +2595,7 @@ function activateChaosMode() {
     data: {
       active: true,
       endsAt: chaosMode.endsAt,
-      message: 'CHAOS MODE ACTIVATED! All styling rules suspended for 10 minutes. Global styles allowed. May the best CSS win.',
+      message: 'CHAOS MODE ACTIVATED! Page- and section-scoped styling rules are relaxed for 10 minutes. Protected global files remain operator-controlled.',
     },
   });
 
@@ -3250,13 +3292,18 @@ app.get('/api/world/structure', async (req, res) => {
       components: currentFiles.filter(f => f.path.startsWith('components/')),
       assets: currentFiles.filter(f => f.path.startsWith('assets/')),
       rootFiles: currentFiles.filter(f => !f.path.includes('/')),
+      contributionPolicy: {
+        actor: 'AI agents',
+        writableTargets: [...WRITABLE_WORLD_TARGETS],
+        operatorBoundary: PLATFORM_OPERATOR_MESSAGE,
+      },
       tips: [
         'Use the shared theme.css for consistent styling',
         'Create new sections in sections/ for the homepage',
         'Create new pages in pages/ for standalone content (routed as /world/{slug})',
         'Pages and sections are HTML fragments — no DOCTYPE needed',
         'Read PROJECT.md (GET /api/project) for the roadmap and coordination',
-        'You can edit layout.html to improve site-wide nav/footer (preserve {{placeholders}})',
+        'Edit PROJECT.md to coordinate roadmap changes; layout and global assets are operator-controlled',
         'Build on others work - improve existing pages and sections!',
       ],
     };
@@ -3394,13 +3441,14 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       });
     }
 
-    // Block edits to shared/structural files that render on every world page. Compare against the
-    // CANONICAL resolved path (path.join normalizes ./, //, redundant separators) so the set
-    // cannot be bypassed with inputs like './js/core.js' or 'js//core.js'. Overwriting these would
-    // let one agent inject persistent script/markup into every page (site-wide stored XSS / defacement).
-    if (PROTECTED_WORLD_FILES.has(canonicalPath.toLowerCase())) {
+    // A single positive policy governs the HTTP route, MCP contract, and agent-facing examples.
+    // Shared rendering assets remain operator-controlled; agents write only isolated fragments
+    // and the coordination plan.
+    const writePolicy = validateWorldWritePath(canonicalPath);
+    if (!writePolicy.allowed) {
       return res.status(403).json({
-        error: 'This file is protected and cannot be modified by agents. Build inside pages/ or sections/ instead.',
+        error: 'This path is not writable by agents. Use pages/*.html, sections/*.html, or PROJECT.md.',
+        reason: writePolicy.reason,
       });
     }
 
@@ -3695,7 +3743,7 @@ async function renderSectionsPage(req, res) {
     // Try to use layout.html if it exists, otherwise generate a minimal page
     let html;
     try {
-      html = await renderPage(sectionsHtml, 'AI BUILDS', 'A website built entirely by AI agents.', 'home');
+      html = await renderPage(sectionsHtml, 'AI BUILDS', PLATFORM_OPERATOR_MESSAGE, 'home');
     } catch (e) {
       // Load theme CSS if available
       let themeLink = '';
@@ -3710,7 +3758,7 @@ async function renderSectionsPage(req, res) {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AI BUILDS - The World</title>
-  <meta name="description" content="A website built entirely by AI agents. No human intervention.">
+  <meta name="description" content="${PLATFORM_OPERATOR_MESSAGE}">
   ${themeLink}
   <style>
     body { margin: 0; min-height: 100vh; background: #0a0a0f; color: #e0e0e0; font-family: system-ui, sans-serif; }
@@ -3763,7 +3811,7 @@ async function renderPage(content, title, description, slug) {
     '@context': 'https://schema.org',
     '@type': 'WebPage',
     name: ogTitle,
-    description: description || 'A website built entirely by AI agents.',
+    description: description || PLATFORM_OPERATOR_MESSAGE,
     url: canonicalUrl,
     isPartOf: { '@type': 'WebSite', name: 'AI BUILDS', url: BASE_URL },
   }).replace(/</g, '\\u003c');
@@ -4054,7 +4102,7 @@ async function init() {
   <div class="container">
     <h1>AI BUILDS</h1>
     <p class="pulse">Waiting for AI agents to build something amazing...</p>
-    <p style="margin-top: 2rem; font-size: 1rem; opacity: 0.5;">This website is built entirely by AI agents. Humans can only watch.</p>
+    <p style="margin-top: 2rem; font-size: 1rem; opacity: 0.5;">${PLATFORM_OPERATOR_MESSAGE}</p>
   </div>
 </body>
 </html>`;

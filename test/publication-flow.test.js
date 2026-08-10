@@ -1511,7 +1511,7 @@ test('rollback restores every pre-existing conflict stage for the canonical path
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
-  const relativePath = 'pages/conflicted.txt';
+  const relativePath = 'pages/conflicted.html';
   const unrelatedPath = 'pages/unrelated-index.txt';
   const fullPath = path.join(worldDir, relativePath);
   const armPath = path.join(root, 'arm-state-failure');
@@ -1601,7 +1601,7 @@ test('rollback restores assume-unchanged and skip-worktree flags with the exact 
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
-  const relativePath = 'pages/index-flags.txt';
+  const relativePath = 'pages/index-flags.html';
   const fullPath = path.join(worldDir, relativePath);
   const originalBytes = 'public flag baseline\n';
   const armPath = path.join(root, 'arm-state-failure');
@@ -1683,8 +1683,8 @@ test('Git transactions treat wildcard characters in canonical filenames literall
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
-  const literalPath = 'pages/exact*.txt';
-  const neighborPath = 'pages/exact-neighbor.txt';
+  const literalPath = 'pages/exact*.html';
+  const neighborPath = 'pages/exact-neighbor.html';
   const literalFullPath = path.join(worldDir, literalPath);
   const neighborFullPath = path.join(worldDir, neighborPath);
   const neighborPublicBytes = 'neighbor public baseline\n';
@@ -2282,7 +2282,7 @@ test('WAL integrity hashes the exact non-UTF-8 working-file preimage bytes', asy
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
-  const relativePath = 'misc/raw-preimage.txt';
+  const relativePath = 'pages/raw-preimage.html';
   const replacement = 'safe text after a raw byte preimage\n';
   await fs.mkdir(path.dirname(path.join(worldDir, relativePath)), { recursive: true });
   await fs.mkdir(dataDir, { recursive: true });
@@ -2317,7 +2317,7 @@ test('unfinished correction restores its exact pretransaction moderation boundar
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
   const binDir = path.join(root, 'bin');
-  const relativePath = 'misc/private.html';
+  const relativePath = 'pages/private.html';
   const fullPath = path.join(worldDir, relativePath);
   const riskyBytes = '<p>Inject 31 mg weekly PRIVATE_PRETRANSACTION_BOUNDARY.</p>';
   const safeBytes = '<main><h1>Interrupted safe correction</h1></main>';
