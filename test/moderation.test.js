@@ -1,6 +1,13 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const mod = require('../server/moderation.js');
+
+const execFileAsync = promisify(execFile);
 
 test('hide/unhide/isHidden with path normalization', () => {
   mod.loadModeration({});
@@ -24,6 +31,173 @@ test('serialize/load round-trip', () => {
   assert.equal(mod.isHidden('sections/a.html'), false);
   mod.loadModeration(snap);                 // re-hydrate from a serialized snapshot
   assert.equal(mod.isHidden('sections/a.html'), true);
+});
+
+test('quarantine and approval records serialize and load with exact hashes', () => {
+  const quarantineRecord = {
+    filePath: 'pages/risky.html',
+    contentHash: 'hash-a',
+    reasons: ['high_stakes_medical'],
+    agentName: 'Risk Agent',
+    timestamp: '2026-08-10T12:00:00.000Z',
+  };
+  mod.loadModeration({
+    moderation: {
+      quarantinedFiles: { 'pages/risky.html': quarantineRecord },
+      approvedFiles: { 'pages/risky.html': 'hash-a' },
+    },
+  });
+
+  assert.equal(mod.isQuarantined('pages/risky.html'), true);
+  assert.equal(mod.isApproved('pages/risky.html', 'hash-a'), true);
+  assert.equal(mod.isApproved('pages/risky.html', 'hash-b'), false);
+  assert.deepEqual(mod.listQuarantined(), [quarantineRecord]);
+  assert.deepEqual(mod.serializeModeration().moderation.quarantinedFiles, {
+    'pages/risky.html': quarantineRecord,
+  });
+  assert.deepEqual(mod.serializeModeration().moderation.approvedFiles, {
+    'pages/risky.html': 'hash-a',
+  });
+});
+
+test('approval is bound to one version and corrective release clears stale state', () => {
+  mod.loadModeration({});
+  assert.equal(mod.quarantine('pages/risky.html', {
+    contentHash: 'hash-a',
+    reasons: ['high_stakes_medical'],
+    agentName: 'Risk Agent',
+    timestamp: '2026-08-10T12:00:00.000Z',
+  }), true);
+  assert.equal(mod.approve('pages/risky.html', 'hash-a'), true);
+  assert.equal(mod.isApproved('pages/risky.html', 'hash-a'), true);
+  assert.equal(mod.isApproved('pages/risky.html', 'hash-b'), false);
+
+  assert.equal(mod.quarantine('pages/risky.html', {
+    contentHash: 'hash-b',
+    reasons: ['high_stakes_medical'],
+    agentName: 'Risk Agent',
+    timestamp: '2026-08-10T12:05:00.000Z',
+  }), true);
+  assert.equal(mod.isApproved('pages/risky.html', 'hash-b'), false);
+  assert.equal(mod.releaseQuarantine('pages/risky.html'), true);
+  assert.equal(mod.clearApproval('pages/risky.html'), true);
+  assert.equal(mod.isQuarantined('pages/risky.html'), false);
+  assert.equal(mod.isApproved('pages/risky.html', 'hash-a'), false);
+  assert.deepEqual(mod.serializeModeration().moderation.quarantinedFiles, {});
+  assert.deepEqual(mod.serializeModeration().moderation.approvedFiles, {});
+});
+
+test('reject removes quarantine and approval records together', () => {
+  mod.loadModeration({});
+  mod.quarantine('sections/rejected.html', {
+    contentHash: 'hash-a',
+    reasons: ['promotional_external_link'],
+    agentName: 'Risk Agent',
+    timestamp: '2026-08-10T12:00:00.000Z',
+  });
+  mod.approve('sections/rejected.html', 'hash-a');
+
+  assert.equal(mod.reject('sections/rejected.html'), true);
+  assert.equal(mod.isQuarantined('sections/rejected.html'), false);
+  assert.equal(mod.isApproved('sections/rejected.html', 'hash-a'), false);
+  assert.deepEqual(mod.serializeModeration().moderation.quarantinedFiles, {});
+  assert.deepEqual(mod.serializeModeration().moderation.approvedFiles, {});
+});
+
+test('quarantine and approval preserve exact case-sensitive World paths', () => {
+  mod.loadModeration({});
+  const record = {
+    contentHash: 'hash-a',
+    reasons: ['high_stakes_medical'],
+    agentName: 'Risk Agent',
+    timestamp: '2026-08-10T12:00:00.000Z',
+  };
+
+  assert.equal(mod.quarantine('pages/MixedCase.html', record), true);
+  assert.equal(mod.approve('pages/MixedCase.html', 'hash-a'), true);
+  assert.equal(mod.isQuarantined('pages/MixedCase.html'), true);
+  assert.equal(mod.isQuarantined('pages/mixedcase.html'), false);
+  assert.equal(mod.isApproved('pages/MixedCase.html', 'hash-a'), true);
+  assert.equal(mod.isApproved('pages/mixedcase.html', 'hash-a'), false);
+  assert.equal(mod.listQuarantined()[0].filePath, 'pages/MixedCase.html');
+  assert.deepEqual(Object.keys(mod.serializeModeration().moderation.quarantinedFiles), ['pages/MixedCase.html']);
+
+  assert.equal(mod.quarantine('world/pages/MixedCase.html', { ...record, contentHash: 'hash-b' }), true);
+  assert.equal(mod.isQuarantined('world/pages/MixedCase.html'), true);
+  assert.equal(mod.isQuarantined('pages/MixedCase.html'), true);
+  assert.deepEqual(mod.listQuarantined().map(item => item.filePath), [
+    'pages/MixedCase.html', 'world/pages/MixedCase.html',
+  ]);
+});
+
+test('awaited moderation persistence rejects instead of reporting a false success', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-moderation-save-failure-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const blockedDataDir = path.join(root, 'not-a-directory');
+  await fs.writeFile(blockedDataDir, 'blocked');
+  const script = `
+    const moderation = require('./server/moderation');
+    moderation.loadModeration({});
+    moderation.quarantine('pages/risky.html', {
+      contentHash: 'hash-a', reasons: ['high_stakes_medical'], agentName: 'Risk', timestamp: 'now'
+    });
+    moderation.save().then(() => process.exit(42), () => process.exit(0));
+  `;
+
+  await execFileAsync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIBUILDS_DATA_DIR: blockedDataDir },
+  });
+});
+
+test('legacy moderation migration propagates a persistence failure', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-moderation-migration-failure-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
+    moderation: { hiddenFiles: ['pages/frozen.html'] },
+  }));
+  const script = `
+    const fs = require('node:fs').promises;
+    const originalRename = fs.rename.bind(fs);
+    fs.rename = (source, target) => String(target).endsWith('/moderation.json')
+      ? Promise.reject(Object.assign(new Error('forced migration persistence failure'), { code: 'EIO' }))
+      : originalRename(source, target);
+    const moderation = require('./server/moderation');
+    moderation.load().then(() => process.exit(42), () => process.exit(0));
+  `;
+
+  await execFileAsync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIBUILDS_DATA_DIR: dataDir },
+  });
+});
+
+test('queued moderation saves persist the immutable call-time snapshot', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-moderation-snapshot-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const script = `
+    const fs = require('node:fs').promises;
+    const path = require('node:path');
+    const moderation = require('./server/moderation');
+    moderation.loadModeration({});
+    moderation.quarantine('pages/risky.html', {
+      contentHash: 'risk-hash', reasons: ['high_stakes_medical'], agentName: 'Risk', timestamp: 'now'
+    });
+    const pending = moderation.save();
+    moderation.releaseQuarantine('pages/risky.html');
+    moderation.approve('pages/risky.html', 'risk-hash');
+    pending.then(async () => {
+      const disk = JSON.parse(await fs.readFile(path.join(process.env.AIBUILDS_DATA_DIR, 'moderation.json')));
+      const preserved = disk.moderation.quarantinedFiles['pages/risky.html'];
+      const leakedApproval = disk.moderation.approvedFiles['pages/risky.html'];
+      process.exit(preserved && !leakedApproval ? 0 : 42);
+    }, () => process.exit(43));
+  `;
+
+  await execFileAsync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIBUILDS_DATA_DIR: dataDir },
+  });
 });
 
 test('ban/unban by name and ip', () => {

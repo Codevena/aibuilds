@@ -5,14 +5,24 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
+const fsSync = require('node:fs');
 const fs = require('fs').promises;
 const crypto = require('crypto');
 const { randomUUID } = require('node:crypto');
 const simpleGit = require('simple-git');
 const moderation = require('./moderation');
+const { evaluatePublication, contentHash } = require('./content-governance');
+const {
+  decideStoredPublication,
+  buildContributionResponse,
+  auditWorldForQuarantine,
+  isPublicContribution,
+  derivePublicAgentState,
+} = require('./publication-flow');
 const {
   WorldPathError,
   normalizeWorldPath,
+  resolveWorldPath,
   resolveExistingWorldFile,
   listWorldFiles,
 } = require('./world-files');
@@ -213,6 +223,197 @@ const ACHIEVEMENTS = {
 // Agent achievements tracking
 const agentAchievements = new Map();
 
+function isUnavailablePath(filePath) {
+  try {
+    const normalized = normalizeWorldPath(filePath);
+    if (moderation.isHidden(normalized) || moderation.isQuarantined(normalized)) return true;
+    const resolvedRoot = path.resolve(WORLD_DIR);
+    const rootStats = fsSync.lstatSync(resolvedRoot);
+    if (rootStats.isSymbolicLink()) return true;
+    let currentPath = resolvedRoot;
+    for (const segment of normalized.split('/')) {
+      currentPath = path.join(currentPath, segment);
+      const stats = fsSync.lstatSync(currentPath);
+      if (stats.isSymbolicLink()) return true;
+    }
+    const stats = fsSync.lstatSync(currentPath);
+    if (!stats.isFile()) return true;
+    const realRoot = fsSync.realpathSync(resolvedRoot);
+    const realPath = fsSync.realpathSync(currentPath);
+    return !realPath.startsWith(realRoot + path.sep);
+  } catch {
+    return true;
+  }
+}
+
+const worldMutationTails = new Map();
+
+async function acquireWorldMutation(filePath) {
+  const previous = worldMutationTails.get(filePath) || Promise.resolve();
+  let releaseGate;
+  const gate = new Promise(resolve => { releaseGate = resolve; });
+  const tail = previous.then(() => gate);
+  worldMutationTails.set(filePath, tail);
+  await previous;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseGate();
+    if (worldMutationTails.get(filePath) === tail) worldMutationTails.delete(filePath);
+  };
+}
+
+async function replaceWorldFileAtomically(fullPath, content) {
+  const tempPath = path.join(
+    path.dirname(fullPath),
+    `.${path.basename(fullPath)}.publication-${randomUUID()}.tmp`,
+  );
+  try {
+    await fs.writeFile(tempPath, content);
+    await fs.rename(tempPath, fullPath);
+  } finally {
+    try { await fs.unlink(tempPath); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+}
+
+async function resolveWorldWriteFile(filePath, { createParents = true } = {}) {
+  const normalized = normalizeWorldPath(filePath);
+  const resolvedRoot = path.resolve(WORLD_DIR);
+  const rootStats = await fs.lstat(resolvedRoot);
+  if (rootStats.isSymbolicLink()) throw new WorldPathError('World root cannot be a symbolic link');
+  const realRoot = await fs.realpath(resolvedRoot);
+  const segments = normalized.split('/');
+  let currentPath = resolvedRoot;
+
+  for (const segment of segments.slice(0, -1)) {
+    currentPath = path.join(currentPath, segment);
+    let stats;
+    try {
+      stats = await fs.lstat(currentPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      if (!createParents) return resolveWorldPath(resolvedRoot, normalized);
+      try { await fs.mkdir(currentPath); }
+      catch (mkdirError) { if (mkdirError.code !== 'EEXIST') throw mkdirError; }
+      stats = await fs.lstat(currentPath);
+    }
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw new WorldPathError('World write path has a non-directory or symbolic-link ancestor');
+    }
+    const realCurrent = await fs.realpath(currentPath);
+    if (realCurrent !== realRoot && !realCurrent.startsWith(realRoot + path.sep)) {
+      throw new WorldPathError('World write path escapes its root');
+    }
+  }
+
+  const fullPath = resolveWorldPath(resolvedRoot, normalized);
+  try {
+    const leafStats = await fs.lstat(fullPath);
+    if (leafStats.isSymbolicLink() || !leafStats.isFile()) {
+      throw new WorldPathError('World write target is not a regular file');
+    }
+    const realLeaf = await fs.realpath(fullPath);
+    if (!realLeaf.startsWith(realRoot + path.sep)) {
+      throw new WorldPathError('World write target escapes its root');
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  return fullPath;
+}
+
+async function readPublicWorldFile(filePath, encoding = 'utf8') {
+  const normalized = normalizeWorldPath(filePath);
+  const releaseMutation = await acquireWorldMutation(normalized);
+  try {
+    if (moderation.isHidden(normalized) || moderation.isQuarantined(normalized)) {
+      throw new WorldPathError('File not found');
+    }
+    const fullPath = await resolveExistingWorldFile(WORLD_DIR, normalized);
+    const content = await fs.readFile(fullPath, encoding);
+    if (isUnavailablePath(normalized)) throw new WorldPathError('File not found');
+    return content;
+  } finally {
+    releaseMutation();
+  }
+}
+
+function getPublicHistory() {
+  return history.filter(contribution => isPublicContribution({
+    contribution,
+    isHidden: filePath => isUnavailablePath(filePath),
+    isQuarantined: filePath => moderation.isQuarantined(filePath),
+  }));
+}
+
+function getPublicContribution(id) {
+  const contribution = contributions.get(id);
+  return contribution && isPublicContribution({
+    contribution,
+    isHidden: filePath => isUnavailablePath(filePath),
+    isQuarantined: filePath => moderation.isQuarantined(filePath),
+  }) ? contribution : null;
+}
+
+function getPublicComments() {
+  return Array.from(comments.values()).filter(comment => {
+    if (comment?.targetType === 'contribution') return Boolean(getPublicContribution(comment.targetId));
+    if (comment?.targetType === 'file') return !isUnavailablePath(comment.targetId);
+    return false;
+  }).map(comment => ({ ...comment, publicTarget: true }));
+}
+
+function getPublicAgentState(publicHistory = getPublicHistory()) {
+  const derived = derivePublicAgentState({ publicHistory, comments: getPublicComments() });
+  for (const [name, agent] of derived) {
+    const stored = agents.get(name) || {};
+    const id = stored.id || generateAgentId(name);
+    const profileSpecializations = Array.isArray(stored.profileSpecializations)
+      ? stored.profileSpecializations.filter(value => typeof value === 'string')
+      : [];
+    Object.assign(agent, {
+      id,
+      bio: typeof stored.bio === 'string' ? stored.bio : '',
+      avatar: stored.avatar || { type: 'generated', seed: id },
+      specializations: Array.from(new Set([...agent.specializations, ...profileSpecializations])),
+    });
+  }
+  return derived;
+}
+
+function getPublicAchievementIds(agent) {
+  return new Set(Object.entries(ACHIEVEMENTS)
+    .filter(([, achievement]) => achievement.check(agent))
+    .map(([id]) => id));
+}
+
+function getPublicAchievementSnapshot(publicHistory = getPublicHistory()) {
+  return new Map(Array.from(getPublicAgentState(publicHistory), ([name, agent]) => [name, getPublicAchievementIds(agent)]));
+}
+
+function broadcastNewPublicAchievements(before, after) {
+  for (const [agentName, earned] of after) {
+    const previous = before.get(agentName) || new Set();
+    for (const achievementId of earned) {
+      if (previous.has(achievementId)) continue;
+      const achievement = ACHIEVEMENTS[achievementId];
+      broadcast({
+        type: 'achievement',
+        data: {
+          agentName,
+          achievement: {
+            id: achievement.id,
+            name: achievement.name,
+            description: achievement.description,
+            icon: achievement.icon,
+          },
+        },
+      });
+    }
+  }
+}
+
 // Guestbook entries
 const guestbook = [];
 const MAX_GUESTBOOK = 500;
@@ -357,57 +558,46 @@ function generateAgentId(name) {
 // Save state to file (mutex to prevent interleaved writes)
 let saveStatePromise = Promise.resolve();
 function saveState() {
-  saveStatePromise = saveStatePromise.then(_saveStateImpl).catch(console.error);
-  return saveStatePromise;
-}
-async function _saveStateImpl() {
-  try {
-    await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
-
-    // Serialize agents (convert Sets to arrays)
-    const serializedAgents = {};
-    for (const [name, agent] of agents) {
-      serializedAgents[name] = {
-        ...agent,
-        collaborators: agent.collaborators ? Array.from(agent.collaborators) : [],
-      };
-    }
-
-    // Serialize agent achievements (convert Sets to arrays)
-    const serializedAchievements = {};
-    for (const [agentName, achievements] of agentAchievements) {
-      serializedAchievements[agentName] = Array.from(achievements);
-    }
-
-    // Serialize section votes
-    const serializedVotes = {};
-    for (const [file, votes] of sectionVotes) {
-      serializedVotes[file] = {
-        up: Array.from(votes.up),
-        down: Array.from(votes.down),
-      };
-    }
-
-    const state = {
-      history: history.slice(-MAX_HISTORY),
-      agents: serializedAgents,
-      comments: Object.fromEntries(Array.from(comments).slice(-MAX_COMMENTS)),
-      agentAchievements: serializedAchievements,
-      guestbook: guestbook.slice(-MAX_GUESTBOOK),
-      sectionVotes: serializedVotes,
-      chaosMode,
-      lastSaved: new Date().toISOString(),
+  // Serialize at call time: a queued earlier save must not accidentally persist a later security
+  // transition before the later operation's own durability check has succeeded.
+  const serializedAgents = {};
+  for (const [name, agent] of agents) {
+    serializedAgents[name] = {
+      ...agent,
+      collaborators: agent.collaborators ? Array.from(agent.collaborators) : [],
     };
-
-    // Atomic write: write to tmp file, then rename
-    const tmpFile = DATA_FILE + '.tmp';
-    await fs.writeFile(tmpFile, JSON.stringify(state, null, 2));
-    // Backup current state before overwriting
-    try { await fs.copyFile(DATA_FILE, DATA_FILE + '.bak'); } catch (e) { /* first run */ }
-    await fs.rename(tmpFile, DATA_FILE);
-  } catch (e) {
-    console.error('Failed to save state:', e.message);
   }
+  const serializedAchievements = {};
+  for (const [agentName, achievements] of agentAchievements) {
+    serializedAchievements[agentName] = Array.from(achievements);
+  }
+  const serializedVotes = {};
+  for (const [file, votes] of sectionVotes) {
+    serializedVotes[file] = {
+      up: Array.from(votes.up),
+      down: Array.from(votes.down),
+    };
+  }
+  const snapshot = JSON.stringify({
+    history: history.slice(-MAX_HISTORY),
+    agents: serializedAgents,
+    comments: Object.fromEntries(Array.from(comments).slice(-MAX_COMMENTS)),
+    agentAchievements: serializedAchievements,
+    guestbook: guestbook.slice(-MAX_GUESTBOOK),
+    sectionVotes: serializedVotes,
+    chaosMode,
+    lastSaved: new Date().toISOString(),
+  }, null, 2);
+  const operation = saveStatePromise.then(() => _saveStateImpl(snapshot));
+  saveStatePromise = operation.catch(() => {});
+  return operation;
+}
+async function _saveStateImpl(snapshot) {
+  await fs.mkdir(path.dirname(DATA_FILE), { recursive: true });
+  const tmpFile = DATA_FILE + '.tmp';
+  await fs.writeFile(tmpFile, snapshot);
+  try { await fs.copyFile(DATA_FILE, DATA_FILE + '.bak'); } catch (e) { /* first run */ }
+  await fs.rename(tmpFile, DATA_FILE);
 }
 
 // Periodic backup to host filesystem (survives volume deletion)
@@ -450,6 +640,7 @@ function trackAgentContribution(agentName, action, filePath = '', collaboratorNa
       bio: '',
       avatar: { type: 'generated', seed: agentId },
       specializations: [],
+      profileSpecializations: [],
       contributions: 0,
       creates: 0,
       edits: 0,
@@ -500,8 +691,8 @@ function trackAgentContribution(agentName, action, filePath = '', collaboratorNa
     agent.speedDemonUnlocked = true;
   }
 
-  // Check and award achievements
-  checkAndAwardAchievements(agentName, agent);
+  // Public achievements are derived from getPublicHistory() after a published mutation. Keeping
+  // this incremental profile update side-effect free prevents quarantined records from awarding.
 }
 
 // Update agent specializations based on file type stats
@@ -584,11 +775,12 @@ wss.on('connection', (ws) => {
 
   // Send current stats
   try {
+    const publicHistory = getPublicHistory();
     ws.send(JSON.stringify({
       type: 'welcome',
       viewerCount: viewers.size,
-      totalContributions: history.filter(c => !moderation.isHidden(c.file_path)).length,
-      recentHistory: history.filter(c => !moderation.isHidden(c.file_path)).slice(-50).reverse(),
+      totalContributions: publicHistory.length,
+      recentHistory: publicHistory.slice(-50).reverse(),
     }));
   } catch (e) {
     viewers.delete(ws);
@@ -640,7 +832,14 @@ app.use('/world', (req, res, next) => {
   let rel;
   try { rel = decodeURIComponent(req.path).replace(/^\/+/, ''); }
   catch { return res.status(400).send('Bad request'); }
-  if (rel && moderation.isHidden(rel)) return res.status(404).send('Not found');
+  if (rel) {
+    let normalized;
+    try { normalized = normalizeWorldPath(rel); }
+    catch { return res.status(404).send('Not found'); }
+    if (moderation.isHidden(normalized) || moderation.isQuarantined(normalized)) {
+      return res.status(404).send('Not found');
+    }
+  }
   next();
 });
 
@@ -649,14 +848,13 @@ app.get('/world/', worldCSP, async (req, res, next) => {
   try {
     // If the home page file is hidden by moderation, fall through to the auto-assembled
     // (hidden-filtered) sections page instead of rendering it via its pretty URL.
-    if (moderation.isHidden('pages/home.html')) {
+    if (moderation.isHidden('pages/home.html') || moderation.isQuarantined('pages/home.html')) {
       return renderSectionsPage(req, res);
     }
     // Try pages/home.html first
     let content, title, description;
     try {
-      const homePath = await resolveExistingWorldFile(WORLD_DIR, 'pages/home.html');
-      content = await fs.readFile(homePath, 'utf-8');
+      content = await readPublicWorldFile('pages/home.html', 'utf8');
       const divMatch = content.match(/<div[^>]*>/i);
       const tag = divMatch ? divMatch[0] : '';
       title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || 'Home';
@@ -665,8 +863,10 @@ app.get('/world/', worldCSP, async (req, res, next) => {
       if (e instanceof WorldPathError) return res.status(404).json({ error: 'File not found' });
       // Try index.html
       try {
-        const indexPath = await resolveExistingWorldFile(WORLD_DIR, 'index.html');
-        return res.sendFile(indexPath);
+        if (moderation.isHidden('index.html') || moderation.isQuarantined('index.html')) {
+          return renderSectionsPage(req, res);
+        }
+        return res.send(await readPublicWorldFile('index.html', 'utf8'));
       } catch (e2) {
         if (e2 instanceof WorldPathError) return res.status(404).json({ error: 'File not found' });
         // No home page or index — auto-assemble sections
@@ -696,10 +896,9 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
 
   try {
     // Hidden pages are unreachable via their pretty URL too (not just the static handler)
-    if (moderation.isHidden(`pages/${page}.html`)) return next();
+    if (isUnavailablePath(`pages/${page}.html`)) return next();
 
-    const pagePath = await resolveExistingWorldFile(WORLD_DIR, `pages/${page}.html`);
-    const content = await fs.readFile(pagePath, 'utf-8');
+    const content = await readPublicWorldFile(`pages/${page}.html`, 'utf8');
 
     // Extract metadata
     const divMatch = content.match(/<div[^>]*>/i);
@@ -721,11 +920,19 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
 // delivery so symbolic links and private paths are rejected before sendFile reads them.
 app.use('/world', worldCSP, async (req, res, next) => {
   let relativePath;
+  let releaseMutation;
   try {
-    relativePath = decodeURIComponent(req.path).replace(/^\/+/, '');
-    if (!relativePath) return next();
+    const decodedPath = decodeURIComponent(req.path).replace(/^\/+/, '');
+    if (!decodedPath) return next();
+    relativePath = normalizeWorldPath(decodedPath);
+    releaseMutation = await acquireWorldMutation(relativePath);
+    const release = () => releaseMutation?.();
+    res.once('finish', release);
+    res.once('close', release);
+    if (isUnavailablePath(relativePath)) return res.status(404).send('Not found');
     await resolveExistingWorldFile(WORLD_DIR, relativePath);
   } catch (error) {
+    releaseMutation?.();
     if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
       return res.status(404).send('Not found');
     }
@@ -1014,10 +1221,12 @@ app.get('/live', (req, res) => {
 // API: Get current stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => moderation.isHidden(relativePath) });
+    const files = (await listWorldFiles(WORLD_DIR, {
+      isHidden: relativePath => isUnavailablePath(relativePath),
+    })).filter(file => !isUnavailablePath(file.path));
     res.json({
       viewerCount: viewers.size,
-      totalContributions: history.filter(c => !moderation.isHidden(c.file_path)).length,
+      totalContributions: getPublicHistory().length,
       fileCount: files.length,
       files: files,
     });
@@ -1030,7 +1239,7 @@ app.get('/api/stats', async (req, res) => {
 app.get('/api/history', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, MAX_HISTORY);
   const offset = Math.max(0, parseInt(req.query.offset) || 0);
-  const visible = history.filter(c => !moderation.isHidden(c.file_path));
+  const visible = getPublicHistory();
   res.json({
     items: visible.slice(-(limit + offset), offset ? -offset : undefined).reverse(),
     total: visible.length,
@@ -1041,104 +1250,31 @@ app.get('/api/history', (req, res) => {
 // API: Get agent leaderboard with filters
 app.get('/api/leaderboard', (req, res) => {
   const { period = 'all', category = 'contributions' } = req.query;
-
-  // Calculate time threshold
   let timeThreshold = 0;
   const now = Date.now();
-  if (period === 'day') {
-    timeThreshold = now - 24 * 60 * 60 * 1000;
-  } else if (period === 'week') {
-    timeThreshold = now - 7 * 24 * 60 * 60 * 1000;
-  }
-
-  // Get contribution counts by agent for the period
-  const periodStats = new Map();
-
-  if (period !== 'all') {
-    // Calculate stats from history for the period
-    for (const contrib of history) {
-      const contribTime = new Date(contrib.timestamp).getTime();
-      if (contribTime >= timeThreshold) {
-        if (moderation.isHidden(contrib.file_path)) continue;
-        const agentName = contrib.agent_name;
-        if (!periodStats.has(agentName)) {
-          periodStats.set(agentName, {
-            contributions: 0,
-            reactions: 0,
-            comments: 0,
-          });
-        }
-        const stats = periodStats.get(agentName);
-        stats.contributions++;
-
-        // Count reactions received
-        if (contrib.reactions) {
-          for (const type of REACTION_TYPES) {
-            stats.reactions += (contrib.reactions[type]?.length || 0);
-          }
-        }
-      }
-    }
-
-    // Count comments for the period
-    for (const comment of comments.values()) {
-      const commentTime = new Date(comment.timestamp).getTime();
-      if (commentTime >= timeThreshold) {
-        if (!periodStats.has(comment.agentName)) {
-          periodStats.set(comment.agentName, {
-            contributions: 0,
-            reactions: 0,
-            comments: 0,
-          });
-        }
-        periodStats.get(comment.agentName).comments++;
-      }
-    }
-  }
-
-  // Build leaderboard
-  let leaderboard;
-
-  if (period === 'all') {
-    // KNOWN LIMITATION (moderation v1): the all-time leaderboard uses each agent's incremental
-    // lifetime counters, which still include contributions later hidden/deleted by moderation.
-    // This leaks only an integer tally (no path/content). Period leaderboards above exclude hidden.
-    leaderboard = Array.from(agents.values()).map(agent => ({
-      name: agent.name,
-      contributions: agent.contributions,
-      creates: agent.creates,
-      edits: agent.edits,
-      deletes: agent.deletes,
-      reactions: agent.reactionsReceived,
-      comments: agent.commentsCount,
-      score: category === 'contributions' ? agent.contributions :
-             category === 'reactions' ? agent.reactionsReceived :
-             agent.commentsCount,
-    }));
-  } else {
-    leaderboard = Array.from(periodStats.entries()).map(([name, stats]) => {
-      const agent = agents.get(name);
-      return {
-        name,
-        contributions: stats.contributions,
-        creates: 0,
-        edits: 0,
-        deletes: 0,
-        reactions: stats.reactions,
-        comments: stats.comments,
-        score: category === 'contributions' ? stats.contributions :
-               category === 'reactions' ? stats.reactions :
-               stats.comments,
-      };
-    });
-  }
-
-  // Sort by selected category
+  if (period === 'day') timeThreshold = now - 24 * 60 * 60 * 1000;
+  else if (period === 'week') timeThreshold = now - 7 * 24 * 60 * 60 * 1000;
+  const publicHistory = getPublicHistory().filter(contribution =>
+    period === 'all' || new Date(contribution.timestamp).getTime() >= timeThreshold);
+  const publicComments = getPublicComments().filter(comment =>
+    period === 'all' || new Date(comment.timestamp).getTime() >= timeThreshold);
+  const publicAgents = derivePublicAgentState({ publicHistory, comments: publicComments });
+  const leaderboard = Array.from(publicAgents.values()).map(agent => ({
+    name: agent.name,
+    contributions: agent.contributions,
+    creates: agent.creates,
+    edits: agent.edits,
+    deletes: agent.deletes,
+    reactions: agent.reactionsReceived,
+    comments: agent.commentsCount,
+    score: category === 'contributions' ? agent.contributions :
+      category === 'reactions' ? agent.reactionsReceived : agent.commentsCount,
+  }));
   leaderboard.sort((a, b) => b.score - a.score);
 
   res.json({
     leaderboard: leaderboard.slice(0, 50),
-    totalAgents: agents.size,
+    totalAgents: publicAgents.size,
     period,
     category,
   });
@@ -1326,6 +1462,7 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
       }
     }
     moderation.unhide(relPath);
+    moderation.reject(relPath);
     // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
     // `git add <deleted path>` stages the file's removal.
     try { await git.add(['--', relPath]); await git.commit(`moderation: remove ${relPath}`); } catch (e) { /* best effort */ }
@@ -1391,9 +1528,162 @@ app.post('/api/admin/moderation', adminLimiter, (req, res) => {
   res.json(body);
 });
 
+function authenticateQuarantineAdmin(req, res) {
+  const provided = req.headers['x-admin-secret'] || req.body?.secret;
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(provided, process.env.ADMIN_RESET_SECRET)) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/api/admin/quarantine', adminLimiter, (req, res) => {
+  if (!authenticateQuarantineAdmin(req, res)) return;
+  res.json({
+    quarantined: moderation.listQuarantined().map(record => ({
+      path: record.filePath,
+      content_hash: record.contentHash,
+      reasons: record.reasons,
+      agent_name: record.agentName,
+      timestamp: record.timestamp,
+    })),
+  });
+});
+
+app.post('/api/admin/quarantine/approve', adminLimiter, async (req, res) => {
+  if (!authenticateQuarantineAdmin(req, res)) return;
+  const { path: requestedPath, content_hash: requestedHash } = req.body || {};
+  if (typeof requestedPath !== 'string' || !requestedPath || typeof requestedHash !== 'string' || !requestedHash) {
+    return res.status(400).json({ error: 'path and content_hash are required' });
+  }
+  let filePath;
+  try { filePath = normalizeWorldPath(requestedPath); }
+  catch { return res.status(404).json({ error: 'File not found' }); }
+  const releaseMutation = await acquireWorldMutation(filePath);
+  try {
+    // Re-read both metadata and bytes inside the same path transaction. An operator decision is
+    // valid only for the exact record/version returned by the list route.
+    const quarantineRecord = moderation.listQuarantined().find(record => record.filePath === filePath);
+    let fullPath;
+    try { fullPath = await resolveExistingWorldFile(WORLD_DIR, filePath); }
+    catch (error) {
+      if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+        return res.status(404).json({ error: 'File not found' });
+      }
+      throw error;
+    }
+    if (!quarantineRecord) return res.status(404).json({ error: 'Quarantine record not found' });
+    const currentHash = contentHash(await fs.readFile(fullPath));
+    if (requestedHash !== quarantineRecord.contentHash || requestedHash !== currentHash) {
+      return res.status(409).json({ error: 'Quarantined file changed; refresh the current content_hash' });
+    }
+    const previousApproval = moderation.serializeModeration().moderation.approvedFiles[filePath];
+    moderation.approve(filePath, requestedHash);
+    moderation.releaseQuarantine(filePath);
+    try {
+      await moderation.save();
+    } catch (error) {
+      moderation.clearApproval(filePath);
+      if (previousApproval) moderation.approve(filePath, previousApproval);
+      moderation.quarantine(filePath, quarantineRecord);
+      // Another caller may have snapshotted the provisional approval while this save was queued.
+      // Persist the rollback after those snapshots so a failed decision cannot become public on restart.
+      try {
+        await moderation.save();
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], 'Approval and rollback persistence both failed');
+      }
+      throw error;
+    }
+    broadcast({ type: 'moderation', data: { action: 'approve', target: filePath } });
+    res.json({ success: true, action: 'approve', target: filePath, publicationStatus: 'published' });
+  } catch (error) {
+    console.error('Quarantine approval error:', error.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to approve quarantine' });
+  } finally {
+    releaseMutation();
+  }
+});
+
+app.post('/api/admin/quarantine/reject', adminLimiter, async (req, res) => {
+  if (!authenticateQuarantineAdmin(req, res)) return;
+  const { path: requestedPath } = req.body || {};
+  if (typeof requestedPath !== 'string' || !requestedPath) {
+    return res.status(400).json({ error: 'path is required' });
+  }
+  let filePath;
+  try { filePath = normalizeWorldPath(requestedPath); }
+  catch { return res.status(404).json({ error: 'File not found' }); }
+  const releaseMutation = await acquireWorldMutation(filePath);
+  try {
+    const quarantineRecord = moderation.listQuarantined().find(record => record.filePath === filePath);
+    if (!quarantineRecord) return res.status(404).json({ error: 'Quarantine record not found' });
+    const previousApproval = moderation.serializeModeration().moderation.approvedFiles[filePath];
+    let fullPath;
+    try { fullPath = await resolveExistingWorldFile(WORLD_DIR, filePath); }
+    catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+        fullPath = resolveWorldPath(WORLD_DIR, filePath);
+      } else if (error instanceof WorldPathError) {
+        return res.status(404).json({ error: 'File not found' });
+      } else {
+        throw error;
+      }
+    }
+    try { await fs.unlink(fullPath); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+
+    const subject = `moderation: reject ${filePath}`;
+    await queueGitOperation(async () => {
+      const alreadyStaged = (await git.raw(['diff', '--cached', '--name-only', '--', filePath]))
+        .split('\n').includes(filePath);
+      let tracked = true;
+      try { await git.raw(['ls-files', '--error-unmatch', '--', filePath]); }
+      catch { tracked = false; }
+      if (tracked && !alreadyStaged) await git.add(['-u', '--', filePath]);
+      try {
+        if (tracked || alreadyStaged) {
+          await git.raw(['commit', '--only', '--allow-empty', '-m', subject, '--', filePath]);
+        } else {
+          await git.raw(['commit', '--allow-empty', '-m', subject]);
+        }
+      } catch (error) {
+        // A failed hook must not leave this deletion staged for another path's contribution commit.
+        if (tracked || alreadyStaged) {
+          try { await git.raw(['reset', '--', filePath]); } catch { /* retain original error */ }
+        }
+        throw error;
+      }
+      const latest = (await git.log({ maxCount: 1 })).latest;
+      if (!latest || latest.message !== subject) throw new Error('Git rejection commit was not created');
+    });
+
+    moderation.reject(filePath);
+    try {
+      await moderation.save();
+    } catch (error) {
+      moderation.quarantine(filePath, quarantineRecord);
+      if (previousApproval) moderation.approve(filePath, previousApproval);
+      // Order a fail-closed snapshot after any unrelated save that observed provisional rejection.
+      try {
+        await moderation.save();
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], 'Rejection and rollback persistence both failed');
+      }
+      throw error;
+    }
+    // Do not broadcast the exact path of content that was never public.
+    res.json({ success: true, action: 'reject', target: filePath });
+  } catch (error) {
+    console.error('Quarantine rejection error:', error.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to reject quarantine' });
+  } finally {
+    releaseMutation();
+  }
+});
+
 // API: Get all agents
 app.get('/api/agents', (req, res) => {
-  const agentList = Array.from(agents.values()).map(agent => ({
+  const agentList = Array.from(getPublicAgentState().values()).map(agent => ({
     id: agent.id,
     name: agent.name,
     bio: agent.bio,
@@ -1403,7 +1693,7 @@ app.get('/api/agents', (req, res) => {
     reactionsReceived: agent.reactionsReceived,
     firstSeen: agent.firstSeen,
     lastSeen: agent.lastSeen,
-    achievements: Array.from(agentAchievements.get(agent.name) || []),
+    achievements: Array.from(getPublicAchievementIds(agent)),
   }));
 
   res.json({
@@ -1414,18 +1704,17 @@ app.get('/api/agents', (req, res) => {
 
 // API: Get specific agent profile
 app.get('/api/agents/:name', (req, res) => {
-  const agent = agents.get(req.params.name);
+  const publicHistory = getPublicHistory();
+  const agent = getPublicAgentState(publicHistory).get(req.params.name);
   if (!agent) {
     return res.status(404).json({ error: 'Agent not found' });
   }
 
-  // Get agent's recent contributions (exclude moderated/hidden file paths)
-  const agentHistory = history
-    .filter(h => h.agent_name === req.params.name && !moderation.isHidden(h.file_path))
+  const agentHistory = publicHistory
+    .filter(h => h.agent_name === req.params.name)
     .slice(-50);
 
-  // Get agent's achievements
-  const achievements = Array.from(agentAchievements.get(req.params.name) || [])
+  const achievements = Array.from(getPublicAchievementIds(agent))
     .map(id => ACHIEVEMENTS[id])
     .filter(Boolean);
 
@@ -1435,9 +1724,6 @@ app.get('/api/agents/:name', (req, res) => {
     bio: agent.bio,
     avatar: agent.avatar,
     specializations: agent.specializations,
-    // KNOWN LIMITATION (moderation v1): these lifetime stat counters still include contributions
-    // later hidden/deleted by moderation (an integer tally only — no path/content). recentContributions
-    // above is filtered. Recomputing incremental lifetime stats per request is deferred.
     stats: {
       contributions: agent.contributions,
       creates: agent.creates,
@@ -1469,12 +1755,12 @@ app.get('/api/achievements', (req, res) => {
 
 // API: Get agent achievements
 app.get('/api/agents/:name/achievements', (req, res) => {
-  const agent = agents.get(req.params.name);
+  const agent = getPublicAgentState().get(req.params.name);
   if (!agent) {
     return res.status(404).json({ error: 'Agent not found' });
   }
 
-  const earned = agentAchievements.get(req.params.name) || new Set();
+  const earned = getPublicAchievementIds(agent);
   const achievements = Array.from(earned).map(id => ({
     ...ACHIEVEMENTS[id],
     earned: true,
@@ -1499,9 +1785,36 @@ app.get('/api/agents/:name/achievements', (req, res) => {
 
 // API: Update agent profile
 app.put('/api/agents/:name/profile', agentLimiter, requireProofOfWork, (req, res) => {
-  const agent = agents.get(req.params.name);
-  if (!agent) {
+  const publicAgent = getPublicAgentState().get(req.params.name);
+  if (!publicAgent) {
     return res.status(404).json({ error: 'Agent not found' });
+  }
+  let agent = agents.get(req.params.name);
+  if (!agent) {
+    const id = generateAgentId(req.params.name);
+    agent = {
+      id,
+      name: req.params.name,
+      bio: '',
+      avatar: { type: 'generated', seed: id },
+      specializations: [],
+      profileSpecializations: [],
+      contributions: 0,
+      creates: 0,
+      edits: 0,
+      deletes: 0,
+      reactionsReceived: 0,
+      reactionsGiven: 0,
+      commentsCount: 0,
+      fileTypeStats: {},
+      collaborators: new Set(),
+      nightContributions: 0,
+      recentContributionTimes: [],
+      speedDemonUnlocked: false,
+      firstSeen: publicAgent.firstSeen,
+      lastSeen: publicAgent.lastSeen,
+    };
+    agents.set(req.params.name, agent);
   }
 
   const { bio, specializations, avatar_style } = req.body;
@@ -1512,7 +1825,7 @@ app.put('/api/agents/:name/profile', agentLimiter, requireProofOfWork, (req, res
 
   if (specializations !== undefined && Array.isArray(specializations)) {
     const validSpecs = ['frontend', 'backend', 'css', 'data', 'docs', 'graphics', 'fullstack', 'ai'];
-    agent.specializations = specializations
+    agent.profileSpecializations = specializations
       .filter(s => validSpecs.includes(s))
       .slice(0, 5);
   }
@@ -1522,15 +1835,16 @@ app.put('/api/agents/:name/profile', agentLimiter, requireProofOfWork, (req, res
   }
 
   saveState().catch(console.error);
+  const refreshedPublicAgent = getPublicAgentState().get(req.params.name);
 
   res.json({
     success: true,
     agent: {
-      id: agent.id,
-      name: agent.name,
-      bio: agent.bio,
-      avatar: agent.avatar,
-      specializations: agent.specializations,
+      id: refreshedPublicAgent.id,
+      name: refreshedPublicAgent.name,
+      bio: refreshedPublicAgent.bio,
+      avatar: refreshedPublicAgent.avatar,
+      specializations: refreshedPublicAgent.specializations,
     },
   });
 });
@@ -1618,7 +1932,7 @@ app.post('/api/vote', agentLimiter, requireProofOfWork, (req, res) => {
 app.get('/api/votes', (req, res) => {
   const allVotes = {};
   for (const [file, votes] of sectionVotes) {
-    if (moderation.isHidden(file)) continue;
+    if (isUnavailablePath(file)) continue;
     allVotes[file] = {
       score: votes.up.size - votes.down.size,
       upvotes: votes.up.size,
@@ -1749,11 +2063,8 @@ function scheduleChaosMode() {
 
 // API: Get contribution by ID
 app.get('/api/contributions/:id', (req, res) => {
-  const contribution = contributions.get(req.params.id);
+  const contribution = getPublicContribution(req.params.id);
   if (!contribution) {
-    return res.status(404).json({ error: 'Contribution not found' });
-  }
-  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
   res.json(contribution);
@@ -1761,11 +2072,8 @@ app.get('/api/contributions/:id', (req, res) => {
 
 // API: Add/remove reaction to contribution
 app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (req, res) => {
-  const contribution = contributions.get(req.params.id);
+  const contribution = getPublicContribution(req.params.id);
   if (!contribution) {
-    return res.status(404).json({ error: 'Contribution not found' });
-  }
-  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
@@ -1793,31 +2101,11 @@ app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (
     reactions.push(agent_name);
     action = 'added';
 
-    // Update stats
-    const reactingAgent = agents.get(agent_name);
-    if (reactingAgent) {
-      reactingAgent.reactionsGiven = (reactingAgent.reactionsGiven || 0) + 1;
-    }
-
-    const receivingAgent = agents.get(contribution.agent_name);
-    if (receivingAgent) {
-      receivingAgent.reactionsReceived = (receivingAgent.reactionsReceived || 0) + 1;
-    }
   } else {
     // Remove reaction
     reactions.splice(index, 1);
     action = 'removed';
 
-    // Update stats
-    const reactingAgent = agents.get(agent_name);
-    if (reactingAgent && reactingAgent.reactionsGiven > 0) {
-      reactingAgent.reactionsGiven--;
-    }
-
-    const receivingAgent = agents.get(contribution.agent_name);
-    if (receivingAgent && receivingAgent.reactionsReceived > 0) {
-      receivingAgent.reactionsReceived--;
-    }
   }
 
   // Save state
@@ -1844,11 +2132,8 @@ app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (
 
 // API: Get comments for a contribution
 app.get('/api/contributions/:id/comments', (req, res) => {
-  const contribution = contributions.get(req.params.id);
+  const contribution = getPublicContribution(req.params.id);
   if (!contribution) {
-    return res.status(404).json({ error: 'Contribution not found' });
-  }
-  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
@@ -1875,11 +2160,8 @@ app.get('/api/contributions/:id/comments', (req, res) => {
 
 // API: Add comment to a contribution
 app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (req, res) => {
-  const contribution = contributions.get(req.params.id);
+  const contribution = getPublicContribution(req.params.id);
   if (!contribution) {
-    return res.status(404).json({ error: 'Contribution not found' });
-  }
-  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
@@ -1908,7 +2190,8 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
   moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
   // Validate parent comment if provided
-  if (parent_id && !comments.has(parent_id)) {
+  const parentComment = parent_id ? comments.get(parent_id) : null;
+  if (parent_id && (!parentComment || parentComment.targetType !== 'contribution' || parentComment.targetId !== req.params.id)) {
     return res.status(400).json({ error: 'Parent comment not found' });
   }
 
@@ -1926,12 +2209,6 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
 
   // Update contribution comment count
   contribution.commentCount = (contribution.commentCount || 0) + 1;
-
-  // Update agent stats
-  const agent = agents.get(agent_name);
-  if (agent) {
-    agent.commentsCount = (agent.commentsCount || 0) + 1;
-  }
 
   // Save state
   saveState().catch(console.error);
@@ -1952,9 +2229,11 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
 });
 
 // API: Get comments for a file
-app.get('/api/files/:path(*)/comments', (req, res) => {
-  const filePath = req.params.path;
-  if (moderation.isHidden(filePath)) {
+app.get('/api/files/:path(*)/comments', async (req, res) => {
+  let filePath;
+  try { filePath = normalizeWorldPath(req.params.path); }
+  catch { return res.status(404).json({ error: 'File not found' }); }
+  if (isUnavailablePath(filePath)) {
     return res.status(404).json({ error: 'File not found' });
   }
 
@@ -1979,9 +2258,11 @@ app.get('/api/files/:path(*)/comments', (req, res) => {
 });
 
 // API: Add comment to a file
-app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req, res) => {
-  const filePath = req.params.path;
-  if (moderation.isHidden(filePath)) {
+app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, async (req, res) => {
+  let filePath;
+  try { filePath = normalizeWorldPath(req.params.path); }
+  catch { return res.status(404).json({ error: 'File not found' }); }
+  if (isUnavailablePath(filePath)) {
     return res.status(404).json({ error: 'File not found' });
   }
   const { agent_name, content, parent_id, line_number } = req.body;
@@ -2008,7 +2289,8 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
   moderation.recordAgentIp(agent_name, req.ip);
   moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
-  if (parent_id && !comments.has(parent_id)) {
+  const parentComment = parent_id ? comments.get(parent_id) : null;
+  if (parent_id && (!parentComment || parentComment.targetType !== 'file' || parentComment.targetId !== filePath)) {
     return res.status(400).json({ error: 'Parent comment not found' });
   }
 
@@ -2024,11 +2306,6 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
   };
 
   comments.set(comment.id, comment);
-
-  const agent = agents.get(agent_name);
-  if (agent) {
-    agent.commentsCount = (agent.commentsCount || 0) + 1;
-  }
 
   saveState().catch(console.error);
 
@@ -2048,28 +2325,27 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
 
 // API: Get diff for a contribution
 app.get('/api/contributions/:id/diff', async (req, res) => {
-  const contribution = contributions.get(req.params.id);
+  const contribution = getPublicContribution(req.params.id);
   if (!contribution) {
-    return res.status(404).json({ error: 'Contribution not found' });
-  }
-  // A hidden file's content must not leak through its git diff either.
-  if (moderation.isHidden(contribution.file_path)) {
     return res.status(404).json({ error: 'Contribution not found' });
   }
 
   try {
-    // Get the git log to find commits related to this contribution
-    const log = await git.log({ maxCount: 200 });
-    const commit = log.all.find(c =>
-      c.message.includes(contribution.file_path) &&
-      c.message.includes(contribution.agent_name)
-    );
-
-    if (!commit) {
+    if (typeof contribution.gitHash !== 'string' || !/^[0-9a-f]{40}$/i.test(contribution.gitHash)) {
       return res.json({
         diff: null,
         message: 'No git diff available for this contribution',
       });
+    }
+
+    const log = await git.log({
+      from: `${contribution.gitHash}^`,
+      to: contribution.gitHash,
+      maxCount: 1,
+    });
+    const commit = log.latest;
+    if (!commit || commit.hash !== contribution.gitHash) {
+      return res.json({ diff: null, message: 'No git diff available for this contribution' });
     }
 
     // Get diff for the specific commit
@@ -2113,8 +2389,8 @@ app.get('/api/contributions/:id/diff', async (req, res) => {
 
 // API: Get agent network graph data
 app.get('/api/network/graph', (req, res) => {
-  // Build nodes from agents
-  const nodes = Array.from(agents.values()).map(agent => ({
+  const publicHistory = getPublicHistory();
+  const nodes = Array.from(getPublicAgentState(publicHistory).values()).map(agent => ({
     id: agent.name,
     name: agent.name,
     contributions: agent.contributions,
@@ -2127,8 +2403,7 @@ app.get('/api/network/graph', (req, res) => {
 
   // Group contributions by file to find collaborators
   const fileContributors = new Map();
-  for (const contrib of history) {
-    if (moderation.isHidden(contrib.file_path)) continue;
+  for (const contrib of publicHistory) {
     if (!fileContributors.has(contrib.file_path)) {
       fileContributors.set(contrib.file_path, new Set());
     }
@@ -2179,8 +2454,8 @@ app.get('/api/trends', (req, res) => {
   }
 
   // Filter recent contributions (exclude moderated/hidden ones)
-  const recentContribs = history.filter(h =>
-    new Date(h.timestamp).getTime() >= timeThreshold && !moderation.isHidden(h.file_path)
+  const recentContribs = getPublicHistory().filter(h =>
+    new Date(h.timestamp).getTime() >= timeThreshold
   );
 
   // Count file edits
@@ -2227,12 +2502,14 @@ app.get('/api/trends', (req, res) => {
 
 // API: Get file history (for timeline)
 app.get('/api/files/:path(*)/history', (req, res) => {
-  const filePath = req.params.path;
-  if (moderation.isHidden(filePath)) {
+  let filePath;
+  try { filePath = normalizeWorldPath(req.params.path); }
+  catch { return res.status(404).json({ error: 'File not found' }); }
+  if (isUnavailablePath(filePath)) {
     return res.status(404).json({ error: 'File not found' });
   }
 
-  const fileHistory = history
+  const fileHistory = getPublicHistory()
     .filter(h => h.file_path === filePath)
     .map(h => ({
       id: h.id,
@@ -2265,11 +2542,9 @@ app.get('/api/activity/heatmap', (req, res) => {
   }
 
   // Count contributions per day
-  for (const contrib of history) {
+  for (const contrib of getPublicHistory()) {
     // Filter by agent if specified
     if (agent && contrib.agent_name !== agent) continue;
-    if (moderation.isHidden(contrib.file_path)) continue;
-
     const contribDate = new Date(contrib.timestamp);
     if (contribDate >= oneYearAgo) {
       const dateStr = contribDate.toISOString().split('T')[0];
@@ -2303,22 +2578,13 @@ app.get('/api/activity/heatmap', (req, res) => {
 
 // API: Get git log (timeline)
 app.get('/api/timeline', async (req, res) => {
-  try {
-    const log = await git.log({ maxCount: 100 });
-    // Don't surface moderation-removal commits, or commits referencing a currently-hidden file path.
-    const hidden = moderation.listHidden();
-    res.json(log.all
-      .filter(c => !/^moderation: remove /i.test(c.message) &&
-        !hidden.some(h => c.message.toLowerCase().includes(h)))
-      .map(commit => ({
-        hash: commit.hash.slice(0, 7),
-        date: commit.date,
-        message: commit.message,
-        author: commit.author_name,
-      })));
-  } catch (e) {
-    res.json([]);
-  }
+  const timeline = getPublicHistory().slice(-100).reverse().map(contribution => ({
+    hash: contribution.gitHash ? contribution.gitHash.slice(0, 7) : null,
+    date: contribution.timestamp,
+    message: contribution.message || `[${contribution.agent_name}] ${contribution.action}: ${contribution.file_path}`,
+    author: contribution.agent_name,
+  }));
+  res.json(timeline);
 });
 
 // API: Search files, agents, and contributions
@@ -2334,18 +2600,17 @@ app.get('/api/search', (req, res) => {
 
   // Search files
   if (type === 'all' || type === 'files') {
-    const fileResults = history
+    const fileResults = getPublicHistory()
       .filter(h => h.file_path.toLowerCase().includes(query))
       .map(h => h.file_path)
       .filter((v, i, a) => a.indexOf(v) === i) // unique
-      .filter(f => !moderation.isHidden(f))
       .slice(0, 10);
     results.files = fileResults.map(f => ({ path: f, type: 'file' }));
   }
 
   // Search agents
   if (type === 'all' || type === 'agents') {
-    const agentResults = Array.from(agents.values())
+    const agentResults = Array.from(getPublicAgentState().values())
       .filter(a =>
         a.name.toLowerCase().includes(query) ||
         (a.bio && a.bio.toLowerCase().includes(query)) ||
@@ -2362,12 +2627,11 @@ app.get('/api/search', (req, res) => {
 
   // Search contributions
   if (type === 'all' || type === 'contributions') {
-    const contribResults = history
+    const contribResults = getPublicHistory()
       .filter(h =>
         (h.message?.toLowerCase().includes(query) ||
         h.file_path.toLowerCase().includes(query) ||
-        h.agent_name.toLowerCase().includes(query)) &&
-        !moderation.isHidden(h.file_path)
+        h.agent_name.toLowerCase().includes(query))
       )
       .slice(-20)
       .reverse();
@@ -2402,8 +2666,7 @@ app.get('/api/pages', async (req, res) => {
 // API: Get project plan (PROJECT.md)
 app.get('/api/project', async (req, res) => {
   try {
-    const projectPath = await resolveExistingWorldFile(WORLD_DIR, 'PROJECT.md');
-    const content = await fs.readFile(projectPath, 'utf-8');
+    const content = await readPublicWorldFile('PROJECT.md', 'utf8');
     res.json({ content });
   } catch (error) {
     if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
@@ -2417,14 +2680,18 @@ app.get('/api/project', async (req, res) => {
 // API: Get world structure for agents
 app.get('/api/world/structure', async (req, res) => {
   try {
-    const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => moderation.isHidden(relativePath) });
+    const files = (await listWorldFiles(WORLD_DIR, {
+      isHidden: relativePath => isUnavailablePath(relativePath),
+    })).filter(file => !isUnavailablePath(file.path));
+    const pages = await getPages();
+    const currentFiles = files.filter(file => !isUnavailablePath(file.path));
 
     // Categorize files
     const structure = {
       theme: '/world/css/theme.css',
       coreJs: '/world/js/core.js',
       guidelines: '/world/WORLD.md',
-      sections: files
+      sections: currentFiles
         .filter(f => f.path.startsWith('sections/') && f.path.endsWith('.html'))
         .map(f => ({
           path: f.path,
@@ -2432,10 +2699,10 @@ app.get('/api/world/structure', async (req, res) => {
           size: f.size,
           modified: f.modified,
         })),
-      pages: await getPages(),
-      components: files.filter(f => f.path.startsWith('components/')),
-      assets: files.filter(f => f.path.startsWith('assets/')),
-      rootFiles: files.filter(f => !f.path.includes('/')),
+      pages,
+      components: currentFiles.filter(f => f.path.startsWith('components/')),
+      assets: currentFiles.filter(f => f.path.startsWith('assets/')),
+      rootFiles: currentFiles.filter(f => !f.path.includes('/')),
       tips: [
         'Use the shared theme.css for consistent styling',
         'Create new sections in sections/ for the homepage',
@@ -2456,8 +2723,7 @@ app.get('/api/world/structure', async (req, res) => {
 // API: Get world guidelines
 app.get('/api/world/guidelines', async (req, res) => {
   try {
-    const guidelinesPath = await resolveExistingWorldFile(WORLD_DIR, 'WORLD.md');
-    const content = await fs.readFile(guidelinesPath, 'utf-8');
+    const content = await readPublicWorldFile('WORLD.md', 'utf8');
     res.json({ content });
   } catch (error) {
     if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
@@ -2472,14 +2738,15 @@ app.get('/api/world/guidelines', async (req, res) => {
 app.get('/api/world/sections', async (req, res) => {
   try {
     const sectionFiles = (await listWorldFiles(WORLD_DIR, {
-      isHidden: relativePath => moderation.isHidden(relativePath),
+      isHidden: relativePath => isUnavailablePath(relativePath),
     })).filter(file => file.path.startsWith('sections/') && !file.path.slice('sections/'.length).includes('/') && file.path.endsWith('.html'));
 
     const sections = [];
     for (const file of sectionFiles) {
       const fileName = path.basename(file.path);
-      const filePath = await resolveExistingWorldFile(WORLD_DIR, file.path);
-      const content = await fs.readFile(filePath, 'utf-8');
+      let content;
+      try { content = await readPublicWorldFile(file.path, 'utf8'); }
+      catch (error) { if (error instanceof WorldPathError) continue; throw error; }
 
       // Extract data-* attributes from the <section> tag
       const sectionMatch = content.match(/<section[^>]*>/i);
@@ -2528,13 +2795,7 @@ app.get('/api/world/*', async (req, res) => {
   try {
     const filePath = normalizeWorldPath(req.params[0]);
 
-    // Don't serve the content of a moderated/hidden file via the read API either
-    if (moderation.isHidden(filePath)) {
-      return res.status(404).json({ error: 'File not found' });
-    }
-
-    const fullPath = await resolveExistingWorldFile(WORLD_DIR, filePath);
-    const content = await fs.readFile(fullPath, 'utf-8');
+    const content = await readPublicWorldFile(filePath, 'utf8');
     res.json({ path: filePath, content });
   } catch (error) {
     if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
@@ -2548,7 +2809,9 @@ app.get('/api/world/*', async (req, res) => {
 // API: List all world files
 app.get('/api/files', async (req, res) => {
   try {
-    const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => moderation.isHidden(relativePath) });
+    const files = (await listWorldFiles(WORLD_DIR, {
+      isHidden: relativePath => isUnavailablePath(relativePath),
+    })).filter(file => !isUnavailablePath(file.path));
     res.json(files);
   } catch (error) {
     res.status(500).json({ error: 'Failed to list files' });
@@ -2573,9 +2836,10 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       return res.status(400).json({ error: 'file_path is required' });
     }
 
-    // Sanitize file path
-    const sanitizedPath = file_path.replace(/\.\./g, '').replace(/^\/+/, '');
-    const ext = path.extname(sanitizedPath).toLowerCase();
+    let canonicalPath;
+    try { canonicalPath = normalizeWorldPath(file_path); }
+    catch { return res.status(400).json({ error: 'file_path is invalid' }); }
+    const ext = path.extname(canonicalPath).toLowerCase();
 
     if (!ALLOWED_EXTENSIONS.includes(ext)) {
       return res.status(400).json({
@@ -2583,41 +2847,52 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       });
     }
 
-    const fullPath = path.join(WORLD_DIR, sanitizedPath);
-
-    // Security: ensure path is within world (path.sep prevents traversal to sibling dirs)
-    if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
     // Block edits to shared/structural files that render on every world page. Compare against the
     // CANONICAL resolved path (path.join normalizes ./, //, redundant separators) so the set
     // cannot be bypassed with inputs like './js/core.js' or 'js//core.js'. Overwriting these would
     // let one agent inject persistent script/markup into every page (site-wide stored XSS / defacement).
-    const relativePath = path.relative(WORLD_DIR, fullPath).split(path.sep).join('/').toLowerCase();
-    if (PROTECTED_WORLD_FILES.has(relativePath)) {
+    if (PROTECTED_WORLD_FILES.has(canonicalPath.toLowerCase())) {
       return res.status(403).json({
         error: 'This file is protected and cannot be modified by agents. Build inside pages/ or sections/ instead.',
       });
     }
 
+    const releaseMutation = await acquireWorldMutation(canonicalPath);
+    try {
     if (moderation.isBanned(agent_name, req.ip)) {
       return res.status(403).json({ error: 'This agent is banned.' });
     }
-    const modHit = moderation.scanContent({ content, message, agentName: agent_name, filePath: sanitizedPath });
+    const modHit = moderation.scanContent({ content, message, agentName: agent_name, filePath: canonicalPath });
     if (modHit) {
       console.warn(`[moderation] rejected contribute from ${agent_name} (${modHit.reason}: ${modHit.rule})`);
       return res.status(403).json({ error: 'Contribution rejected by content policy.' });
     }
     // A moderated/hidden path is frozen: agents cannot edit/recreate/delete it (that would rewrite
     // the file and re-broadcast its content, working around the admin kill-switch).
-    if (moderation.isHidden(sanitizedPath)) {
+    if (moderation.isHidden(canonicalPath)) {
       return res.status(403).json({ error: 'This file is under moderation and cannot be modified.' });
     }
 
+    let evaluation = null;
+    let decision = { status: 'published', reasons: [] };
+    if (action !== 'delete') {
+      evaluation = evaluatePublication({
+        content: content || '',
+        message: message || '',
+        agentName: agent_name,
+        filePath: canonicalPath,
+      });
+      decision = decideStoredPublication({
+        evaluation,
+        approvedHash: moderation.isApproved(canonicalPath, evaluation.contentHash)
+          ? evaluation.contentHash
+          : undefined,
+      });
+    }
+
     // Check file size for create/edit
-    if (action !== 'delete' && content) {
-      if (Buffer.byteLength(content, 'utf-8') > MAX_FILE_SIZE) {
+    if (action !== 'delete' && evaluation) {
+      if (Buffer.byteLength(evaluation.content, 'utf-8') > MAX_FILE_SIZE) {
         return res.status(400).json({ error: `File too large. Max size: ${MAX_FILE_SIZE / 1024}KB` });
       }
     }
@@ -2625,45 +2900,69 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
     // Check max files
     const currentFiles = await listWorldFiles(WORLD_DIR, {
       includeHidden: true,
-      isHidden: relativePath => moderation.isHidden(relativePath),
+      isHidden: relativePath => isUnavailablePath(relativePath),
     });
     if (action === 'create' && currentFiles.length >= MAX_FILES) {
       return res.status(400).json({ error: `Max file limit reached: ${MAX_FILES}` });
     }
+    const fullPath = await resolveWorldWriteFile(canonicalPath, { createParents: action !== 'delete' });
 
     // Find last editor of this file for collaboration tracking
     let lastEditor = null;
     for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].file_path === sanitizedPath && history[i].agent_name !== agent_name) {
+      if (history[i].file_path === canonicalPath && history[i].agent_name !== agent_name) {
         lastEditor = history[i].agent_name;
         break;
       }
     }
 
-    // Perform action
     const contribution = {
       id: randomUUID(),
       timestamp: new Date().toISOString(),
       agent_name: agent_name.slice(0, 100),
       action,
-      file_path: sanitizedPath,
+      file_path: canonicalPath,
       message: (message || '').slice(0, 500),
       reactions: { fire: [], heart: [], rocket: [], eyes: [] },
       commentCount: 0,
+      publicationStatus: decision.status,
     };
 
     if (action === 'delete') {
+      let removed = false;
       try {
         await fs.unlink(fullPath);
+        removed = true;
       } catch (e) {
         if (e.code !== 'ENOENT') throw e;
       }
+      if (removed) {
+        moderation.releaseQuarantine(canonicalPath);
+        moderation.clearApproval(canonicalPath);
+      }
     } else {
-      // Create directory if needed
-      await fs.mkdir(path.dirname(fullPath), { recursive: true });
-      await fs.writeFile(fullPath, content || '');
-      contribution.contentPreview = (content || '').slice(0, 200);
+      if (decision.status === 'quarantined') {
+        // Persist the deny boundary before risky bytes can replace an existing public version.
+        moderation.clearApproval(canonicalPath);
+        moderation.quarantine(canonicalPath, {
+          contentHash: evaluation.contentHash,
+          reasons: decision.reasons,
+          agentName: contribution.agent_name,
+          timestamp: contribution.timestamp,
+        });
+        await moderation.save();
+      }
+      await replaceWorldFileAtomically(fullPath, evaluation.content);
+      contribution.contentPreview = evaluation.content.slice(0, 200);
+      if (decision.status === 'published') {
+        moderation.releaseQuarantine(canonicalPath);
+        moderation.clearApproval(canonicalPath);
+      }
     }
+
+    // A safe correction may make older published records visible again. Snapshot after that path
+    // transition but before inserting this new immutable record, so old awards are not re-emitted.
+    const achievementsBefore = getPublicAchievementSnapshot();
 
     // Record in history and contributions index
     history.push(contribution);
@@ -2673,50 +2972,53 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       contributions.delete(removed.id);
     }
 
-    // Track agent stats (with file path and collaborator)
-    trackAgentContribution(contribution.agent_name, action, sanitizedPath, lastEditor);
+    if (getPublicContribution(contribution.id)) {
+      trackAgentContribution(contribution.agent_name, action, canonicalPath, lastEditor);
+    }
 
     // Record agent IP for moderation
     moderation.recordAgentIp(agent_name, req.ip);
-  moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
+    await moderation.save();
+    await saveState();
 
-    // Save state (async, don't wait)
-    saveState().catch(console.error);
+    // Bind the immutable record to the exact bytes written while this path transaction is held.
+    // Other paths may continue writing, but the serialized Git queue stages only this target.
+    await gitCommit(contribution);
 
-    // Git commit (async, don't wait)
-    gitCommit(contribution).catch(console.error);
+    if (getPublicContribution(contribution.id)) {
+      broadcastNewPublicAchievements(achievementsBefore, getPublicAchievementSnapshot());
+      broadcast({
+        type: 'contribution',
+        data: contribution,
+        viewerCount: viewers.size,
+      });
+    }
 
-    // Broadcast to viewers
-    broadcast({
-      type: 'contribution',
-      data: contribution,
-      viewerCount: viewers.size,
-    });
+    console.log(`[${agent_name}] ${action} ${canonicalPath}`);
 
-    console.log(`[${agent_name}] ${action} ${sanitizedPath}`);
-
-    res.json({
-      success: true,
-      contribution,
-      message: `Successfully ${action}d ${sanitizedPath}`,
-    });
+    res.json(buildContributionResponse({ contribution, decision }));
+    } finally {
+      releaseMutation();
+    }
 
   } catch (error) {
     console.error('Contribution error:', error);
-    res.status(500).json({ error: 'Failed to process contribution' });
+    if (error instanceof WorldPathError) res.status(403).json({ error: 'Access denied' });
+    else res.status(500).json({ error: 'Failed to process contribution' });
   }
 });
 
 // Helper: Get all pages from world/pages/*.html with metadata
 async function getPages() {
   const pageFiles = (await listWorldFiles(WORLD_DIR, {
-    isHidden: relativePath => moderation.isHidden(relativePath),
+    isHidden: relativePath => isUnavailablePath(relativePath),
   })).filter(file => file.path.startsWith('pages/') && !file.path.slice('pages/'.length).includes('/') && file.path.endsWith('.html'));
 
   const pages = [];
   for (const file of pageFiles) {
-    const filePath = await resolveExistingWorldFile(WORLD_DIR, file.path);
-    const content = await fs.readFile(filePath, 'utf-8');
+    let content;
+    try { content = await readPublicWorldFile(file.path, 'utf8'); }
+    catch (error) { if (error instanceof WorldPathError) continue; throw error; }
     const slug = path.basename(file.path).replace('.html', '');
 
     // Extract data-page-* attributes from the wrapper div
@@ -2741,7 +3043,7 @@ async function getPages() {
 
   // Sort by navOrder
   pages.sort((a, b) => a.navOrder - b.navOrder);
-  return pages.filter(p => !moderation.isHidden(`pages/${p.file}`));
+  return pages.filter(p => !isUnavailablePath(`pages/${p.file}`));
 }
 
 // Helper: Generate navigation HTML from discovered pages
@@ -2781,12 +3083,14 @@ function generateNav(pages, currentSlug) {
 async function renderSectionsPage(req, res) {
   try {
     const sectionFiles = (await listWorldFiles(WORLD_DIR, {
-      isHidden: relativePath => moderation.isHidden(relativePath),
+      isHidden: relativePath => isUnavailablePath(relativePath),
     })).filter(file => file.path.startsWith('sections/') && !file.path.slice('sections/'.length).includes('/') && file.path.endsWith('.html'));
 
     const sections = [];
     for (const file of sectionFiles) {
-      const content = await fs.readFile(await resolveExistingWorldFile(WORLD_DIR, file.path), 'utf-8');
+      let content;
+      try { content = await readPublicWorldFile(file.path, 'utf8'); }
+      catch (error) { if (error instanceof WorldPathError) continue; throw error; }
       const tag = (content.match(/<section[^>]*>/i) || [''])[0];
       const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
       const voteData = sectionVotes.get(file.path);
@@ -2842,8 +3146,8 @@ async function renderSectionsPage(req, res) {
 async function renderPage(content, title, description, slug) {
   let layout;
   try {
-    const layoutPath = await resolveExistingWorldFile(WORLD_DIR, 'layout.html');
-    layout = await fs.readFile(layoutPath, 'utf-8');
+    if (moderation.isHidden('layout.html') || moderation.isQuarantined('layout.html')) return content;
+    layout = await readPublicWorldFile('layout.html', 'utf8');
   } catch (e) {
     if (e instanceof WorldPathError) throw e;
     if (e.code !== 'ENOENT') throw e;
@@ -2922,18 +3226,29 @@ function sanitizeForGit(str) {
 
 // Helper: Git commit (serialized to prevent concurrent git operations)
 let gitPromise = Promise.resolve();
+function queueGitOperation(operation) {
+  const current = gitPromise.then(operation);
+  gitPromise = current.catch(() => {});
+  return current;
+}
 function gitCommit(contribution) {
-  gitPromise = gitPromise.then(() => _gitCommitImpl(contribution)).catch(console.error);
-  return gitPromise;
+  return queueGitOperation(() => _gitCommitImpl(contribution)).catch(console.error);
 }
 async function _gitCommitImpl(contribution) {
   try {
     const agentName = sanitizeForGit(contribution.agent_name);
     const message = sanitizeForGit(contribution.message) || 'No message';
-    await git.add('.');
-    await git.commit(
-      `[${agentName}] ${contribution.action}: ${contribution.file_path}\n\n${message}`
-    );
+    if (contribution.action === 'delete') {
+      await git.add(['-u', '--', contribution.file_path]);
+    } else {
+      await git.add(['--', contribution.file_path]);
+    }
+    const commitMessage = `[${agentName}] ${contribution.action}: ${contribution.file_path}\n\n${message}`;
+    await git.raw(['commit', '--only', '-m', commitMessage, '--', contribution.file_path]);
+    const latest = (await git.log({ maxCount: 1 })).latest;
+    if (!latest) return;
+    contribution.gitHash = latest.hash;
+    await saveState();
   } catch (e) {
     // Git might not be initialized, that's ok
   }
@@ -2948,6 +3263,89 @@ async function init() {
 
   // Load moderation state from its own server-only file (migrates out of legacy state.json once)
   await moderation.load();
+
+  // Discover all current public-world candidates without relying on a known incident filename.
+  // The audit runs before traffic, then legacy contribution statuses are migrated against that
+  // completed view so records on newly quarantined paths never become briefly public.
+  const startupFiles = await listWorldFiles(WORLD_DIR, { includeHidden: true });
+  const startupFilePaths = new Set(startupFiles.map(file => file.path));
+  const startupSources = new Map();
+  const startupEvaluations = new Map();
+  const startupQuarantines = await auditWorldForQuarantine({
+    files: startupFiles,
+    readFile: async filePath => {
+      const source = await fs.readFile(await resolveExistingWorldFile(WORLD_DIR, filePath), 'utf8');
+      startupSources.set(filePath, source);
+      return source;
+    },
+    isApproved: (filePath, hash) => moderation.isApproved(filePath, hash),
+    evaluatePublication: input => {
+      const evaluation = evaluatePublication(input);
+      startupEvaluations.set(input.filePath, evaluation);
+      return evaluation;
+    },
+  });
+  let moderationChanged = false;
+  const existingQuarantines = new Map(
+    moderation.listQuarantined().map(record => [record.filePath, record]),
+  );
+  const approvedFiles = moderation.serializeModeration().moderation.approvedFiles;
+
+  // Reconcile stale state before adding current risky records. Missing paths cannot be repaired by
+  // an admin decision; safe bytes left behind by an interrupted correction must not stay hidden.
+  for (const record of existingQuarantines.values()) {
+    if (!startupFilePaths.has(record.filePath)) {
+      if (moderation.reject(record.filePath)) moderationChanged = true;
+      continue;
+    }
+    const evaluation = startupEvaluations.get(record.filePath);
+    const source = startupSources.get(record.filePath);
+    if (!evaluation || source === undefined) continue;
+    const hash = contentHash(source);
+    if (evaluation.status === 'published') {
+      if (moderation.releaseQuarantine(record.filePath)) moderationChanged = true;
+      if (moderation.clearApproval(record.filePath)) moderationChanged = true;
+    } else if (moderation.isApproved(record.filePath, hash)) {
+      if (moderation.releaseQuarantine(record.filePath)) moderationChanged = true;
+    }
+  }
+  for (const [filePath, approvedHash] of Object.entries(approvedFiles)) {
+    if (!startupFilePaths.has(filePath)) {
+      if (moderation.reject(filePath)) moderationChanged = true;
+      continue;
+    }
+    const evaluation = startupEvaluations.get(filePath);
+    const source = startupSources.get(filePath);
+    if (evaluation && source !== undefined &&
+        (evaluation.status === 'published' || contentHash(source) !== approvedHash)) {
+      if (moderation.clearApproval(filePath)) moderationChanged = true;
+    }
+  }
+  for (const record of startupQuarantines) {
+    const existing = existingQuarantines.get(record.filePath);
+    const reconciledRecord = existing && existing.contentHash === record.contentHash
+      ? { ...record, agentName: existing.agentName, timestamp: existing.timestamp }
+      : record;
+    if (moderation.quarantine(record.filePath, reconciledRecord)) moderationChanged = true;
+  }
+  let historyMigrated = false;
+  for (const contribution of history) {
+    if (contribution.publicationStatus !== undefined) continue;
+    let normalizedPath;
+    try { normalizedPath = normalizeWorldPath(contribution.file_path); }
+    catch { normalizedPath = null; }
+    const evaluation = normalizedPath ? startupEvaluations.get(normalizedPath) : null;
+    const source = normalizedPath ? startupSources.get(normalizedPath) : undefined;
+    const auditedHtml = normalizedPath ? /^(?:pages|sections)\/.+\.html$/i.test(normalizedPath) : false;
+    const auditedSafe = !auditedHtml || (evaluation && source !== undefined &&
+      (evaluation.status === 'published' || moderation.isApproved(normalizedPath, contentHash(source))));
+    contribution.publicationStatus = normalizedPath && !isUnavailablePath(normalizedPath) && auditedSafe
+      ? 'published'
+      : 'quarantined';
+    historyMigrated = true;
+  }
+  if (moderationChanged) await moderation.save();
+  if (historyMigrated) await saveState();
 
   // If we restarted mid-chaos, re-arm the deactivation timer (loadState only clears expired chaos)
   rearmChaosTimer();
@@ -2968,7 +3366,7 @@ async function init() {
   }, POW_EXPIRY_MS);
 
   // Create initial file if world is empty
-  const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => moderation.isHidden(relativePath) });
+  const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => isUnavailablePath(relativePath) });
   if (files.length === 0) {
     const welcomeHtml = `<!DOCTYPE html>
 <html lang="en">

@@ -2,17 +2,21 @@
 
 const path = require('path');
 const fs = require('fs').promises;
+const { normalizeWorldPath } = require('./world-files');
 
 // Moderation state lives in its OWN server-only file (gitignored) so agent IPs / banned IPs are
 // never written into the shared/tracked state.json or its backups.
-const MODERATION_FILE = path.join(__dirname, '../data/moderation.json');
-const LEGACY_STATE_FILE = path.join(__dirname, '../data/state.json');
+const DATA_DIR = process.env.AIBUILDS_DATA_DIR || path.join(__dirname, '../data');
+const MODERATION_FILE = path.join(DATA_DIR, 'moderation.json');
+const LEGACY_STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 // In-memory moderation state (persisted via serializeModeration / loadModeration).
 const hiddenFiles = new Set();   // normalized world-relative paths
 const bannedAgents = new Set();  // exact agent_name
 const bannedIps = new Set();     // exact ip
 const agentIps = new Map();      // agent_name -> last seen ip (private)
+const quarantinedFiles = new Map(); // path -> public-safe quarantine metadata
+const approvedFiles = new Map();    // path -> approved content hash
 
 // Normalize any path input to a comparable, CANONICAL world-relative key. Canonicalization
 // (path.posix.normalize) collapses ./ and ../ segments so a hidden "sections/x.html" can't be
@@ -30,14 +34,37 @@ function normalizePath(p) {
   return n.toLowerCase();
 }
 
+// Publication paths use the exact Task-1 World identity. Unlike the legacy hide/ban key,
+// quarantine decisions must preserve case and must not rewrite a legitimate `world/` directory.
+function normalizePublicationPath(p) {
+  try { return normalizeWorldPath(p); }
+  catch { return ''; }
+}
+
 function loadModeration(state) {
   hiddenFiles.clear(); bannedAgents.clear(); bannedIps.clear(); agentIps.clear();
+  quarantinedFiles.clear(); approvedFiles.clear();
   const m = (state && state.moderation) || {};
   for (const p of m.hiddenFiles || []) hiddenFiles.add(normalizePath(p));
   for (const a of m.bannedAgents || []) bannedAgents.add(a);
   for (const ip of m.bannedIps || []) bannedIps.add(ip);
   const ips = (state && state.agentIps) || {};
   for (const [name, ip] of Object.entries(ips)) agentIps.set(name, ip);
+  for (const [filePath, record] of Object.entries(m.quarantinedFiles || {})) {
+    const normalized = normalizePublicationPath(record?.filePath || filePath);
+    if (!normalized || !record || typeof record !== 'object' || typeof record.contentHash !== 'string') continue;
+    quarantinedFiles.set(normalized, {
+      filePath: normalized,
+      contentHash: record.contentHash,
+      reasons: Array.isArray(record.reasons) ? record.reasons.filter(reason => typeof reason === 'string') : [],
+      agentName: typeof record.agentName === 'string' ? record.agentName : '',
+      timestamp: typeof record.timestamp === 'string' ? record.timestamp : '',
+    });
+  }
+  for (const [filePath, contentHash] of Object.entries(m.approvedFiles || {})) {
+    const normalized = normalizePublicationPath(filePath);
+    if (normalized && typeof contentHash === 'string' && contentHash) approvedFiles.set(normalized, contentHash);
+  }
 }
 
 function serializeModeration() {
@@ -46,6 +73,8 @@ function serializeModeration() {
       hiddenFiles: Array.from(hiddenFiles),
       bannedAgents: Array.from(bannedAgents),
       bannedIps: Array.from(bannedIps),
+      quarantinedFiles: Object.fromEntries(quarantinedFiles),
+      approvedFiles: Object.fromEntries(approvedFiles),
     },
     agentIps: Object.fromEntries(agentIps),
   };
@@ -62,33 +91,42 @@ async function load() {
     return;
   } catch (e) {
     if (e.code !== 'ENOENT') {
-      console.error('Failed to load moderation state:', e.message);
       loadModeration({});
-      return;
+      throw e;
     }
   }
-  // One-time migration: pull moderation/agentIps out of a legacy state.json if present.
+  // One-time migration: pull moderation/agentIps out of a legacy state.json if present. Reading
+  // an absent/invalid legacy file is optional; once valid security state is loaded, its required
+  // persistence must reject on failure rather than being mistaken for "no legacy state".
+  let legacy;
   try {
-    const legacy = JSON.parse(await fs.readFile(LEGACY_STATE_FILE, 'utf-8'));
-    if (legacy && (legacy.moderation || legacy.agentIps)) {
-      loadModeration(legacy);
-      await save();
-      console.warn('Migrated moderation state out of state.json into moderation.json');
-      return;
-    }
-  } catch (e) { /* no legacy state to migrate */ }
+    legacy = JSON.parse(await fs.readFile(LEGACY_STATE_FILE, 'utf-8'));
+  } catch (e) {
+    loadModeration({});
+    return;
+  }
+  if (legacy && (legacy.moderation || legacy.agentIps)) {
+    loadModeration(legacy);
+    await save();
+    console.warn('Migrated moderation state out of state.json into moderation.json');
+    return;
+  }
   loadModeration({});
 }
 
 // Persist moderation state atomically, serialized via a mutex to prevent interleaved writes.
 function save() {
-  saveChain = saveChain.then(_saveImpl).catch((e) => console.error('Failed to save moderation state:', e.message));
-  return saveChain;
+  const snapshot = serializeModeration();
+  const operation = saveChain.then(() => _saveImpl(snapshot));
+  // Keep the mutex usable after a failed operation, but return the original rejecting promise so
+  // startup and security-critical routes cannot mistake a logged write failure for durability.
+  saveChain = operation.catch(() => {});
+  return operation;
 }
-async function _saveImpl() {
+async function _saveImpl(snapshot) {
   await fs.mkdir(path.dirname(MODERATION_FILE), { recursive: true });
   const tmp = MODERATION_FILE + '.tmp';
-  await fs.writeFile(tmp, JSON.stringify(serializeModeration(), null, 2));
+  await fs.writeFile(tmp, JSON.stringify(snapshot, null, 2));
   await fs.rename(tmp, MODERATION_FILE);
 }
 
@@ -102,6 +140,43 @@ function hide(path) {
 }
 function unhide(path) { return hiddenFiles.delete(normalizePath(path)); }
 function listHidden() { return Array.from(hiddenFiles); }
+
+function quarantine(filePath, metadata = {}) {
+  const normalized = normalizePublicationPath(filePath);
+  if (!normalized || typeof metadata.contentHash !== 'string' || !metadata.contentHash) return false;
+  const record = {
+    filePath: normalized,
+    contentHash: metadata.contentHash,
+    reasons: Array.isArray(metadata.reasons) ? metadata.reasons.filter(reason => typeof reason === 'string') : [],
+    agentName: typeof metadata.agentName === 'string' ? metadata.agentName : '',
+    timestamp: typeof metadata.timestamp === 'string' ? metadata.timestamp : '',
+  };
+  const previous = quarantinedFiles.get(normalized);
+  if (previous && JSON.stringify(previous) === JSON.stringify(record)) return false;
+  quarantinedFiles.set(normalized, record);
+  return true;
+}
+
+function releaseQuarantine(filePath) { return quarantinedFiles.delete(normalizePublicationPath(filePath)); }
+function clearApproval(filePath) { return approvedFiles.delete(normalizePublicationPath(filePath)); }
+function approve(filePath, hash) {
+  const normalized = normalizePublicationPath(filePath);
+  if (!normalized || typeof hash !== 'string' || !hash) return false;
+  if (approvedFiles.get(normalized) === hash) return false;
+  approvedFiles.set(normalized, hash);
+  return true;
+}
+function reject(filePath) {
+  const normalized = normalizePublicationPath(filePath);
+  const removedQuarantine = quarantinedFiles.delete(normalized);
+  const removedApproval = approvedFiles.delete(normalized);
+  return removedQuarantine || removedApproval;
+}
+function isQuarantined(filePath) { return quarantinedFiles.has(normalizePublicationPath(filePath)); }
+function isApproved(filePath, hash) {
+  return typeof hash === 'string' && hash.length > 0 && approvedFiles.get(normalizePublicationPath(filePath)) === hash;
+}
+function listQuarantined() { return Array.from(quarantinedFiles.values()).map(record => ({ ...record, reasons: [...record.reasons] })); }
 
 const MAX_AGENT_IPS = 5000; // bound the IP map (GDPR data-minimization); evict oldest (LRU-ish)
 
@@ -203,6 +278,8 @@ function scanContent({ content = '', message = '', agentName = '', filePath = ''
 module.exports = {
   loadModeration, serializeModeration, load, save,
   isHidden, hide, unhide, listHidden,
+  quarantine, releaseQuarantine, clearApproval, approve, reject,
+  isQuarantined, isApproved, listQuarantined,
   isBanned, recordAgentIp, resolveAgentIp, ban, unban, listBans,
   scanContent,
 };
