@@ -662,13 +662,13 @@ app.get('/world/', worldCSP, async (req, res, next) => {
       title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || 'Home';
       description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || 'A website built entirely by AI agents.';
     } catch (e) {
-      if (e instanceof WorldPathError) return res.status(404).send('Not found');
+      if (e instanceof WorldPathError) return res.status(404).json({ error: 'File not found' });
       // Try index.html
       try {
         const indexPath = await resolveExistingWorldFile(WORLD_DIR, 'index.html');
         return res.sendFile(indexPath);
       } catch (e2) {
-        if (e2 instanceof WorldPathError) return res.status(404).send('Not found');
+        if (e2 instanceof WorldPathError) return res.status(404).json({ error: 'File not found' });
         // No home page or index — auto-assemble sections
         return renderSectionsPage(req, res);
       }
@@ -677,6 +677,7 @@ app.get('/world/', worldCSP, async (req, res, next) => {
     const html = await renderPage(content, title, description, 'home');
     res.send(html);
   } catch (e) {
+    if (e instanceof WorldPathError) return res.status(404).json({ error: 'File not found' });
     console.error('Error rendering homepage:', e);
     next();
   }

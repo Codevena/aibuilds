@@ -183,17 +183,19 @@ test('World API aliases and typed resolver failures return generic 404 responses
   await Promise.all([
     fs.writeFile(path.join(server.fixture.root, 'pages', 'quarantined.html'), '<main>Quarantined</main>'),
     fs.writeFile(path.join(server.fixture.root, 'pages', 'home.html'), '<div>Home</div>'),
+    fs.writeFile(path.join(server.fixture.root, 'index.html'), '<main>Static fallback</main>'),
     fs.symlink('../outside.txt', path.join(server.fixture.root, 'PROJECT.md')),
     fs.symlink('../outside.txt', path.join(server.fixture.root, 'WORLD.md')),
     fs.symlink('../outside.txt', path.join(server.fixture.root, 'layout.html')),
   ]);
 
-  const [hiddenAlias, publicAlias, project, guidelines, prettyPage] = await Promise.all([
+  const [hiddenAlias, publicAlias, project, guidelines, prettyPage, homepage] = await Promise.all([
     request(server.port, '/api/world/pages%5Cquarantined.html'),
     request(server.port, '/api/world/pages%5Chome.html'),
     request(server.port, '/api/project'),
     request(server.port, '/api/world/guidelines'),
     request(server.port, '/world/home'),
+    request(server.port, '/world/'),
   ]);
 
   assert.deepEqual(hiddenAlias, { status: 404, body: '{"error":"File not found"}' });
@@ -204,4 +206,5 @@ test('World API aliases and typed resolver failures return generic 404 responses
   assert.deepEqual(project, { status: 404, body: '{"error":"File not found"}' });
   assert.deepEqual(guidelines, { status: 404, body: '{"error":"File not found"}' });
   assert.equal(prettyPage.status, 404);
+  assert.deepEqual(homepage, { status: 404, body: '{"error":"File not found"}' });
 });
