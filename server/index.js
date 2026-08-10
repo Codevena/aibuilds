@@ -276,6 +276,52 @@ async function acquireWorldMutation(filePath) {
   };
 }
 
+function isContributionStateReadRequest(req) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+  const requestPath = req.path.length > 1 ? req.path.replace(/\/+$/, '') : req.path;
+  return requestPath === '/world' ||
+    requestPath === '/api/season/current' ||
+    requestPath === '/api/seasons' ||
+    requestPath === '/api/votes' ||
+    requestPath === '/api/history' ||
+    requestPath === '/api/leaderboard' ||
+    requestPath === '/api/agents' ||
+    /^\/api\/agents\/[^/]+(?:\/achievements)?$/.test(requestPath) ||
+    /^\/api\/contributions\/[^/]+(?:\/comments)?$/.test(requestPath) ||
+    (requestPath.startsWith('/api/files/') && requestPath.endsWith('/comments')) ||
+    requestPath === '/api/world/sections';
+}
+
+async function serializeContributionStateRead(req, res, next) {
+  if (!isContributionStateReadRequest(req)) return next();
+
+  let releaseContributionState;
+  try {
+    releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
+  } catch (error) {
+    return next(error);
+  }
+  if (req.destroyed || res.destroyed) {
+    releaseContributionState();
+    return;
+  }
+
+  let released = false;
+  const releaseOnce = () => {
+    if (released) return;
+    released = true;
+    releaseContributionState();
+  };
+  res.once('finish', releaseOnce);
+  res.once('close', releaseOnce);
+  try {
+    next();
+  } catch (error) {
+    releaseOnce();
+    next(error);
+  }
+}
+
 async function consumePendingGitRepairAgentIps() {
   for (const repair of moderation.listGitRepairs()) {
     // A durable contribution means this WAL record only needs finalization. Its agent/IP update is
@@ -1348,7 +1394,9 @@ wss.on('connection', async (ws) => {
   });
 
   // Send current stats
+  let releaseContributionState;
   try {
+    releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
     const snapshot = await getPublicPlatformSnapshot();
     ws.send(JSON.stringify({
       type: 'welcome',
@@ -1358,6 +1406,8 @@ wss.on('connection', async (ws) => {
     }));
   } catch (e) {
     viewers.delete(ws);
+  } finally {
+    releaseContributionState?.();
   }
 
   ws.on('close', () => {
@@ -1381,6 +1431,11 @@ setInterval(() => {
   // Broadcast accurate count after cleanup
   broadcast({ type: 'viewerCount', count: viewers.size });
 }, WS_HEARTBEAT_INTERVAL);
+
+// Vote/comment mutations update shared in-memory state before their durable save resolves.
+// Affected public reads must cross the same barrier so they observe either the prior durable
+// snapshot after rollback or the committed successor, never provisional state.
+app.use(serializeContributionStateRead);
 
 // Serve the world — CSP middleware for all /world routes
 const worldCSP = (req, res, next) => {

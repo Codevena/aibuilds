@@ -6,6 +6,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
+const http = require('node:http');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 const WebSocket = require('ws');
@@ -53,6 +54,14 @@ async function requestJson(baseUrl, requestPath, options = {}) {
   let body;
   try { body = await response.json(); } catch { body = null; }
   return { response, body };
+}
+
+function observeSettlement(promise) {
+  let settled = false;
+  return {
+    promise: Promise.resolve(promise).finally(() => { settled = true; }),
+    isSettled: () => settled,
+  };
 }
 
 async function mutationRequest(baseUrl, requestPath, body) {
@@ -511,7 +520,53 @@ test('real server persists bounded curation events and exposes only public Seaso
   assert.match(contextText, /Optional theme prompt \(suggestion, not a requirement\):/);
 });
 
-test('curation mutations roll back on state failure and serialize a failed A before successful B', async (t) => {
+test('real MCP keeps the collaboration directive when optional Season context is unavailable', async (t) => {
+  const backend = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/world/structure') {
+      return res.end(JSON.stringify({ sections: [] }));
+    }
+    if (req.url === '/api/pages') {
+      return res.end(JSON.stringify({ pages: [] }));
+    }
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+  backend.listen(0, '127.0.0.1');
+  await once(backend, 'listening');
+  t.after(() => new Promise(resolve => backend.close(resolve)));
+
+  const mcpLogs = [];
+  const mcp = spawn(process.execPath, ['mcp/index.js'], {
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      AI_BUILDS_URL: `http://127.0.0.1:${backend.address().port}`,
+      AGENT_NAME: 'Fallback-Agent',
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  mcp.stderr.on('data', chunk => mcpLogs.push(chunk.toString()));
+  t.after(async () => {
+    if (mcp.exitCode === null) mcp.kill('SIGTERM');
+    if (mcp.exitCode === null) await once(mcp, 'exit');
+  });
+
+  const rpc = createJsonRpcClient(mcp, mcpLogs);
+  await rpc.request('initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 'season-fallback-test', version: '1.0.0' },
+  });
+  rpc.notify('notifications/initialized');
+  const context = await rpc.request('tools/call', { name: 'aibuilds_get_context', arguments: {} });
+  const contextText = context.content[0].text;
+  assert.doesNotMatch(contextText, /Today's Season:/);
+  assert.match(contextText,
+    /Improve another agent's existing work before starting another isolated page\./);
+});
+
+test('curation mutations hide provisional reads, roll back failures, and serialize failed A before B', async (t) => {
   // Mutations caught: fire-and-forget saves return 200 and leak Curator/broadcast state; removing
   // the shared mutation lock lets B settle while A's failed provisional state is still active.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-curation-atomic-'));
@@ -561,7 +616,7 @@ test('curation mutations roll back on state failure and serialize a failed A bef
         if (!failed) {
           failed = true;
           await originalWriteFile(process.env.AIBUILDS_STATE_MARKER, token);
-          if (token.endsWith('concurrent')) {
+          if (token.endsWith('concurrent') || token.endsWith('-read')) {
             while (!fs.existsSync(process.env.AIBUILDS_STATE_RELEASE)) {
               await new Promise(resolve => setTimeout(resolve, 10));
             }
@@ -612,29 +667,196 @@ test('curation mutations roll back on state failure and serialize a failed A bef
     try { frames.push(JSON.parse(data.toString())); } catch { /* ignore */ }
   });
 
-  await fs.writeFile(armPath, 'vote');
+  await fs.writeFile(armPath, 'vote-read');
+  await fs.rm(releasePath, { force: true });
+  const failedVote = mutationRequest(baseUrl, '/api/vote', {
+    agent_name: 'FailedVote', section_file: 'sections/voted.html', vote: 'down',
+  });
+  await waitForFileValue(markerPath, 'vote-read');
+  const voteReadObservers = [
+    requestJson(baseUrl, '/api/votes'),
+    requestJson(baseUrl, '/api/season/current'),
+    requestJson(baseUrl, '/api/seasons'),
+    requestJson(baseUrl, '/api/world/sections'),
+    fetch(`${baseUrl}/world/`).then(async response => ({ response, body: await response.text() })),
+    requestJson(baseUrl, '/api/votes/'),
+    requestJson(baseUrl, '/api/seasons/'),
+    requestJson(baseUrl, '/api/world/sections/'),
+    fetch(`${baseUrl}/world`).then(async response => ({ response, body: await response.text() })),
+    fetch(`${baseUrl}/api/votes`, { method: 'HEAD' }),
+    fetch(`${baseUrl}/api/votes/`, { method: 'HEAD' }),
+  ].map(observeSettlement);
+  const voteReads = Promise.all(voteReadObservers.map(observer => observer.promise));
+  const abortedVoteRead = http.get(`${baseUrl}/api/votes`);
+  abortedVoteRead.on('error', () => {});
+  await once(abortedVoteRead, 'socket');
+  await new Promise(resolve => setTimeout(resolve, 25));
+  abortedVoteRead.destroy();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const voteReadsSettledDuringFailure = voteReadObservers.map(observer => observer.isSettled());
+  const provisionalVoteFrame = frames.some(frame => frame.type === 'vote');
+  await fs.writeFile(releasePath, 'release');
+  const [failedVoteResult, [votesAfterRollback, seasonAfterVoteRollback, seasonsAfterVoteRollback,
+    sectionsAfterVoteRollback, worldAfterVoteRollback, , , , , voteHeadAfterRollback,
+    voteAliasHeadAfterRollback]] = await Promise.all([failedVote, voteReads]);
+  assert.deepEqual(voteReadsSettledDuringFailure,
+    [false, false, false, false, false, false, false, false, false, false, false],
+    'every vote-derived read must wait for durability');
+  assert.equal(provisionalVoteFrame, false);
+  assert.equal(failedVoteResult.response.status, 500, logs.join(''));
+  assert.equal(votesAfterRollback.body.votes['sections/voted.html'], undefined);
+  assert.deepEqual(seasonAfterVoteRollback.body.roles.curator, []);
+  assert.deepEqual(seasonsAfterVoteRollback.body.seasons.find(season => season.id === today).roles.curator, []);
+  assert.deepEqual(sectionsAfterVoteRollback.body.sections[0].votes, { score: 0, up: 0, down: 0 });
+  assert.match(worldAfterVoteRollback.body, /<h2>Voted<\/h2>/);
+  const durableVoteHead = await fetch(`${baseUrl}/api/votes`, { method: 'HEAD' });
+  assert.equal(voteHeadAfterRollback.headers.get('content-length'),
+    durableVoteHead.headers.get('content-length'));
+  assert.equal(voteHeadAfterRollback.headers.get('etag'), durableVoteHead.headers.get('etag'));
+  assert.equal(voteAliasHeadAfterRollback.headers.get('content-length'),
+    durableVoteHead.headers.get('content-length'));
+  assert.equal(voteAliasHeadAfterRollback.headers.get('etag'), durableVoteHead.headers.get('etag'));
+  const postAbortProbe = requestJson(baseUrl, '/api/votes').then(
+    value => ({ type: 'response', value }),
+    error => ({ type: 'error', error }),
+  );
+  const postAbortOutcome = await Promise.race([
+    postAbortProbe,
+    new Promise(resolve => setTimeout(() => resolve({ type: 'timeout' }), 500)),
+  ]);
+  assert.equal(postAbortOutcome.type, 'response', 'aborted queued reads must not leak the shared lock');
+
+  await fs.writeFile(armPath, 'contribution-comment-read');
+  await fs.rm(releasePath, { force: true });
+  const failedComment = mutationRequest(baseUrl, '/api/contributions/public-contribution/comments', {
+    agent_name: 'Builder', content: 'This must roll back.',
+  });
+  await waitForFileValue(markerPath, 'contribution-comment-read');
+  const midFlightWs = new WebSocket(baseUrl.replace('http', 'ws'));
+  const midFlightWsOpen = once(midFlightWs, 'open');
+  const midFlightWelcomeObserver = observeSettlement(
+    once(midFlightWs, 'message').then(([data]) => JSON.parse(data.toString())));
+  await midFlightWsOpen;
+  const contributionReadObservers = [
+    requestJson(baseUrl, '/api/contributions/public-contribution/comments'),
+    requestJson(baseUrl, '/api/contributions/public-contribution'),
+    requestJson(baseUrl, '/api/history'),
+    requestJson(baseUrl, '/api/season/current'),
+    requestJson(baseUrl, '/api/seasons'),
+    requestJson(baseUrl, '/api/leaderboard?category=comments'),
+    requestJson(baseUrl, '/api/agents/Builder'),
+    requestJson(baseUrl, '/api/agents'),
+    requestJson(baseUrl, '/api/agents/Builder/achievements'),
+    requestJson(baseUrl, '/api/contributions/public-contribution/comments/'),
+    requestJson(baseUrl, '/api/history/'),
+    requestJson(baseUrl, '/api/agents/Builder/'),
+    fetch(`${baseUrl}/api/contributions/public-contribution/comments`, { method: 'HEAD' }),
+    fetch(`${baseUrl}/api/contributions/public-contribution/comments/`, { method: 'HEAD' }),
+  ].map(observeSettlement);
+  const contributionReads = Promise.all(
+    contributionReadObservers.map(observer => observer.promise));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const contributionReadsSettledDuringFailure =
+    contributionReadObservers.map(observer => observer.isSettled());
+  const welcomeSettledDuringFailure = midFlightWelcomeObserver.isSettled();
+  const provisionalCommentFrame = frames.some(frame => frame.type === 'comment');
+  await fs.writeFile(releasePath, 'release');
+  const [failedCommentResult, contributionReadResults, welcomeAfterRollback] =
+    await Promise.all([failedComment, contributionReads, midFlightWelcomeObserver.promise]);
+  midFlightWs.close();
+  const [commentsAfterRollback, contributionAfterRollback, historyAfterRollback,
+    seasonAfterCommentRollback, seasonsAfterCommentRollback, leaderboardAfterRollback,
+    profileAfterRollback, agentsAfterRollback, achievementsAfterRollback, , , ,
+    contributionCommentsHeadAfterRollback, contributionCommentsAliasHeadAfterRollback] =
+    contributionReadResults;
+  assert.deepEqual(contributionReadsSettledDuringFailure,
+    [false, false, false, false, false, false, false, false, false, false, false, false, false, false],
+    'every comment-derived HTTP read must wait for durability');
+  assert.equal(welcomeSettledDuringFailure, false, 'WebSocket welcome must wait for durability');
+  assert.equal(provisionalCommentFrame, false);
+  assert.equal(failedCommentResult.response.status, 500, logs.join(''));
+  assert.equal(commentsAfterRollback.body.total, 0);
+  assert.equal(contributionAfterRollback.body.commentCount, 0);
+  assert.equal(historyAfterRollback.body.items.find(item => item.id === 'public-contribution').commentCount, 0);
+  assert.deepEqual(seasonAfterCommentRollback.body.roles.curator, []);
+  assert.deepEqual(seasonsAfterCommentRollback.body.seasons.find(season => season.id === today).roles.curator, []);
+  assert.equal(leaderboardAfterRollback.body.leaderboard.find(agent => agent.name === 'Builder').comments, 0);
+  assert.equal(profileAfterRollback.body.stats.commentsCount, 0);
+  assert.equal(agentsAfterRollback.response.status, 200);
+  assert.equal(achievementsAfterRollback.response.status, 200);
+  assert.equal(welcomeAfterRollback.recentHistory.find(item => item.id === 'public-contribution').commentCount, 0);
+  const durableContributionCommentsHead = await fetch(
+    `${baseUrl}/api/contributions/public-contribution/comments`, { method: 'HEAD' });
+  assert.equal(contributionCommentsHeadAfterRollback.headers.get('content-length'),
+    durableContributionCommentsHead.headers.get('content-length'));
+  assert.equal(contributionCommentsHeadAfterRollback.headers.get('etag'),
+    durableContributionCommentsHead.headers.get('etag'));
+  assert.equal(contributionCommentsAliasHeadAfterRollback.headers.get('content-length'),
+    durableContributionCommentsHead.headers.get('content-length'));
+  assert.equal(contributionCommentsAliasHeadAfterRollback.headers.get('etag'),
+    durableContributionCommentsHead.headers.get('etag'));
+
+  await fs.writeFile(armPath, 'file-comment-read');
+  await fs.rm(releasePath, { force: true });
+  const failedFileCommentRead = mutationRequest(baseUrl, '/api/files/pages/shared.html/comments', {
+    agent_name: 'Builder', content: 'This must also roll back.',
+  });
+  await waitForFileValue(markerPath, 'file-comment-read');
+  const fileCommentReadObservers = [
+    requestJson(baseUrl, '/api/files/pages/shared.html/comments'),
+    requestJson(baseUrl, '/api/season/current'),
+    requestJson(baseUrl, '/api/seasons'),
+    requestJson(baseUrl, '/api/leaderboard?category=comments'),
+    requestJson(baseUrl, '/api/agents/Builder'),
+    requestJson(baseUrl, '/api/agents'),
+    requestJson(baseUrl, '/api/agents/Builder/achievements'),
+    requestJson(baseUrl, '/api/files/pages/shared.html/comments/'),
+    requestJson(baseUrl, '/api/leaderboard/?category=comments'),
+    requestJson(baseUrl, '/api/agents/Builder/achievements/'),
+  ].map(observeSettlement);
+  const fileCommentReads = Promise.all(fileCommentReadObservers.map(observer => observer.promise));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const fileCommentReadsSettledDuringFailure =
+    fileCommentReadObservers.map(observer => observer.isSettled());
+  const provisionalFileCommentFrame = frames.some(frame => frame.type === 'fileComment');
+  await fs.writeFile(releasePath, 'release');
+  const [failedFileCommentReadResult, fileCommentReadResults] =
+    await Promise.all([failedFileCommentRead, fileCommentReads]);
+  const [fileCommentsAfterRollback, seasonAfterFileCommentRollback,
+    seasonsAfterFileCommentRollback, fileLeaderboardAfterRollback,
+    fileProfileAfterRollback, fileAgentsAfterRollback,
+    fileAchievementsAfterRollback] = fileCommentReadResults;
+  assert.deepEqual(fileCommentReadsSettledDuringFailure,
+    [false, false, false, false, false, false, false, false, false, false],
+    'every file-comment-derived read must wait for durability');
+  assert.equal(provisionalFileCommentFrame, false);
+  assert.equal(failedFileCommentReadResult.response.status, 500, logs.join(''));
+  assert.equal(fileCommentsAfterRollback.body.total, 0);
+  assert.deepEqual(seasonAfterFileCommentRollback.body.roles.curator, []);
+  assert.deepEqual(seasonsAfterFileCommentRollback.body.seasons.find(season => season.id === today).roles.curator, []);
+  assert.equal(fileLeaderboardAfterRollback.body.leaderboard.find(agent => agent.name === 'Builder').comments, 0);
+  assert.equal(fileProfileAfterRollback.body.stats.commentsCount, 0);
+  assert.equal(fileAgentsAfterRollback.response.status, 200);
+  assert.equal(fileAchievementsAfterRollback.response.status, 200);
+
   let result = await mutationRequest(baseUrl, '/api/vote', {
-    agent_name: 'FailedVote', section_file: 'sections/voted.html', vote: 'up',
+    agent_name: 'ReadVoteSuccess', section_file: 'sections/voted.html', vote: 'up',
   });
-  assert.equal(result.response.status, 500, logs.join(''));
-  assert.deepEqual((await requestJson(baseUrl, '/api/votes')).body.votes['sections/voted.html'], undefined);
-  assert.deepEqual((await requestJson(baseUrl, '/api/season/current')).body.roles.curator, []);
-
-  await fs.writeFile(armPath, 'contribution-comment');
+  assert.equal(result.response.status, 200, logs.join(''));
   result = await mutationRequest(baseUrl, '/api/contributions/public-contribution/comments', {
-    agent_name: 'FailedComment', content: 'This must roll back.',
+    agent_name: 'Builder', content: 'This durable contribution comment is public.',
   });
-  assert.equal(result.response.status, 500, logs.join(''));
-  assert.equal((await requestJson(baseUrl, '/api/contributions/public-contribution/comments')).body.total, 0);
-  assert.deepEqual((await requestJson(baseUrl, '/api/season/current')).body.roles.curator, []);
-
-  await fs.writeFile(armPath, 'file-comment');
+  assert.equal(result.response.status, 200, logs.join(''));
   result = await mutationRequest(baseUrl, '/api/files/pages/shared.html/comments', {
-    agent_name: 'FailedFileComment', content: 'This must also roll back.',
+    agent_name: 'Builder', content: 'This durable file comment is public.',
   });
-  assert.equal(result.response.status, 500, logs.join(''));
-  assert.equal((await requestJson(baseUrl, '/api/files/pages/shared.html/comments')).body.total, 0);
-  assert.deepEqual((await requestJson(baseUrl, '/api/season/current')).body.roles.curator, []);
+  assert.equal(result.response.status, 200, logs.join(''));
+  assert.equal((await requestJson(baseUrl, '/api/contributions/public-contribution/comments')).body.total, 1);
+  assert.equal((await requestJson(baseUrl, '/api/files/pages/shared.html/comments')).body.total, 1);
+  assert.equal((await requestJson(baseUrl, '/api/contributions/public-contribution')).body.commentCount, 1);
+  assert.equal((await requestJson(baseUrl, '/api/agents/Builder')).body.stats.commentsCount, 2);
+  assert.deepEqual((await requestJson(baseUrl, '/api/season/current')).body.roles.curator,
+    ['ReadVoteSuccess', 'Builder']);
 
   await fs.writeFile(armPath, 'contribution-comment-concurrent');
   await fs.rm(releasePath, { force: true });
@@ -656,7 +878,8 @@ test('curation mutations roll back on state failure and serialize a failed A bef
     await Promise.all([failedContributionComment, contributionFollower]);
   assert.equal(failedContributionCommentResult.response.status, 500, logs.join(''));
   assert.equal(contributionFollowerResult.response.status, 200, logs.join(''));
-  assert.deepEqual((await requestJson(baseUrl, '/api/season/current')).body.roles.curator, ['CommentFollower']);
+  assert.deepEqual((await requestJson(baseUrl, '/api/season/current')).body.roles.curator,
+    ['ReadVoteSuccess', 'Builder', 'CommentFollower']);
 
   await fs.writeFile(armPath, 'file-comment-concurrent');
   await fs.rm(releasePath, { force: true });
@@ -678,7 +901,7 @@ test('curation mutations roll back on state failure and serialize a failed A bef
   assert.equal(failedFileCommentResult.response.status, 500, logs.join(''));
   assert.equal(fileFollowerResult.response.status, 200, logs.join(''));
   assert.deepEqual((await requestJson(baseUrl, '/api/season/current')).body.roles.curator,
-    ['CommentFollower', 'FileCommentFollower']);
+    ['ReadVoteSuccess', 'Builder', 'CommentFollower', 'FileCommentFollower']);
 
   await fs.writeFile(armPath, 'concurrent');
   await fs.rm(releasePath, { force: true });
@@ -701,16 +924,19 @@ test('curation mutations roll back on state failure and serialize a failed A bef
   assert.equal(bResult.response.status, 200, logs.join(''));
 
   const season = (await requestJson(baseUrl, '/api/season/current')).body;
-  assert.deepEqual(season.roles.curator, ['CommentFollower', 'FileCommentFollower', 'SuccessfulB']);
+  assert.deepEqual(season.roles.curator,
+    ['ReadVoteSuccess', 'Builder', 'CommentFollower', 'FileCommentFollower', 'SuccessfulB']);
   const votes = (await requestJson(baseUrl, '/api/votes')).body.votes['sections/voted.html'];
-  assert.deepEqual(votes, { score: 1, upvotes: 2, downvotes: 1 });
+  assert.deepEqual(votes, { score: 2, upvotes: 3, downvotes: 1 });
   const persisted = await waitForPersistedState(statePath, state =>
     state.curationEvents?.some(event => event.agentName === 'SuccessfulB'));
   assert.deepEqual(persisted.curationEvents.map(event => event.agentName),
-    ['CommentFollower', 'FileCommentFollower', 'SuccessfulB']);
+    ['ReadVoteSuccess', 'Builder', 'Builder', 'CommentFollower', 'FileCommentFollower', 'SuccessfulB']);
   await new Promise(resolve => setTimeout(resolve, 50));
-  assert.equal(frames.filter(frame => frame.type === 'vote').length, 3);
-  assert.equal(frames.some(frame => ['comment', 'fileComment'].includes(frame.type)), false);
+  assert.equal(frames.filter(frame => frame.type === 'vote').length, 4);
+  assert.equal(frames.filter(frame => frame.type === 'comment').length, 1);
+  assert.equal(frames.filter(frame => frame.type === 'fileComment').length, 1);
+  assert.equal(frames.some(frame => JSON.stringify(frame).includes('Failed')), false);
 
   await fs.writeFile(armPath, 'reset-concurrent');
   await fs.rm(releasePath, { force: true });

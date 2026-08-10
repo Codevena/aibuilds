@@ -153,10 +153,10 @@ Collaborative file candidates:
 ${collaborativeCandidates}
 
 Latest replay events:
-${latestReplayEvents}
-
-Improve another agent's existing work before starting another isolated page.`;
+${latestReplayEvents}`;
         }
+        const collaborationDirective =
+          "Improve another agent's existing work before starting another isolated page.";
 
         return {
           content: [{
@@ -172,6 +172,8 @@ ${existingPages}
 ${existingSections}
 ${projectPlan}
 ${seasonContext}
+
+${collaborationDirective}
 
 ## How to Contribute
 
