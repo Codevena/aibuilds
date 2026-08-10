@@ -1217,6 +1217,13 @@ test('rollback byte-restore failure persists a fail-closed quarantine across res
   assert.ok(record);
   assert.deepEqual(record.reasons, ['rollback_failed']);
   assert.equal(record.content_hash, contentHash(riskyBytes));
+  let gitResult = await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir });
+  assert.equal(gitResult.stdout.trim(), originalBytes,
+    'Git compensation must restore the public parent tree even when working-byte restore fails');
+  gitResult = await execFileAsync('git', ['diff', '--cached', '--name-only'], { cwd: worldDir });
+  assert.equal(gitResult.stdout, '');
+  gitResult = await execFileAsync('git', ['status', '--porcelain'], { cwd: worldDir });
+  assert.equal(gitResult.stdout.trim(), `M ${relativePath}`);
   await fs.rm(armPath, { force: true });
   await server.crash();
 
@@ -1229,6 +1236,123 @@ test('rollback byte-restore failure persists a fail-closed quarantine across res
   assert.ok(record);
   assert.deepEqual(record.reasons, ['high_stakes_medical']);
   assert.equal(record.content_hash, contentHash(riskyBytes));
+  const correction = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'SafeRestoreAgent', action: 'edit', file_path: relativePath,
+      content: '<main><h1>Safe correction after restore failure</h1></main>',
+      message: 'safe correction after restore failure',
+    }),
+  });
+  assert.equal(correction.response.status, 200, server.logs.join(''));
+  assert.equal(correction.body.publicationStatus, 'published');
+  const correctionDiff = await jsonRequest(
+    server.baseUrl, `/api/contributions/${correction.body.contribution.id}/diff`,
+  );
+  assert.equal(correctionDiff.response.status, 200);
+  assert.match(correctionDiff.body.diff || '', /Safe correction after restore failure/);
+  assert.doesNotMatch(correctionDiff.body.diff || '', /Inject 11 mg weekly|force restore failure/);
+  const timeline = (await jsonRequest(server.baseUrl, '/api/timeline')).body;
+  assert.equal(timeline.some(item => item.message === 'force restore failure'), false);
+  const persisted = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
+  const correctionRecord = persisted.history.find(item => item.id === correction.body.contribution.id);
+  gitResult = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir });
+  assert.equal(correctionRecord.gitHash, gitResult.stdout.trim());
+  gitResult = await execFileAsync('git', ['status', '--porcelain', '--', relativePath], { cwd: worldDir });
+  assert.equal(gitResult.stdout, '');
+  await server.stop();
+});
+
+test('rollback restores an originally untracked quarantined path without committing private bytes', async (t) => {
+  // Mutation caught: forcing tracked=true and adding restored bytes commits the private untracked parent.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-untracked-git-rollback-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/private-untracked.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const originalPrivateBytes = '<p>Inject 5 mg weekly for best results.</p>';
+  const failedPrivateBytes = '<p>Inject 17 mg weekly for best results.</p>';
+  const armPath = path.join(root, 'arm-state-failure');
+  const preloadPath = path.join(root, 'fail-first-state-rename.cjs');
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(path.join(worldDir, 'pages', 'tracked-seed.html'),
+    '<main><h1>Tracked seed</h1></main>');
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'tracked seed'], { cwd: worldDir });
+  await fs.writeFile(fullPath, originalPrivateBytes);
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let failed = false;
+    promises.rename = async function failFirstStateRename(source, target) {
+      if (!failed && fs.existsSync(process.env.AIBUILDS_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_STATE_TARGET) {
+        failed = true;
+        throw Object.assign(new Error('forced state persistence failure'), { code: 'EIO' });
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const extraEnv = {
+    NODE_OPTIONS: `--require=${preloadPath}`,
+    AIBUILDS_FAILURE_ARM: armPath,
+    AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+  };
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  await assert.rejects(execFileAsync('git', ['ls-files', '--error-unmatch', '--', relativePath], { cwd: worldDir }));
+  await fs.writeFile(armPath, 'armed');
+  const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'PrivateUntrackedAgent', action: 'edit', file_path: relativePath,
+      content: failedPrivateBytes, message: 'PRIVATE_UNTRACKED_FAILURE',
+    }),
+  });
+  assert.equal(failed.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(fullPath, 'utf8'), originalPrivateBytes);
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  await assert.rejects(execFileAsync('git', ['ls-files', '--error-unmatch', '--', relativePath], { cwd: worldDir }));
+  await assert.rejects(execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir }));
+  let gitResult = await execFileAsync('git', ['diff', '--cached', '--name-only'], { cwd: worldDir });
+  assert.equal(gitResult.stdout, '');
+  gitResult = await execFileAsync('git', ['status', '--porcelain', '--', relativePath], { cwd: worldDir });
+  assert.equal(gitResult.stdout.trim(), `?? ${relativePath}`);
+  await fs.rm(armPath, { force: true });
+  await server.crash();
+
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  await assert.rejects(execFileAsync('git', ['ls-files', '--error-unmatch', '--', relativePath], { cwd: worldDir }));
+  const correction = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'SafeUntrackedAgent', action: 'edit', file_path: relativePath,
+      content: '<main><h1>Safe formerly untracked page</h1></main>', message: 'SAFE_UNTRACKED_MARKER',
+    }),
+  });
+  assert.equal(correction.response.status, 200, server.logs.join(''));
+  assert.equal(correction.body.publicationStatus, 'published');
+  const diff = await jsonRequest(server.baseUrl, `/api/contributions/${correction.body.contribution.id}/diff`);
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /Safe formerly untracked page/);
+  assert.doesNotMatch(diff.body.diff || '', /Inject (?:5|17) mg weekly|PRIVATE_UNTRACKED_FAILURE/);
+  const timeline = (await jsonRequest(server.baseUrl, '/api/timeline')).body;
+  assert.equal(timeline.some(item => item.message === 'PRIVATE_UNTRACKED_FAILURE'), false);
+  assert.equal(timeline.some(item => item.message === 'SAFE_UNTRACKED_MARKER'), true);
+  const persisted = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
+  const correctionRecord = persisted.history.find(item => item.id === correction.body.contribution.id);
+  gitResult = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir });
+  assert.equal(correctionRecord.gitHash, gitResult.stdout.trim());
+  gitResult = await execFileAsync('git', ['status', '--porcelain'], { cwd: worldDir });
+  assert.equal(gitResult.stdout, '');
   await server.stop();
 });
 

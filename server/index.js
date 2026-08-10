@@ -9,6 +9,8 @@ const fsSync = require('node:fs');
 const fs = require('fs').promises;
 const crypto = require('crypto');
 const { randomUUID } = require('node:crypto');
+const { execFile: execFileCallback, execSync } = require('node:child_process');
+const { promisify } = require('node:util');
 const simpleGit = require('simple-git');
 const moderation = require('./moderation');
 const { evaluatePublication, contentHash } = require('./content-governance');
@@ -56,10 +58,11 @@ const PROTECTED_WORLD_FILES = new Set([
 // Git setup for history - detect git binary location
 const gitBinary = (() => {
   try {
-    return require('child_process').execSync('which git', { encoding: 'utf-8' }).trim();
+    return execSync('which git', { encoding: 'utf-8' }).trim();
   } catch { return 'git'; }
 })();
 const git = simpleGit(WORLD_DIR, { binary: gitBinary });
+const execGitFile = promisify(execFileCallback);
 
 // Trust proxy (Coolify/reverse proxy) so rate limiting uses real client IP
 app.set('trust proxy', 1);
@@ -350,6 +353,7 @@ async function snapshotContributionTransaction({ fullPath, filePath, agentName, 
   }
   const quarantine = moderation.listQuarantined().find(record => record.filePath === filePath);
   const approval = moderation.serializeModeration().moderation.approvedFiles[filePath];
+  const gitPathState = await snapshotContributionGitPath(filePath);
   return {
     fullPath,
     filePath,
@@ -365,6 +369,7 @@ async function snapshotContributionTransaction({ fullPath, filePath, agentName, 
     contributionId: null,
     trimmedHistory: null,
     gitHash: null,
+    gitPathState,
   };
 }
 
@@ -389,35 +394,83 @@ async function failClosedRollbackPath(transaction, reason) {
   });
 }
 
+async function runGitFile(args, extraEnv = {}) {
+  const { stdout } = await execGitFile(gitBinary, args, {
+    cwd: WORLD_DIR,
+    env: { ...process.env, ...extraEnv },
+    encoding: 'utf8',
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+function parseHeadTreeEntry(output) {
+  const match = String(output).trim().match(/^(\d+)\s+blob\s+([0-9a-f]{40})\t/);
+  return match ? { mode: match[1], hash: match[2] } : null;
+}
+
+function parseIndexEntry(output) {
+  const match = String(output).trim().match(/^(\d+)\s+([0-9a-f]{40})\s+0\t/);
+  return match ? { mode: match[1], hash: match[2] } : null;
+}
+
+async function snapshotContributionGitPath(filePath) {
+  return queueGitOperation(async () => {
+    const head = (await runGitFile(['rev-parse', 'HEAD'])).trim();
+    const treeEntry = parseHeadTreeEntry(await runGitFile(['ls-tree', head, '--', filePath]));
+    const indexEntry = parseIndexEntry(await runGitFile(['ls-files', '--stage', '--', filePath]));
+    return { head, treeEntry, indexEntry };
+  });
+}
+
+async function setIndexPathState(filePath, entry, extraEnv = {}) {
+  if (entry) {
+    await runGitFile(['update-index', '--add', '--cacheinfo', entry.mode, entry.hash, filePath], extraEnv);
+  } else {
+    await runGitFile(['update-index', '--force-remove', '--', filePath], extraEnv);
+  }
+}
+
 async function compensateContributionGit(transaction) {
   return queueGitOperation(async () => {
-    let pathWasStaged = false;
+    const { treeEntry, indexEntry } = transaction.gitPathState;
+    const currentHead = (await runGitFile(['rev-parse', 'HEAD'])).trim();
+    const gitIndexPath = (await runGitFile(['rev-parse', '--git-path', 'index'])).trim();
+    const resolvedIndexPath = path.isAbsolute(gitIndexPath)
+      ? gitIndexPath
+      : path.resolve(WORLD_DIR, gitIndexPath);
+    const temporaryIndex = path.join(
+      path.dirname(resolvedIndexPath),
+      `aibuilds-rollback-index-${randomUUID()}`,
+    );
+    const temporaryEnv = { GIT_INDEX_FILE: temporaryIndex };
+    const subject = `rollback: ${transaction.gitHash} ${transaction.filePath}`;
     try {
-      let tracked = true;
-      try { await git.raw(['ls-files', '--error-unmatch', '--', transaction.filePath]); }
-      catch { tracked = false; }
-      if (transaction.fileExisted) {
-        await git.add(['--', transaction.filePath]);
-        pathWasStaged = true;
-      } else if (tracked) {
-        await git.add(['-u', '--', transaction.filePath]);
-        pathWasStaged = true;
+      // Build a commit from the current HEAD plus the exact pre-transaction tree entry. The private
+      // working bytes are never staged, so compensation remains correct even when byte restore failed.
+      await runGitFile(['read-tree', currentHead], temporaryEnv);
+      await setIndexPathState(transaction.filePath, treeEntry, temporaryEnv);
+      const restoredTree = (await runGitFile(['write-tree'], temporaryEnv)).trim();
+      const rollbackCommit = (await runGitFile([
+        'commit-tree', restoredTree, '-p', currentHead, '-m', subject,
+      ])).trim();
+      await runGitFile(['update-ref', 'HEAD', rollbackCommit, currentHead]);
+
+      // Restore the real index independently from the compensating tree. An originally untracked
+      // private file remains untracked in the worktree and absent from every committed parent tree.
+      await setIndexPathState(transaction.filePath, indexEntry);
+      const actualTreeEntry = parseHeadTreeEntry(
+        await runGitFile(['ls-tree', rollbackCommit, '--', transaction.filePath]),
+      );
+      const actualIndexEntry = parseIndexEntry(
+        await runGitFile(['ls-files', '--stage', '--', transaction.filePath]),
+      );
+      if (JSON.stringify(actualTreeEntry) !== JSON.stringify(treeEntry) ||
+          JSON.stringify(actualIndexEntry) !== JSON.stringify(indexEntry)) {
+        throw new Error('Contribution rollback did not restore the pre-transaction Git path state');
       }
-      const subject = `rollback: ${transaction.gitHash} ${transaction.filePath}`;
-      if (pathWasStaged || tracked) {
-        await git.raw([
-          'commit', '--only', '--allow-empty', '--no-verify', '-m', subject, '--', transaction.filePath,
-        ]);
-      } else {
-        await git.raw(['commit', '--allow-empty', '--no-verify', '-m', subject]);
-      }
-      const latest = (await git.log({ maxCount: 1 })).latest;
-      if (!latest || latest.message !== subject) throw new Error('Contribution rollback commit was not created');
-    } catch (error) {
-      if (pathWasStaged) {
-        try { await git.raw(['reset', '--', transaction.filePath]); } catch { /* retain original error */ }
-      }
-      throw error;
+    } finally {
+      try { await fs.unlink(temporaryIndex); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
   });
 }
@@ -452,7 +505,7 @@ async function rollbackContributionTransaction(transaction) {
   if (transaction.agentExisted) agents.set(transaction.agentName, transaction.agent);
   else agents.delete(transaction.agentName);
 
-  if (bytesRestored && transaction.gitHash) {
+  if (transaction.gitHash) {
     try {
       await compensateContributionGit(transaction);
     } catch (error) {
