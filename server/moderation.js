@@ -196,6 +196,19 @@ function recordAgentIp(agentName, ip) {
   }
 }
 function resolveAgentIp(agentName) { return agentIps.get(agentName) || null; }
+function snapshotAgentIps() { return Array.from(agentIps.entries()); }
+function restoreAgentIps(snapshot) {
+  if (!Array.isArray(snapshot)) return false;
+  agentIps.clear();
+  for (const entry of snapshot) {
+    if (!Array.isArray(entry) || entry.length !== 2) continue;
+    const [agentName, ip] = entry;
+    if (typeof agentName === 'string' && agentName && typeof ip === 'string' && ip) {
+      agentIps.set(agentName, ip);
+    }
+  }
+  return true;
+}
 function restoreAgentIp(agentName, ip) {
   if (typeof agentName !== 'string' || !agentName) return false;
   if (typeof ip === 'string' && ip) {
@@ -293,6 +306,7 @@ module.exports = {
   isHidden, hide, unhide, listHidden,
   quarantine, releaseQuarantine, clearApproval, approve, reject,
   isQuarantined, isApproved, listQuarantined,
-  isBanned, recordAgentIp, resolveAgentIp, restoreAgentIp, ban, unban, listBans,
+  isBanned, recordAgentIp, resolveAgentIp, snapshotAgentIps, restoreAgentIps, restoreAgentIp,
+  ban, unban, listBans,
   scanContent,
 };

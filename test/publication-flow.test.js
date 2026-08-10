@@ -1146,3 +1146,242 @@ for (const failureKind of ['moderation', 'state', 'git']) {
     await server.stop();
   });
 }
+
+test('rollback byte-restore failure persists a fail-closed quarantine across restart', async (t) => {
+  // Mutation caught: restoring the old public moderation boundary after byte rollback failure exposes risky bytes.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-restore-failure-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/restore-failure.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const originalBytes = '<main><h1>Original public bytes</h1></main>';
+  const riskyBytes = '<p>Inject 11 mg weekly for best results.</p>';
+  const armPath = path.join(root, 'arm-restore-failure');
+  const preloadPath = path.join(root, 'fail-state-and-restore.cjs');
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, originalBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
+    history: [{
+      id: 'original-public-record', timestamp: '2026-08-10T10:00:00.000Z', agent_name: 'OriginalAgent',
+      action: 'create', file_path: relativePath, message: 'original public record',
+      publicationStatus: 'published', reactions: { fire: [], heart: [], rocket: [], eyes: [] },
+    }],
+  }));
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let stateFailed = false;
+    let worldRenames = 0;
+    promises.rename = async function failStateAndRollback(source, target) {
+      if (fs.existsSync(process.env.AIBUILDS_FAILURE_ARM)) {
+        if (!stateFailed && String(target) === process.env.AIBUILDS_STATE_TARGET) {
+          stateFailed = true;
+          throw Object.assign(new Error('forced state persistence failure'), { code: 'EIO' });
+        }
+        if (String(target) === process.env.AIBUILDS_WORLD_TARGET) {
+          worldRenames += 1;
+          if (worldRenames === 2) {
+            throw Object.assign(new Error('forced byte restore failure'), { code: 'EIO' });
+          }
+        }
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const extraEnv = {
+    NODE_OPTIONS: `--require=${preloadPath}`,
+    AIBUILDS_FAILURE_ARM: armPath,
+    AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+    AIBUILDS_WORLD_TARGET: fullPath,
+  };
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  await fs.writeFile(armPath, 'armed');
+  const result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'FailedRestoreAgent', action: 'edit', file_path: relativePath,
+      content: riskyBytes, message: 'force restore failure',
+    }),
+  });
+  assert.equal(result.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(fullPath, 'utf8'), riskyBytes);
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  let listed = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
+    headers: { 'X-Admin-Secret': 'test-secret' },
+  });
+  let record = listed.body.quarantined.find(item => item.path === relativePath);
+  assert.ok(record);
+  assert.deepEqual(record.reasons, ['rollback_failed']);
+  assert.equal(record.content_hash, contentHash(riskyBytes));
+  await fs.rm(armPath, { force: true });
+  await server.crash();
+
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  listed = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
+    headers: { 'X-Admin-Secret': 'test-secret' },
+  });
+  record = listed.body.quarantined.find(item => item.path === relativePath);
+  assert.ok(record);
+  assert.deepEqual(record.reasons, ['high_stakes_medical']);
+  assert.equal(record.content_hash, contentHash(riskyBytes));
+  await server.stop();
+});
+
+test('post-Git state failure is compensated before a later public contribution diff', async (t) => {
+  // Mutation caught: omitting the compensating commit makes the next public diff include failed risky bytes.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-git-compensation-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/git-compensation.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const originalBytes = '<main><h1>Original Git baseline</h1></main>';
+  const riskyBytes = '<p>Inject 13 mg weekly for best results.</p>';
+  const armPath = path.join(root, 'arm-state-failure');
+  const preloadPath = path.join(root, 'fail-first-state-rename.cjs');
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, originalBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
+    history: [{
+      id: 'git-baseline-record', timestamp: '2026-08-10T10:00:00.000Z', agent_name: 'BaselineAgent',
+      action: 'create', file_path: relativePath, message: 'git baseline',
+      publicationStatus: 'published', reactions: { fire: [], heart: [], rocket: [], eyes: [] },
+    }],
+  }));
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let failed = false;
+    promises.rename = async function failFirstStateRename(source, target) {
+      if (!failed && fs.existsSync(process.env.AIBUILDS_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_STATE_TARGET) {
+        failed = true;
+        throw Object.assign(new Error('forced state persistence failure'), { code: 'EIO' });
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const extraEnv = {
+    NODE_OPTIONS: `--require=${preloadPath}`,
+    AIBUILDS_FAILURE_ARM: armPath,
+    AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+  };
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  await fs.writeFile(armPath, 'armed');
+  let result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'FailedGitAgent', action: 'edit', file_path: relativePath,
+      content: riskyBytes, message: 'FAILED_GIT_MARKER',
+    }),
+  });
+  assert.equal(result.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(fullPath, 'utf8'), originalBytes);
+
+  result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'SafeGitAgent', action: 'edit', file_path: relativePath,
+      content: '<main><h1>Safe post-failure version</h1></main>', message: 'SAFE_GIT_MARKER',
+    }),
+  });
+  assert.equal(result.response.status, 200, server.logs.join(''));
+  const safeId = result.body.contribution.id;
+  const diff = await jsonRequest(server.baseUrl, `/api/contributions/${safeId}/diff`);
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /Safe post-failure version/);
+  assert.doesNotMatch(diff.body.diff || '', /Inject 13 mg weekly|FAILED_GIT_MARKER/);
+  const timeline = (await jsonRequest(server.baseUrl, '/api/timeline')).body;
+  assert.equal(timeline.some(item => item.message === 'FAILED_GIT_MARKER'), false);
+  assert.equal(timeline.some(item => item.message === 'SAFE_GIT_MARKER'), true);
+  const persisted = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
+  const safeRecord = persisted.history.find(item => item.id === safeId);
+  const { stdout: head } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir });
+  const { stdout: treeBytes } = await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir });
+  const { stdout: status } = await execFileAsync('git', ['status', '--porcelain'], { cwd: worldDir });
+  assert.equal(safeRecord.gitHash, head.trim());
+  assert.equal(treeBytes.trim(), '<main><h1>Safe post-failure version</h1></main>');
+  assert.equal(status, '');
+  await server.stop();
+});
+
+test('failed contribution restores an unrelated IP evicted at capacity durably', async (t) => {
+  // Mutation caught: restoring only the submitter IP cannot reverse recordAgentIp's capacity eviction.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-ip-rollback-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/ip-rollback.html';
+  const originalBytes = '<main><h1>IP rollback baseline</h1></main>';
+  const armPath = path.join(root, 'arm-state-failure');
+  const preloadPath = path.join(root, 'fail-first-state-rename.cjs');
+  await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(path.join(worldDir, relativePath), originalBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
+    history: [{
+      id: 'ip-baseline-record', timestamp: '2026-08-10T10:00:00.000Z', agent_name: 'BaselineAgent',
+      action: 'create', file_path: relativePath, message: 'ip baseline',
+      publicationStatus: 'published', reactions: { fire: [], heart: [], rocket: [], eyes: [] },
+    }],
+  }));
+  const agentIps = { OldestAgent: '198.51.100.1' };
+  for (let i = 1; i < 5000; i++) agentIps[`CapacityAgent${i}`] = `198.51.${Math.floor(i / 250)}.${i % 250}`;
+  await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify({
+    moderation: {
+      hiddenFiles: [], bannedAgents: [], bannedIps: [], quarantinedFiles: {}, approvedFiles: {},
+    },
+    agentIps,
+  }));
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let failed = false;
+    promises.rename = async function failFirstStateRename(source, target) {
+      if (!failed && fs.existsSync(process.env.AIBUILDS_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_STATE_TARGET) {
+        failed = true;
+        throw Object.assign(new Error('forced state persistence failure'), { code: 'EIO' });
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const extraEnv = {
+    NODE_OPTIONS: `--require=${preloadPath}`,
+    AIBUILDS_FAILURE_ARM: armPath,
+    AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+  };
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  await fs.writeFile(armPath, 'armed');
+  const result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'EvictingAgent', action: 'edit', file_path: relativePath,
+      content: '<main><h1>Failed IP mutation</h1></main>', message: 'force IP rollback',
+    }),
+  });
+  assert.equal(result.response.status, 500, server.logs.join(''));
+  let persisted = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(Object.keys(persisted.agentIps).length, 5000);
+  assert.equal(persisted.agentIps.OldestAgent, '198.51.100.1');
+  assert.equal(Object.hasOwn(persisted.agentIps, 'EvictingAgent'), false);
+  await fs.rm(armPath, { force: true });
+  await server.crash();
+
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  persisted = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(Object.keys(persisted.agentIps).length, 5000);
+  assert.equal(persisted.agentIps.OldestAgent, '198.51.100.1');
+  assert.equal(Object.hasOwn(persisted.agentIps, 'EvictingAgent'), false);
+  await server.stop();
+});

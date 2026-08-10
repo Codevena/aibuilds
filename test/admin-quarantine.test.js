@@ -461,3 +461,131 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal(frames.some(frame => JSON.stringify(frame).includes(riskyPath)), false);
 });
+
+test('legacy moderate delete serializes its quarantine check and cleanup with contribution writes', async (t) => {
+  // Mutation caught: removing the shared path lock lets legacy cleanup clear a quarantine created mid-delete.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-admin-legacy-delete-race-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/delete-race.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const markerPath = path.join(root, 'legacy-unlink-started');
+  const quarantineMarkerPath = path.join(root, 'contribution-quarantine-saved');
+  const releasePath = path.join(root, 'release-legacy-unlink');
+  const armPath = path.join(root, 'arm-legacy-unlink');
+  const preloadPath = path.join(root, 'delay-legacy-unlink.cjs');
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, '<main><h1>Original safe page</h1></main>');
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalUnlink = promises.unlink.bind(promises);
+    const originalRename = promises.rename.bind(promises);
+    let delayed = false;
+    promises.unlink = async function delayLegacyUnlink(target) {
+      if (!delayed && String(target) === process.env.AIBUILDS_RACE_TARGET &&
+          fs.existsSync(process.env.AIBUILDS_RACE_ARM)) {
+        delayed = true;
+        const result = await originalUnlink(target);
+        fs.writeFileSync(process.env.AIBUILDS_RACE_MARKER, 'started');
+        while (!fs.existsSync(process.env.AIBUILDS_RACE_RELEASE)) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        return result;
+      }
+      return originalUnlink(target);
+    };
+    promises.rename = async function observeQuarantineSave(source, target) {
+      const result = await originalRename(source, target);
+      if (String(target) === process.env.AIBUILDS_MODERATION_TARGET &&
+          fs.existsSync(process.env.AIBUILDS_RACE_MARKER) &&
+          !fs.existsSync(process.env.AIBUILDS_RACE_RELEASE)) {
+        const state = JSON.parse(fs.readFileSync(target, 'utf8'));
+        if (state.moderation?.quarantinedFiles?.[process.env.AIBUILDS_RACE_PATH]) {
+          fs.writeFileSync(process.env.AIBUILDS_QUARANTINE_MARKER, 'saved');
+        }
+      }
+      return result;
+    };
+  `);
+  const port = await getFreePort();
+  const logs = [];
+  const child = spawn(process.execPath, ['server/index.js'], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      POW_DIFFICULTY: '0',
+      ADMIN_RESET_SECRET: 'operator-secret',
+      AIBUILDS_WORLD_DIR: worldDir,
+      AIBUILDS_DATA_DIR: dataDir,
+      AIBUILDS_BACKUP_DIR: backupDir,
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      AIBUILDS_RACE_TARGET: fullPath,
+      AIBUILDS_RACE_PATH: relativePath,
+      AIBUILDS_RACE_ARM: armPath,
+      AIBUILDS_RACE_MARKER: markerPath,
+      AIBUILDS_RACE_RELEASE: releasePath,
+      AIBUILDS_QUARANTINE_MARKER: quarantineMarkerPath,
+      AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', chunk => logs.push(chunk.toString()));
+  child.stderr.on('data', chunk => logs.push(chunk.toString()));
+  t.after(async () => {
+    await fs.writeFile(releasePath, 'release').catch(() => {});
+    if (child.exitCode === null) child.kill('SIGTERM');
+    if (child.exitCode === null) await once(child, 'exit');
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  await waitForServer(baseUrl, child, logs);
+  await fs.writeFile(armPath, 'armed');
+
+  const legacyDelete = requestJson(baseUrl, '/api/admin/moderate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secret: 'operator-secret', action: 'delete', target: relativePath }),
+  });
+  const deadline = Date.now() + 5000;
+  while (true) {
+    try { await fs.access(markerPath); break; } catch { /* wait */ }
+    if (Date.now() > deadline) throw new Error(`Legacy unlink did not start:\n${logs.join('')}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const challenge = await requestJson(baseUrl, '/api/challenge');
+  const riskyContribution = requestJson(baseUrl, '/api/contribute', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Challenge-Id': challenge.body.id,
+      'X-Challenge-Nonce': '0',
+    },
+    body: JSON.stringify({
+      agent_name: 'RaceAgent', action: 'edit', file_path: relativePath,
+      content: '<p>Inject 8 mg weekly for best results.</p>', message: 'risky race edit',
+    }),
+  });
+  const observationDeadline = Date.now() + 1000;
+  while (Date.now() < observationDeadline) {
+    try { await fs.access(quarantineMarkerPath); break; } catch { /* locked contribution has not saved */ }
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  let contributionEnteredCriticalSection = true;
+  try { await fs.access(quarantineMarkerPath); } catch { contributionEnteredCriticalSection = false; }
+  await fs.writeFile(releasePath, 'release');
+
+  const [legacyResult, contributionResult] = await Promise.all([legacyDelete, riskyContribution]);
+  assert.equal(contributionEnteredCriticalSection, false,
+    'contribution must wait until legacy delete releases the canonical path transaction');
+  assert.equal(legacyResult.response.status, 200, logs.join(''));
+  assert.equal(contributionResult.response.status, 200, logs.join(''));
+  assert.equal(contributionResult.body.publicationStatus, 'quarantined');
+  const listed = await requestJson(baseUrl, '/api/admin/quarantine', {
+    headers: { 'X-Admin-Secret': 'operator-secret' },
+  });
+  assert.equal(listed.body.quarantined.some(item => item.path === relativePath), true);
+  assert.equal((await requestJson(baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+});

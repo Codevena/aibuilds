@@ -359,11 +359,12 @@ async function snapshotContributionTransaction({ fullPath, filePath, agentName, 
     fileBytes,
     quarantine: quarantine ? { ...quarantine, reasons: [...quarantine.reasons] } : null,
     approval,
-    agentIp: moderation.resolveAgentIp(ipAgentName),
+    agentIps: moderation.snapshotAgentIps(),
     agentExisted: agents.has(agentName),
     agent: agents.has(agentName) ? structuredClone(agents.get(agentName)) : null,
     contributionId: null,
     trimmedHistory: null,
+    gitHash: null,
   };
 }
 
@@ -372,11 +373,58 @@ function restorePathModeration(transaction) {
   moderation.clearApproval(transaction.filePath);
   if (transaction.quarantine) moderation.quarantine(transaction.filePath, transaction.quarantine);
   if (transaction.approval) moderation.approve(transaction.filePath, transaction.approval);
-  moderation.restoreAgentIp(transaction.ipAgentName, transaction.agentIp);
+}
+
+async function failClosedRollbackPath(transaction, reason) {
+  let currentHash = transaction.mutatedContentHash;
+  try { currentHash = contentHash(await fs.readFile(transaction.fullPath)); }
+  catch { /* an unavailable path is already nonpublic; retain the mutation hash for durable metadata */ }
+  moderation.releaseQuarantine(transaction.filePath);
+  moderation.clearApproval(transaction.filePath);
+  moderation.quarantine(transaction.filePath, {
+    contentHash: currentHash || contentHash(Buffer.alloc(0)),
+    reasons: [reason],
+    agentName: transaction.agentName,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+async function compensateContributionGit(transaction) {
+  return queueGitOperation(async () => {
+    let pathWasStaged = false;
+    try {
+      let tracked = true;
+      try { await git.raw(['ls-files', '--error-unmatch', '--', transaction.filePath]); }
+      catch { tracked = false; }
+      if (transaction.fileExisted) {
+        await git.add(['--', transaction.filePath]);
+        pathWasStaged = true;
+      } else if (tracked) {
+        await git.add(['-u', '--', transaction.filePath]);
+        pathWasStaged = true;
+      }
+      const subject = `rollback: ${transaction.gitHash} ${transaction.filePath}`;
+      if (pathWasStaged || tracked) {
+        await git.raw([
+          'commit', '--only', '--allow-empty', '--no-verify', '-m', subject, '--', transaction.filePath,
+        ]);
+      } else {
+        await git.raw(['commit', '--allow-empty', '--no-verify', '-m', subject]);
+      }
+      const latest = (await git.log({ maxCount: 1 })).latest;
+      if (!latest || latest.message !== subject) throw new Error('Contribution rollback commit was not created');
+    } catch (error) {
+      if (pathWasStaged) {
+        try { await git.raw(['reset', '--', transaction.filePath]); } catch { /* retain original error */ }
+      }
+      throw error;
+    }
+  });
 }
 
 async function rollbackContributionTransaction(transaction) {
   const rollbackErrors = [];
+  let bytesRestored = true;
   try {
     if (transaction.fileExisted) {
       await replaceWorldFileAtomically(transaction.fullPath, transaction.fileBytes);
@@ -385,10 +433,13 @@ async function rollbackContributionTransaction(transaction) {
       catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
   } catch (error) {
+    bytesRestored = false;
     rollbackErrors.push(error);
   }
 
-  restorePathModeration(transaction);
+  if (bytesRestored) restorePathModeration(transaction);
+  else await failClosedRollbackPath(transaction, 'rollback_failed');
+  moderation.restoreAgentIps(transaction.agentIps);
   if (transaction.contributionId) {
     const index = history.findIndex(item => item.id === transaction.contributionId);
     if (index !== -1) history.splice(index, 1);
@@ -400,6 +451,15 @@ async function rollbackContributionTransaction(transaction) {
   }
   if (transaction.agentExisted) agents.set(transaction.agentName, transaction.agent);
   else agents.delete(transaction.agentName);
+
+  if (bytesRestored && transaction.gitHash) {
+    try {
+      await compensateContributionGit(transaction);
+    } catch (error) {
+      rollbackErrors.push(error);
+      await failClosedRollbackPath(transaction, 'git_rollback_failed');
+    }
+  }
 
   try { await moderation.save(); } catch (error) { rollbackErrors.push(error); }
   try { await saveState(); } catch (error) { rollbackErrors.push(error); }
@@ -1506,47 +1566,47 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
   }
   // Resolve a contribution id to its file path; otherwise treat target as a path.
   const filePath = contributions.has(target) ? contributions.get(target).file_path : target;
-  const fullPath = path.join(WORLD_DIR, filePath);
-  // The WORLD_DIR containment check is the ONLY path guard. path.join already normalizes ../,
-  // // and . segments, so a manual `.replace(/\.\./g,'')` is both broken (e.g. '....//' -> '../')
-  // and a false-trust anchor — omit it deliberately.
-  if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
-    return res.status(403).json({ error: 'Access denied' });
-  }
-  // Canonical in-world relative path (collapses ./ and ../). Use it for EVERY record/key/stage op
-  // so a non-canonical target can't unlink one file while mismatching the history/git/hidden bookkeeping.
-  const relPath = path.relative(WORLD_DIR, fullPath).split(path.sep).join('/');
-
-  if (action === 'delete' && moderation.isQuarantined(relPath)) {
-    return res.status(409).json({
-      error: 'Quarantined files must be rejected through the quarantine decision endpoint.',
-    });
-  }
-
-  if (action === 'hide') {
-    moderation.hide(relPath);
-  } else if (action === 'unhide') {
-    moderation.unhide(relPath);
-  } else { // delete
-    try { await fs.unlink(fullPath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    // Purge from in-memory history + index
-    for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i].file_path === relPath) {
-        contributions.delete(history[i].id);
-        history.splice(i, 1);
-      }
+  let relPath;
+  try { relPath = normalizeWorldPath(filePath); }
+  catch { return res.status(403).json({ error: 'Access denied' }); }
+  const fullPath = resolveWorldPath(WORLD_DIR, relPath);
+  const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
+  const releaseMutation = await acquireWorldMutation(relPath);
+  try {
+    if (action === 'delete' && moderation.isQuarantined(relPath)) {
+      return res.status(409).json({
+        error: 'Quarantined files must be rejected through the quarantine decision endpoint.',
+      });
     }
-    moderation.unhide(relPath);
-    moderation.reject(relPath);
-    // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
-    // `git add <deleted path>` stages the file's removal.
-    try { await git.add(['--', relPath]); await git.commit(`moderation: remove ${relPath}`); } catch (e) { /* best effort */ }
-    await saveState(); // delete also mutated history/contributions, which live in state.json
-  }
 
-  await moderation.save();
-  broadcast({ type: 'moderation', data: { action, target: relPath } });
-  res.json({ success: true, action, target: relPath, hidden: moderation.listHidden() });
+    if (action === 'hide') {
+      moderation.hide(relPath);
+    } else if (action === 'unhide') {
+      moderation.unhide(relPath);
+    } else { // delete
+      try { await fs.unlink(fullPath); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+      // Purge from in-memory history + index
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].file_path === relPath) {
+          contributions.delete(history[i].id);
+          history.splice(i, 1);
+        }
+      }
+      moderation.unhide(relPath);
+      moderation.reject(relPath);
+      // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
+      // `git add <deleted path>` stages the file's removal.
+      try { await git.add(['--', relPath]); await git.commit(`moderation: remove ${relPath}`); } catch (e) { /* best effort */ }
+      await saveState(); // delete also mutated history/contributions, which live in state.json
+    }
+
+    await moderation.save();
+    broadcast({ type: 'moderation', data: { action, target: relPath } });
+    res.json({ success: true, action, target: relPath, hidden: moderation.listHidden() });
+  } finally {
+    releaseMutation();
+    releaseContributionState();
+  }
 });
 
 // Admin: ban/unban an agent name and/or IP
@@ -3013,6 +3073,9 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       commentCount: 0,
       publicationStatus: decision.status,
     };
+    transaction.mutatedContentHash = action === 'delete'
+      ? contentHash(Buffer.alloc(0))
+      : evaluation.contentHash;
 
     if (action === 'delete') {
       let removed = false;
@@ -3051,6 +3114,7 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
     // Bind the immutable record to the exact bytes written while this path transaction is held.
     // The Git queue rejects per operation while its recovered tail remains usable.
     contribution.gitHash = await gitCommit(contribution);
+    transaction.gitHash = contribution.gitHash;
 
     // A safe correction may make older published records visible again. Snapshot after that path
     // transition but before inserting this new immutable record, so old awards are not re-emitted.
