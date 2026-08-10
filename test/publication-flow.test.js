@@ -636,7 +636,7 @@ test('contribution diff is bound to the requested contribution git hash', async 
   await waitFor(async () => {
     try {
       const { stdout } = await new Promise((resolve, reject) => {
-        const child = require('node:child_process').execFile('git', ['log', '-1', '--pretty=%B'], { cwd: worldDir },
+        const child = require('node:child_process').execFile('git', ['log', '-2', '--pretty=%B'], { cwd: worldDir },
           (error, out, stderr) => error ? reject(error) : resolve({ stdout: out, stderr }));
         child.unref?.();
       });
@@ -1437,6 +1437,820 @@ test('post-Git state failure is compensated before a later public contribution d
   await server.stop();
 });
 
+test('successful quarantine sanitizes its Git parent before a later public correction', async (t) => {
+  // Mutation caught: retaining the quarantined commit as HEAD exposes its deleted bytes in the correction diff.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-normal-quarantine-git-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/normal-quarantine-parent.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const originalBytes = '<main><h1>Original public parent</h1></main>';
+  const privateBytes = '<p>Inject 29 mg weekly PRIVATE_NORMAL_QUARANTINE.</p>';
+  const safeBytes = '<main><h1>Safe correction after normal quarantine</h1></main>';
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, originalBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
+    history: [{
+      id: 'normal-quarantine-baseline', timestamp: '2026-08-10T10:00:00.000Z',
+      agent_name: 'NormalQuarantineBaseline', action: 'create', file_path: relativePath,
+      message: 'normal quarantine baseline', publicationStatus: 'published',
+      reactions: { fire: [], heart: [], rocket: [], eyes: [] },
+    }],
+  }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'normal quarantine public baseline'], { cwd: worldDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+
+  const quarantined = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'NormalPrivateAgent', action: 'edit', file_path: relativePath,
+      content: privateBytes, message: 'PRIVATE_NORMAL_QUARANTINE',
+    }),
+  });
+  assert.equal(quarantined.response.status, 200, server.logs.join(''));
+  assert.equal(quarantined.body.publicationStatus, 'quarantined');
+  assert.equal(await fs.readFile(fullPath, 'utf8'), privateBytes);
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  let gitResult = await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir });
+  assert.equal(gitResult.stdout.trim(), originalBytes);
+
+  const correction = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'NormalSafeAgent', action: 'edit', file_path: relativePath,
+      content: safeBytes, message: 'SAFE_AFTER_NORMAL_QUARANTINE',
+    }),
+  });
+  assert.equal(correction.response.status, 200, server.logs.join(''));
+  assert.equal(correction.body.publicationStatus, 'published');
+  const diff = await jsonRequest(
+    server.baseUrl, `/api/contributions/${correction.body.contribution.id}/diff`,
+  );
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /Safe correction after normal quarantine/);
+  assert.doesNotMatch(diff.body.diff || '', /PRIVATE_NORMAL_QUARANTINE|Inject 29 mg weekly/);
+  const timeline = (await jsonRequest(server.baseUrl, '/api/timeline')).body;
+  assert.equal(timeline.some(item => item.message === 'PRIVATE_NORMAL_QUARANTINE'), false);
+  assert.equal(timeline.some(item => item.message === 'SAFE_AFTER_NORMAL_QUARANTINE'), true);
+  gitResult = await execFileAsync('git', ['status', '--porcelain'], { cwd: worldDir });
+  assert.equal(gitResult.stdout, '');
+  await server.stop();
+});
+
+test('rollback restores every pre-existing conflict stage for the canonical path', async (t) => {
+  // Mutation caught: restoring only a stage-0 entry removes the original stages 1/2/3.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-conflict-index-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/conflicted.txt';
+  const unrelatedPath = 'pages/unrelated-index.txt';
+  const fullPath = path.join(worldDir, relativePath);
+  const armPath = path.join(root, 'arm-state-failure');
+  const preloadPath = path.join(root, 'fail-first-state-rename.cjs');
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, 'base\n');
+  await fs.writeFile(path.join(worldDir, unrelatedPath), 'unrelated base\n');
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', relativePath, unrelatedPath], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'conflict base'], { cwd: worldDir });
+  const initialBranch = (await execFileAsync(
+    'git', ['branch', '--show-current'], { cwd: worldDir },
+  )).stdout.trim();
+  await execFileAsync('git', ['checkout', '-b', 'conflict-side'], { cwd: worldDir });
+  await fs.writeFile(fullPath, 'theirs\n');
+  await execFileAsync('git', ['commit', '-am', 'theirs'], { cwd: worldDir });
+  await execFileAsync('git', ['checkout', initialBranch], { cwd: worldDir });
+  await fs.writeFile(fullPath, 'ours\n');
+  await execFileAsync('git', ['commit', '-am', 'ours'], { cwd: worldDir });
+  await assert.rejects(execFileAsync('git', ['merge', 'conflict-side'], { cwd: worldDir }));
+  await fs.writeFile(path.join(worldDir, unrelatedPath), 'unrelated staged change\n');
+  await execFileAsync('git', ['add', unrelatedPath], { cwd: worldDir });
+  const conflictedBytes = await fs.readFile(fullPath, 'utf8');
+  const beforeIndex = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', relativePath], { cwd: worldDir },
+  )).stdout;
+  const beforeUnrelatedIndex = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', unrelatedPath], { cwd: worldDir },
+  )).stdout;
+  assert.deepEqual(Array.from(beforeIndex.matchAll(/\s([123])\t/g), match => Number(match[1])), [1, 2, 3]);
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let failed = false;
+    promises.rename = async function failFirstStateRename(source, target) {
+      if (!failed && fs.existsSync(process.env.AIBUILDS_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_STATE_TARGET) {
+        failed = true;
+        throw Object.assign(new Error('forced state persistence failure'), { code: 'EIO' });
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const server = await startIsolatedServer(t, {
+    worldDir,
+    dataDir,
+    backupDir,
+    extraEnv: {
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      AIBUILDS_FAILURE_ARM: armPath,
+      AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+    },
+  });
+  await fs.writeFile(armPath, 'armed');
+
+  const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'ConflictRollbackAgent', action: 'edit', file_path: relativePath,
+      content: 'temporary private resolution\n', message: 'force conflict rollback',
+    }),
+  });
+  assert.equal(failed.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(fullPath, 'utf8'), conflictedBytes);
+  const afterIndex = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', relativePath], { cwd: worldDir },
+  )).stdout;
+  assert.equal(afterIndex, beforeIndex);
+  const afterUnrelatedIndex = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', unrelatedPath], { cwd: worldDir },
+  )).stdout;
+  assert.equal(afterUnrelatedIndex, beforeUnrelatedIndex);
+  const { stdout: headBytes } = await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir });
+  assert.equal(headBytes, 'ours\n');
+  assert.doesNotMatch(headBytes, /temporary private resolution/);
+  await server.stop();
+});
+
+test('rollback restores assume-unchanged and skip-worktree flags with the exact stage-0 entry', async (t) => {
+  // Mutation caught: recreating cacheinfo with default flags changes the original `s` index tag to `H`.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-index-flags-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/index-flags.txt';
+  const fullPath = path.join(worldDir, relativePath);
+  const originalBytes = 'public flag baseline\n';
+  const armPath = path.join(root, 'arm-state-failure');
+  const preloadPath = path.join(root, 'fail-first-state-rename.cjs');
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, originalBytes);
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', relativePath], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'flag base'], { cwd: worldDir });
+  await execFileAsync('git', ['update-index', '--assume-unchanged', relativePath], { cwd: worldDir });
+  await execFileAsync('git', ['update-index', '--skip-worktree', relativePath], { cwd: worldDir });
+  const beforeStage = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', relativePath], { cwd: worldDir },
+  )).stdout;
+  const beforeFlags = (await execFileAsync(
+    'git', ['ls-files', '-v', '-z', '--', relativePath], { cwd: worldDir },
+  )).stdout;
+  assert.equal(beforeFlags, `s ${relativePath}\0`);
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let failed = false;
+    promises.rename = async function failFirstStateRename(source, target) {
+      if (!failed && fs.existsSync(process.env.AIBUILDS_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_STATE_TARGET) {
+        failed = true;
+        throw Object.assign(new Error('forced state persistence failure'), { code: 'EIO' });
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const server = await startIsolatedServer(t, {
+    worldDir,
+    dataDir,
+    backupDir,
+    extraEnv: {
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      AIBUILDS_FAILURE_ARM: armPath,
+      AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+    },
+  });
+  await fs.writeFile(armPath, 'armed');
+
+  const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'FlagRollbackAgent', action: 'edit', file_path: relativePath,
+      content: 'temporary private flag bytes\n', message: 'force flag rollback',
+    }),
+  });
+  assert.equal(failed.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(fullPath, 'utf8'), originalBytes);
+  const afterStage = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', relativePath], { cwd: worldDir },
+  )).stdout;
+  const afterFlags = (await execFileAsync(
+    'git', ['ls-files', '-v', '-z', '--', relativePath], { cwd: worldDir },
+  )).stdout;
+  assert.equal(afterStage, beforeStage);
+  assert.equal(afterFlags, beforeFlags);
+  const { stdout: latestSubject } = await execFileAsync(
+    'git', ['log', '-1', '--format=%s'], { cwd: worldDir },
+  );
+  assert.match(latestSubject, /^rollback: /,
+    'the test must reach post-commit compensation instead of passing on the original skip-worktree guard');
+  const { stdout: headBytes } = await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir });
+  assert.equal(headBytes, originalBytes);
+  await server.stop();
+});
+
+test('Git transactions treat wildcard characters in canonical filenames literally', async (t) => {
+  // Mutation caught: passing the raw path after `--` lets Git match and publish the staged neighbor.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-literal-pathspec-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const literalPath = 'pages/exact*.txt';
+  const neighborPath = 'pages/exact-neighbor.txt';
+  const literalFullPath = path.join(worldDir, literalPath);
+  const neighborFullPath = path.join(worldDir, neighborPath);
+  const neighborPublicBytes = 'neighbor public baseline\n';
+  const neighborPrivateBytes = 'PRIVATE_WILDCARD_NEIGHBOR\n';
+  const armPath = path.join(root, 'arm-state-failure');
+  const preloadPath = path.join(root, 'fail-first-state-rename.cjs');
+  await fs.mkdir(path.dirname(literalFullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(literalFullPath, 'literal public baseline\n');
+  await fs.writeFile(neighborFullPath, neighborPublicBytes);
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'literal pathspec baseline'], { cwd: worldDir });
+  await fs.writeFile(neighborFullPath, neighborPrivateBytes);
+  await execFileAsync('git', ['add', '--', neighborPath], { cwd: worldDir });
+  const neighborIndexBefore = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', neighborPath], { cwd: worldDir },
+  )).stdout;
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let failed = false;
+    promises.rename = async function failFirstStateRename(source, target) {
+      if (!failed && fs.existsSync(process.env.AIBUILDS_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_STATE_TARGET) {
+        failed = true;
+        throw Object.assign(new Error('forced state persistence failure'), { code: 'EIO' });
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const server = await startIsolatedServer(t, {
+    worldDir,
+    dataDir,
+    backupDir,
+    extraEnv: {
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      AIBUILDS_FAILURE_ARM: armPath,
+      AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+    },
+  });
+
+  const result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'LiteralPathAgent', action: 'edit', file_path: literalPath,
+      content: 'literal safe replacement\n', message: 'LITERAL_PATHSPEC_CONTRIBUTION',
+    }),
+  });
+  assert.equal(result.response.status, 200, server.logs.join(''));
+  assert.equal(result.body.publicationStatus, 'published');
+  const { stdout: committedNeighbor } = await execFileAsync(
+    'git', ['show', `HEAD:${neighborPath}`], { cwd: worldDir },
+  );
+  assert.equal(committedNeighbor, neighborPublicBytes);
+  assert.equal(await fs.readFile(neighborFullPath, 'utf8'), neighborPrivateBytes);
+  const neighborIndexAfter = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', neighborPath], { cwd: worldDir },
+  )).stdout;
+  assert.equal(neighborIndexAfter, neighborIndexBefore);
+  const diff = await jsonRequest(server.baseUrl, `/api/contributions/${result.body.contribution.id}/diff`);
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /literal safe replacement/);
+  assert.doesNotMatch(diff.body.diff || '', /PRIVATE_WILDCARD_NEIGHBOR|exact-neighbor/);
+
+  const literalIndexBeforeRollback = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', literalPath], { cwd: worldDir },
+  )).stdout;
+  await fs.writeFile(armPath, 'armed');
+  const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'LiteralRollbackAgent', action: 'edit', file_path: literalPath,
+      content: 'literal temporary failed replacement\n', message: 'LITERAL_PATHSPEC_ROLLBACK',
+    }),
+  });
+  assert.equal(failed.response.status, 500, server.logs.join(''));
+  const literalIndexAfterRollback = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', literalPath], { cwd: worldDir },
+  )).stdout;
+  const neighborIndexAfterRollback = (await execFileAsync(
+    'git', ['ls-files', '--stage', '-z', '--', neighborPath], { cwd: worldDir },
+  )).stdout;
+  assert.equal(literalIndexAfterRollback, literalIndexBeforeRollback);
+  assert.equal(neighborIndexAfterRollback, neighborIndexBefore);
+  const { stdout: rolledBackLiteral } = await execFileAsync(
+    'git', ['show', `HEAD:${literalPath}`], { cwd: worldDir },
+  );
+  assert.equal(rolledBackLiteral, 'literal safe replacement\n');
+  assert.equal(await fs.readFile(literalFullPath, 'utf8'), 'literal safe replacement\n');
+  await server.stop();
+});
+
+test('failed Git compensation stays repair-required until a safe correction repairs its public parent', async (t) => {
+  // Mutations caught: ignoring the repair guard publishes immediately; discarding repair state exposes on restart.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-durable-git-repair-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const binDir = path.join(root, 'bin');
+  const relativePath = 'pages/durable-git-repair.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const originalBytes = '<main><h1>Exact public repair parent</h1></main>';
+  const privateBytes = '<p>Inject 23 mg weekly PRIVATE_REPAIR_PARENT.</p>';
+  const safeBytes = '<main><h1>Safe after durable Git repair</h1></main>';
+  const stateArmPath = path.join(root, 'arm-state-failure');
+  const gitArmPath = path.join(root, 'arm-git-compensation-failure');
+  const walObservedPath = path.join(root, 'git-wal-observed');
+  const repairSaveFailureObservedPath = path.join(root, 'repair-save-failure-observed');
+  const preloadPath = path.join(root, 'fail-first-state-rename.cjs');
+  const wrapperPath = path.join(binDir, 'git');
+  const realGit = (await execFileAsync('which', ['git'])).stdout.trim();
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(fullPath, originalBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
+    history: [{
+      id: 'repair-public-record', timestamp: '2026-08-10T10:00:00.000Z', agent_name: 'RepairBaseline',
+      action: 'create', file_path: relativePath, message: 'repair public baseline',
+      publicationStatus: 'published', reactions: { fire: [], heart: [], rocket: [], eyes: [] },
+    }],
+  }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'repair public baseline'], { cwd: worldDir });
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let stateFailed = false;
+    let repairSaveFailed = false;
+    promises.rename = async function failFirstStateRename(source, target) {
+      if (!stateFailed && fs.existsSync(process.env.AIBUILDS_STATE_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_STATE_TARGET) {
+        stateFailed = true;
+        throw Object.assign(new Error('forced state persistence failure'), { code: 'EIO' });
+      }
+      if (!repairSaveFailed && fs.existsSync(process.env.AIBUILDS_STATE_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_MODERATION_TARGET) {
+        const snapshot = JSON.parse(fs.readFileSync(source, 'utf8'));
+        const repair = snapshot.gitRepairs?.[process.env.AIBUILDS_REPAIR_PATH];
+        if (repair?.status === 'required') {
+          repairSaveFailed = true;
+          fs.writeFileSync(process.env.AIBUILDS_REPAIR_SAVE_FAILURE_OBSERVED, 'failed');
+          throw Object.assign(new Error('forced repair-state persistence failure'), { code: 'EIO' });
+        }
+      }
+      return originalRename(source, target);
+    };
+  `);
+  await fs.writeFile(wrapperPath, `#!/bin/sh
+if [ "$1" = "commit" ] && [ -f "$AIBUILDS_GIT_WAL_CHECK_ARM" ]; then
+  "$AIBUILDS_NODE_BINARY" -e '
+    const fs = require("node:fs");
+    const state = JSON.parse(fs.readFileSync(process.env.AIBUILDS_MODERATION_TARGET, "utf8"));
+    const repair = state.gitRepairs?.[process.env.AIBUILDS_REPAIR_PATH];
+    if (repair?.status !== "armed") process.exit(74);
+  ' || { echo "missing durable pre-commit Git repair marker" >&2; exit 74; }
+  : > "$AIBUILDS_GIT_WAL_OBSERVED"
+fi
+if [ "$1" = "commit-tree" ] && [ -f "$AIBUILDS_GIT_COMPENSATION_FAILURE_ARM" ]; then
+  echo "forced Git compensation failure" >&2
+  exit 75
+fi
+exec "$AIBUILDS_REAL_GIT" "$@"
+`);
+  await fs.chmod(wrapperPath, 0o755);
+  const extraEnv = {
+    NODE_OPTIONS: `--require=${preloadPath}`,
+    PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+    AIBUILDS_REAL_GIT: realGit,
+    AIBUILDS_STATE_FAILURE_ARM: stateArmPath,
+    AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+    AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
+    AIBUILDS_REPAIR_PATH: relativePath,
+    AIBUILDS_REPAIR_SAVE_FAILURE_OBSERVED: repairSaveFailureObservedPath,
+    AIBUILDS_NODE_BINARY: process.execPath,
+    AIBUILDS_GIT_WAL_CHECK_ARM: stateArmPath,
+    AIBUILDS_GIT_WAL_OBSERVED: walObservedPath,
+    AIBUILDS_GIT_COMPENSATION_FAILURE_ARM: gitArmPath,
+  };
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  await fs.writeFile(stateArmPath, 'armed');
+  await fs.writeFile(gitArmPath, 'armed');
+
+  const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'PrivateRepairAgent', action: 'edit', file_path: relativePath,
+      content: privateBytes, message: 'PRIVATE_REPAIR_FAILURE',
+    }),
+  });
+  assert.equal(failed.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(walObservedPath, 'utf8'), '');
+  assert.equal(await fs.readFile(repairSaveFailureObservedPath, 'utf8'), 'failed');
+  assert.equal(await fs.readFile(fullPath, 'utf8'), originalBytes);
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  let moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.ok(moderationState.gitRepairs?.[relativePath], 'the exact Git repair transaction must be durable');
+  assert.deepEqual(moderationState.moderation.quarantinedFiles[relativePath].reasons, ['git_rollback_failed']);
+  let gitResult = await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir });
+  assert.equal(gitResult.stdout.trim(), privateBytes);
+  await fs.rm(stateArmPath, { force: true });
+  await server.crash();
+
+  // Model a process that died immediately after the private Git commit: only the durable armed
+  // write-ahead snapshot exists, and the private working bytes were never restored in-process.
+  moderationState.gitRepairs[relativePath].status = 'armed';
+  moderationState.gitRepairs[relativePath].gitHash = null;
+  await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify(moderationState, null, 2));
+  await fs.writeFile(fullPath, privateBytes);
+
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  assert.equal(await fs.readFile(fullPath, 'utf8'), privateBytes);
+  moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.ok(moderationState.gitRepairs?.[relativePath]);
+  assert.ok(moderationState.moderation.quarantinedFiles[relativePath]);
+  const rejectedCorrection = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'BlockedSafeRepairAgent', action: 'edit', file_path: relativePath,
+      content: safeBytes, message: 'BLOCKED_SAFE_REPAIR',
+    }),
+  });
+  assert.equal(rejectedCorrection.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(fullPath, 'utf8'), privateBytes);
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  assert.equal((await jsonRequest(server.baseUrl, '/api/timeline')).body
+    .some(item => item.message === 'BLOCKED_SAFE_REPAIR'), false);
+  moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.ok(moderationState.gitRepairs?.[relativePath]);
+
+  await fs.rm(gitArmPath, { force: true });
+  const correction = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'SafeRepairAgent', action: 'edit', file_path: relativePath,
+      content: safeBytes, message: 'SAFE_AFTER_GIT_REPAIR',
+    }),
+  });
+  assert.equal(correction.response.status, 200, server.logs.join(''));
+  assert.equal(correction.body.publicationStatus, 'published');
+  assert.equal(await fs.readFile(fullPath, 'utf8'), safeBytes);
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 200);
+  const diff = await jsonRequest(server.baseUrl, `/api/contributions/${correction.body.contribution.id}/diff`);
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /Safe after durable Git repair/);
+  assert.doesNotMatch(diff.body.diff || '', /PRIVATE_REPAIR_PARENT|PRIVATE_REPAIR_FAILURE/);
+  const timeline = (await jsonRequest(server.baseUrl, '/api/timeline')).body;
+  assert.equal(timeline.some(item => item.message === 'PRIVATE_REPAIR_FAILURE'), false);
+  assert.equal(timeline.some(item => item.message === 'SAFE_AFTER_GIT_REPAIR'), true);
+  moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(Object.hasOwn(moderationState.gitRepairs || {}, relativePath), false);
+  assert.equal(Object.hasOwn(moderationState.moderation.quarantinedFiles, relativePath), false);
+  gitResult = await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir });
+  assert.equal(gitResult.stdout.trim(), safeBytes);
+  await server.stop();
+});
+
+test('unfinished correction restores its exact pretransaction moderation boundary on restart', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-repair-moderation-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const binDir = path.join(root, 'bin');
+  const relativePath = 'misc/private.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const riskyBytes = '<p>Inject 31 mg weekly PRIVATE_PRETRANSACTION_BOUNDARY.</p>';
+  const safeBytes = '<main><h1>Interrupted safe correction</h1></main>';
+  const armPath = path.join(root, 'arm-git-commit-failure');
+  const walSnapshotPath = path.join(root, 'armed-moderation.json');
+  const wrapperPath = path.join(binDir, 'git');
+  const realGit = (await execFileAsync('which', ['git'])).stdout.trim();
+  const quarantine = {
+    filePath: relativePath,
+    contentHash: contentHash(riskyBytes),
+    reasons: ['high_stakes_medical'],
+    agentName: 'BoundaryBaseline',
+    timestamp: '2026-08-10T10:00:00.000Z',
+  };
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(fullPath, riskyBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify({
+    moderation: {
+      hiddenFiles: [], bannedAgents: [], bannedIps: [],
+      quarantinedFiles: { [relativePath]: quarantine }, approvedFiles: {},
+    },
+    agentIps: {}, gitRepairs: {},
+  }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'private quarantined baseline'], { cwd: worldDir });
+  await fs.writeFile(wrapperPath, `#!/bin/sh
+if [ "$1" = "commit" ] && [ -f "$AIBUILDS_GIT_COMMIT_FAILURE_ARM" ]; then
+  /bin/cp "$AIBUILDS_MODERATION_TARGET" "$AIBUILDS_WAL_SNAPSHOT"
+  echo "forced Git commit failure after WAL snapshot" >&2
+  exit 74
+fi
+exec "$AIBUILDS_REAL_GIT" "$@"
+`);
+  await fs.chmod(wrapperPath, 0o755);
+  const extraEnv = {
+    PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+    AIBUILDS_REAL_GIT: realGit,
+    AIBUILDS_GIT_COMMIT_FAILURE_ARM: armPath,
+    AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
+    AIBUILDS_WAL_SNAPSHOT: walSnapshotPath,
+  };
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  await fs.writeFile(armPath, 'armed');
+  const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'InterruptedBoundaryAgent', action: 'edit', file_path: relativePath,
+      content: safeBytes, message: 'INTERRUPTED_BOUNDARY_CORRECTION',
+    }),
+  });
+  assert.equal(failed.response.status, 500, server.logs.join(''));
+  const armedState = JSON.parse(await fs.readFile(walSnapshotPath, 'utf8'));
+  assert.deepEqual(
+    armedState.gitRepairs?.[relativePath]?.publicationState?.quarantine,
+    quarantine,
+  );
+  await server.crash();
+
+  // Recreate the exact crash image from immediately before Git commit: the safe working bytes and
+  // post-correction moderation file exist, but the durable WAL retains the old quarantine boundary.
+  await fs.rm(armPath, { force: true });
+  await fs.writeFile(fullPath, safeBytes);
+  await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify(armedState, null, 2));
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
+  assert.equal(await fs.readFile(fullPath, 'utf8'), riskyBytes);
+  const restoredModeration = JSON.parse(
+    await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'),
+  );
+  assert.deepEqual(restoredModeration.moderation.quarantinedFiles[relativePath], quarantine);
+  assert.equal(Object.hasOwn(restoredModeration.gitRepairs || {}, relativePath), false);
+  await server.stop();
+});
+
+test('failed repair-preimage persistence cannot discard the exact moderation rollback state', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-preimage-save-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/preimage-save.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const safeBytes = '<main><h1>Exact public preimage</h1></main>';
+  const riskyBytes = '<p>Inject 37 mg weekly PRIVATE_PREIMAGE_SAVE.</p>';
+  const failureArmPath = path.join(root, 'arm-preimage-save-failure');
+  const failureObservedPath = path.join(root, 'preimage-save-failure-observed');
+  const preloadPath = path.join(root, 'fail-preimage-save.cjs');
+  const removedIpAgent = 'RemovedPreimageIp';
+  const removedIp = '203.0.113.88';
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, safeBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'exact public preimage'], { cwd: worldDir });
+  const { stdout: originalHeadOutput } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir });
+  const originalHead = originalHeadOutput.trim();
+  const { stdout: treeOutput } = await execFileAsync(
+    'git', ['ls-tree', originalHead, '--', relativePath], { cwd: worldDir },
+  );
+  const treeMatch = treeOutput.trim().match(/^(\d+)\s+blob\s+([0-9a-f]+)\t/);
+  assert.ok(treeMatch);
+  await fs.writeFile(fullPath, riskyBytes);
+  await execFileAsync('git', ['add', '--', relativePath], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'interrupted private commit'], { cwd: worldDir });
+  const riskyQuarantine = {
+    filePath: relativePath,
+    contentHash: contentHash(riskyBytes),
+    reasons: ['high_stakes_medical'],
+    agentName: 'InterruptedPrivateAgent',
+    timestamp: '2026-08-10T10:00:00.000Z',
+  };
+  const repairRecord = {
+    filePath: relativePath,
+    gitHash: null,
+    status: 'armed',
+    contributionId: 'missing-preimage-transaction',
+    publicationState: { quarantine: null, approval: null },
+    agentIps: [[removedIpAgent, removedIp]],
+    fileState: { existed: true, bytesBase64: Buffer.from(safeBytes).toString('base64') },
+    gitPathState: {
+      head: originalHead,
+      treeEntry: { mode: treeMatch[1], hash: treeMatch[2] },
+      indexState: {
+        entries: [{ mode: treeMatch[1], hash: treeMatch[2], stage: 0 }],
+        assumeUnchanged: false,
+        skipWorktree: false,
+      },
+    },
+  };
+  await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify({
+    moderation: {
+      hiddenFiles: [], bannedAgents: [removedIpAgent], bannedIps: [],
+      quarantinedFiles: { [relativePath]: riskyQuarantine }, approvedFiles: {},
+    },
+    agentIps: { [removedIpAgent]: removedIp }, gitRepairs: { [relativePath]: repairRecord },
+  }));
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let failed = false;
+    promises.rename = async function failConsumedPreimage(source, target) {
+      if (!failed && fs.existsSync(process.env.AIBUILDS_PREIMAGE_FAILURE_ARM) &&
+          String(target) === process.env.AIBUILDS_MODERATION_TARGET) {
+        const snapshot = JSON.parse(fs.readFileSync(source, 'utf8'));
+        const repair = snapshot.gitRepairs?.[process.env.AIBUILDS_REPAIR_PATH];
+        if (repair && repair.publicationState === null && repair.agentIps === null) {
+          failed = true;
+          fs.writeFileSync(process.env.AIBUILDS_PREIMAGE_FAILURE_OBSERVED, 'failed');
+          throw Object.assign(new Error('forced repair preimage persistence failure'), { code: 'EIO' });
+        }
+      }
+      return originalRename(source, target);
+    };
+  `);
+  await fs.writeFile(failureArmPath, 'armed');
+  const server = await startIsolatedServer(t, {
+    worldDir, dataDir, backupDir,
+    extraEnv: {
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      AIBUILDS_PREIMAGE_FAILURE_ARM: failureArmPath,
+      AIBUILDS_PREIMAGE_FAILURE_OBSERVED: failureObservedPath,
+      AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
+      AIBUILDS_REPAIR_PATH: relativePath,
+    },
+  });
+  assert.equal(await fs.readFile(failureObservedPath, 'utf8'), 'failed');
+  const unrelatedSave = await jsonRequest(server.baseUrl, '/api/admin/ban', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secret: 'test-secret', action: 'unban', agent_name: removedIpAgent }),
+  });
+  assert.equal(unrelatedSave.response.status, 200, server.logs.join(''));
+  const persistedRepair = JSON.parse(
+    await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'),
+  ).gitRepairs[relativePath];
+  assert.deepEqual(persistedRepair.publicationState, { quarantine: null, approval: null });
+  assert.equal(persistedRepair.agentIps, null);
+
+  const reject = await jsonRequest(server.baseUrl, '/api/admin/quarantine/reject', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': 'test-secret' },
+    body: JSON.stringify({ path: relativePath }),
+  });
+  assert.equal(reject.response.status, 404, server.logs.join(''));
+  assert.equal(await fs.readFile(fullPath, 'utf8'), safeBytes);
+  const publicFile = await jsonRequest(server.baseUrl, `/api/world/${relativePath}`);
+  assert.equal(publicFile.response.status, 200);
+  assert.equal(publicFile.body.content, safeBytes);
+  const finalModeration = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(Object.hasOwn(finalModeration.agentIps, removedIpAgent), false);
+  await server.stop();
+});
+
+test('restart finalizes a contribution durable before its WAL clear', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-finalize-wal-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/finalize-wal.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const originalBytes = '<main><h1>Finalize baseline</h1></main>';
+  const safeBytes = '<main><h1>Durable before WAL clear</h1></main>';
+  const armPath = path.join(root, 'arm-clear-crash');
+  const observedPath = path.join(root, 'clear-crash-observed');
+  const preloadPath = path.join(root, 'crash-before-wal-clear.cjs');
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, originalBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'finalize WAL baseline'], { cwd: worldDir });
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    promises.rename = async function crashBeforeWalClear(source, target) {
+      if (fs.existsSync(process.env.AIBUILDS_CLEAR_CRASH_ARM) &&
+          String(target) === process.env.AIBUILDS_MODERATION_TARGET) {
+        const snapshot = JSON.parse(fs.readFileSync(source, 'utf8'));
+        if (!snapshot.gitRepairs?.[process.env.AIBUILDS_REPAIR_PATH]) {
+          fs.writeFileSync(process.env.AIBUILDS_CLEAR_CRASH_OBSERVED, 'crashed');
+          process.kill(process.pid, 'SIGKILL');
+          await new Promise(() => {});
+        }
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const extraEnv = {
+    NODE_OPTIONS: `--require=${preloadPath}`,
+    AIBUILDS_CLEAR_CRASH_ARM: armPath,
+    AIBUILDS_CLEAR_CRASH_OBSERVED: observedPath,
+    AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
+    AIBUILDS_REPAIR_PATH: relativePath,
+  };
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  await fs.writeFile(armPath, 'armed');
+  await assert.rejects(jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'FinalizeWalAgent', action: 'edit', file_path: relativePath,
+      content: safeBytes, message: 'CRASH_AFTER_STATE_BEFORE_WAL_CLEAR',
+    }),
+  }));
+  assert.equal(await fs.readFile(observedPath, 'utf8'), 'crashed');
+  const persistedBeforeRestart = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
+  const durableRecord = persistedBeforeRestart.history.find(
+    item => item.message === 'CRASH_AFTER_STATE_BEFORE_WAL_CLEAR',
+  );
+  assert.ok(durableRecord);
+  const armedState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(armedState.gitRepairs?.[relativePath]?.contributionId, durableRecord.id);
+  await fs.rm(armPath, { force: true });
+
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  const publicFile = await jsonRequest(server.baseUrl, `/api/world/${relativePath}`);
+  assert.equal(publicFile.response.status, 200, server.logs.join(''));
+  assert.equal(publicFile.body.content, safeBytes);
+  const timeline = (await jsonRequest(server.baseUrl, '/api/timeline')).body;
+  assert.equal(
+    timeline.some(item => item.message === 'CRASH_AFTER_STATE_BEFORE_WAL_CLEAR'),
+    true,
+  );
+  const diff = await jsonRequest(server.baseUrl, `/api/contributions/${durableRecord.id}/diff`);
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /Durable before WAL clear/);
+  const restoredModeration = JSON.parse(
+    await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'),
+  );
+  assert.equal(Object.hasOwn(restoredModeration.gitRepairs || {}, relativePath), false);
+  assert.equal(Object.hasOwn(restoredModeration.agentIps || {}, 'FinalizeWalAgent'), true);
+  const gitResult = await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir });
+  assert.equal(gitResult.stdout.trim(), safeBytes);
+  await server.stop();
+});
+
 test('failed contribution restores an unrelated IP evicted at capacity durably', async (t) => {
   // Mutation caught: restoring only the submitter IP cannot reverse recordAgentIp's capacity eviction.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-ip-rollback-'));
@@ -1507,5 +2321,94 @@ test('failed contribution restores an unrelated IP evicted at capacity durably',
   assert.equal(Object.keys(persisted.agentIps).length, 5000);
   assert.equal(persisted.agentIps.OldestAgent, '198.51.100.1');
   assert.equal(Object.hasOwn(persisted.agentIps, 'EvictingAgent'), false);
+  await server.stop();
+});
+
+test('contribution rollback cannot resurrect an IP removed by a concurrent unban', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-unban-rollback-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/concurrent-unban.html';
+  const fullPath = path.join(worldDir, relativePath);
+  const armPath = path.join(root, 'arm-state-delay');
+  const reachedPath = path.join(root, 'state-delay-reached');
+  const releasePath = path.join(root, 'release-state-delay');
+  const preloadPath = path.join(root, 'delay-state-failure.cjs');
+  await fs.mkdir(path.dirname(fullPath), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(fullPath, '<main><h1>Concurrent unban baseline</h1></main>');
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify({
+    moderation: {
+      hiddenFiles: [], bannedAgents: ['RemovedIpAgent'], bannedIps: [],
+      quarantinedFiles: {}, approvedFiles: {},
+    },
+    agentIps: { RemovedIpAgent: '203.0.113.77' }, gitRepairs: {},
+  }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'concurrent unban baseline'], { cwd: worldDir });
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    let delayed = false;
+    promises.rename = async function delayStateFailure(source, target) {
+      if (!delayed && fs.existsSync(process.env.AIBUILDS_UNBAN_DELAY_ARM) &&
+          String(target) === process.env.AIBUILDS_STATE_TARGET) {
+        delayed = true;
+        await promises.writeFile(process.env.AIBUILDS_UNBAN_DELAY_REACHED, 'reached');
+        while (!fs.existsSync(process.env.AIBUILDS_UNBAN_DELAY_RELEASE)) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        throw Object.assign(new Error('forced delayed state failure'), { code: 'EIO' });
+      }
+      return originalRename(source, target);
+    };
+  `);
+  const extraEnv = {
+    NODE_OPTIONS: `--require=${preloadPath}`,
+    AIBUILDS_UNBAN_DELAY_ARM: armPath,
+    AIBUILDS_UNBAN_DELAY_REACHED: reachedPath,
+    AIBUILDS_UNBAN_DELAY_RELEASE: releasePath,
+    AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
+  };
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  await fs.writeFile(armPath, 'armed');
+  const pendingContribution = jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'RollbackSubmitter', action: 'edit', file_path: relativePath,
+      content: '<main><h1>Contribution that will roll back</h1></main>',
+      message: 'ROLLBACK_DURING_UNBAN',
+    }),
+  });
+  await waitFor(async () => {
+    try { await fs.access(reachedPath); return true; } catch { return false; }
+  });
+  let unbanSettled = false;
+  const pendingUnban = jsonRequest(server.baseUrl, '/api/admin/ban', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      secret: 'test-secret', action: 'unban', agent_name: 'RemovedIpAgent',
+    }),
+  }).then(result => { unbanSettled = true; return result; });
+  await Promise.race([
+    pendingUnban.then(() => {}),
+    new Promise(resolve => setTimeout(resolve, 250)),
+  ]);
+  const unbanSettledBeforeRollback = unbanSettled;
+  await fs.writeFile(releasePath, 'released');
+  const [failedContribution, unban] = await Promise.all([pendingContribution, pendingUnban]);
+  assert.equal(failedContribution.response.status, 500, server.logs.join(''));
+  assert.equal(unban.response.status, 200, server.logs.join(''));
+  assert.equal(unbanSettledBeforeRollback, false, 'unban must wait for contribution rollback');
+  const moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(Object.hasOwn(moderationState.agentIps, 'RemovedIpAgent'), false);
+  assert.equal(moderationState.moderation.bannedAgents.includes('RemovedIpAgent'), false);
   await server.stop();
 });

@@ -222,8 +222,12 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
   });
   assert.equal(result.response.status, 200);
   assert.equal(result.body.publicationStatus, 'quarantined');
-  await execFileAsync('git', ['rm', '--cached', '--', untrackedRejectPath], { cwd: worldDir });
-  await execFileAsync('git', ['commit', '-m', `moderation: reject ${untrackedRejectPath}`], { cwd: worldDir });
+  await assert.rejects(execFileAsync(
+    'git', ['ls-files', '--error-unmatch', '--', untrackedRejectPath], { cwd: worldDir },
+  ));
+  await execFileAsync(
+    'git', ['commit', '--allow-empty', '-m', `moderation: reject ${untrackedRejectPath}`], { cwd: worldDir },
+  );
   const { stdout: auditsBefore } = await execFileAsync('git', [
     'log', '--format=%s', '--fixed-strings', '--grep', `moderation: reject ${untrackedRejectPath}`,
   ], { cwd: worldDir });
