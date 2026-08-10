@@ -65,8 +65,10 @@ async function startIsolatedServer(t, {
   child.stderr.on('data', chunk => logs.push(chunk.toString()));
   let stopped = false;
   t.after(async () => {
-    if (!stopped && child.exitCode === null) child.kill('SIGTERM');
-    if (child.exitCode === null) await once(child, 'exit');
+    if (stopped) return;
+    const exited = child.exitCode === null && child.signalCode === null ? once(child, 'exit') : null;
+    if (exited) child.kill('SIGTERM');
+    if (exited) await exited;
   });
   const baseUrl = `http://127.0.0.1:${port}`;
   try {
@@ -82,8 +84,15 @@ async function startIsolatedServer(t, {
     baseUrl,
     logs,
     async stop() {
+      const exited = child.exitCode === null ? once(child, 'exit') : null;
       if (child.exitCode === null) child.kill('SIGTERM');
-      if (child.exitCode === null) await once(child, 'exit');
+      if (exited) await exited;
+      stopped = true;
+    },
+    async crash() {
+      const exited = child.exitCode === null ? once(child, 'exit') : null;
+      if (child.exitCode === null) child.kill('SIGKILL');
+      if (exited) await exited;
       stopped = true;
     },
   };
@@ -958,3 +967,182 @@ test('homepage and pretty routes render public pages when no layout exists', asy
   assert.match(await prettyPage.text(), /Fallback about page/);
   await server.stop();
 });
+
+test('delete records for quarantined targets remain private after a safe recreation', async (t) => {
+  // Mutation caught: assigning every delete `published` revives a private delete record with the path.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-private-delete-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const relativePath = 'pages/private-delete.html';
+
+  let result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'RiskAuthor', action: 'create', file_path: relativePath,
+      content: '<p>Inject 8 mg weekly for best results.</p>', message: 'private risky create',
+    }),
+  });
+  assert.equal(result.body.publicationStatus, 'quarantined');
+  result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'PrivateDeleter', action: 'delete', file_path: relativePath,
+      message: 'delete private target',
+    }),
+  });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.publicationStatus, 'quarantined');
+  const privateDeleteId = result.body.contribution.id;
+
+  result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'SafeRecreator', action: 'create', file_path: relativePath,
+      content: '<main><h1>Safe recreated page</h1></main>', message: 'safe recreation',
+    }),
+  });
+  assert.equal(result.body.publicationStatus, 'published');
+  assert.equal((await jsonRequest(server.baseUrl, `/api/contributions/${privateDeleteId}`)).response.status, 404);
+  assert.equal((await jsonRequest(server.baseUrl, '/api/history')).body.items
+    .some(item => item.id === privateDeleteId), false);
+  assert.equal((await jsonRequest(server.baseUrl, '/api/agents/PrivateDeleter')).response.status, 404);
+  await server.stop();
+});
+
+test('an exact risky approval survives resubmission and restart', async (t) => {
+  // Mutation caught: clearing approval in the generic published branch re-quarantines on restart.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-approved-restart-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'pages/approved-risk.html';
+  const riskyBytes = '<p>Inject 6 mg weekly for best results.</p>';
+  await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(path.join(worldDir, relativePath), riskyBytes);
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const listed = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
+    headers: { 'X-Admin-Secret': 'test-secret' },
+  });
+  const record = listed.body.quarantined.find(item => item.path === relativePath);
+  assert.ok(record);
+  let result = await jsonRequest(server.baseUrl, '/api/admin/quarantine/approve', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Secret': 'test-secret' },
+    body: JSON.stringify({ path: relativePath, content_hash: record.content_hash }),
+  });
+  assert.equal(result.response.status, 200);
+  result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'ApprovedAgent', action: 'edit', file_path: relativePath,
+      content: riskyBytes, message: 'exact approved resubmission',
+    }),
+  });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.publicationStatus, 'published');
+  let moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(moderationState.moderation.approvedFiles[relativePath], record.content_hash);
+  await server.stop();
+
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const afterRestart = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
+    headers: { 'X-Admin-Secret': 'test-secret' },
+  });
+  assert.equal(afterRestart.body.quarantined.some(item => item.path === relativePath), false);
+  assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 200);
+  moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(moderationState.moderation.approvedFiles[relativePath], record.content_hash);
+  await server.stop();
+});
+
+for (const failureKind of ['moderation', 'state', 'git']) {
+  test(`${failureKind} persistence failure rolls back contribution bytes, records, and public counters durably`, async (t) => {
+    // Mutations caught: swallowing this failure or omitting compensation leaves the failed edit public/durable.
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `aibuilds-publication-${failureKind}-rollback-`));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const worldDir = path.join(root, 'world');
+    const dataDir = path.join(root, 'data');
+    const backupDir = path.join(root, 'backups');
+    const relativePath = 'pages/original.html';
+    const originalBytes = '<main><h1>Original durable bytes</h1></main>';
+    const failedAgentName = failureKind === 'state' ? 'F'.repeat(120) : 'FailedAgent';
+    const storedFailedAgentName = failedAgentName.slice(0, 100);
+    const armPath = path.join(root, 'arm-failure');
+    const preloadPath = path.join(root, 'fail-first-persistence.cjs');
+    await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
+    await fs.mkdir(dataDir, { recursive: true });
+    await fs.writeFile(path.join(worldDir, relativePath), originalBytes);
+    await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
+      history: [{
+        id: 'original-record', timestamp: '2026-08-10T10:00:00.000Z', agent_name: 'OriginalAgent',
+        action: 'create', file_path: relativePath, message: 'original record',
+        publicationStatus: 'published', reactions: { fire: [], heart: [], rocket: [], eyes: [] },
+      }],
+    }));
+    await fs.writeFile(preloadPath, `
+      const fs = require('node:fs');
+      const promises = fs.promises;
+      const originalRename = promises.rename.bind(promises);
+      let failed = false;
+      promises.rename = async function failFirstPersistenceRename(source, target) {
+        if (!failed && fs.existsSync(process.env.AIBUILDS_FAILURE_ARM) &&
+            String(target) === process.env.AIBUILDS_FAILURE_TARGET) {
+          failed = true;
+          throw Object.assign(new Error('forced persistence failure'), { code: 'EIO' });
+        }
+        return originalRename(source, target);
+      };
+    `);
+    const extraEnv = failureKind === 'git' ? {} : {
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      AIBUILDS_FAILURE_ARM: armPath,
+      AIBUILDS_FAILURE_TARGET: path.join(dataDir,
+        failureKind === 'moderation' ? 'moderation.json' : 'state.json'),
+    };
+    let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+    if (failureKind === 'git') {
+      const hookPath = path.join(worldDir, '.git', 'hooks', 'pre-commit');
+      await fs.writeFile(hookPath, '#!/bin/sh\nexit 1\n');
+      await fs.chmod(hookPath, 0o755);
+    } else {
+      await fs.writeFile(armPath, 'armed');
+    }
+
+    const result = await jsonRequest(server.baseUrl, '/api/contribute', {
+      method: 'POST', headers: await challengeHeaders(server.baseUrl),
+      body: JSON.stringify({
+        agent_name: failedAgentName, action: 'edit', file_path: relativePath,
+        content: '<main><h1>Failed replacement bytes</h1></main>', message: `failed ${failureKind} edit`,
+      }),
+    });
+    assert.equal(result.response.status, 500, server.logs.join(''));
+    assert.equal(await fs.readFile(path.join(worldDir, relativePath), 'utf8'), originalBytes);
+    assert.equal((await jsonRequest(server.baseUrl, '/api/history')).body.items
+      .some(item => item.agent_name === storedFailedAgentName), false);
+    assert.equal((await jsonRequest(server.baseUrl,
+      `/api/agents/${encodeURIComponent(storedFailedAgentName)}`)).response.status, 404);
+    assert.equal((await jsonRequest(server.baseUrl, '/api/agents/OriginalAgent')).body.stats.contributions, 1);
+    let persistedState = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
+    assert.equal(Object.hasOwn(persistedState.agents || {}, storedFailedAgentName), false);
+    await fs.rm(armPath, { force: true });
+    await server.crash();
+
+    server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+    assert.equal(await fs.readFile(path.join(worldDir, relativePath), 'utf8'), originalBytes);
+    assert.equal((await jsonRequest(server.baseUrl, '/api/history')).body.items
+      .some(item => item.agent_name === storedFailedAgentName), false);
+    assert.equal((await jsonRequest(server.baseUrl,
+      `/api/agents/${encodeURIComponent(storedFailedAgentName)}`)).response.status, 404);
+    assert.equal((await jsonRequest(server.baseUrl, '/api/agents/OriginalAgent')).body.stats.contributions, 1);
+    persistedState = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
+    assert.equal(Object.hasOwn(persistedState.agents || {}, storedFailedAgentName), false);
+    await server.stop();
+  });
+}

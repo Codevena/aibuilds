@@ -9,6 +9,7 @@ const net = require('node:net');
 const { spawn, execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { once } = require('node:events');
+const WebSocket = require('ws');
 
 const execFileAsync = promisify(execFile);
 
@@ -388,4 +389,75 @@ test('failed admin decisions persist rollback after concurrent moderation saves'
   disk = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
   assert.ok(disk.moderation.quarantinedFiles[riskyPath]);
   assert.equal(Object.hasOwn(disk.moderation.approvedFiles, riskyPath), false);
+});
+
+test('legacy moderate delete refuses quarantined paths without purging audit or broadcasting the target', async (t) => {
+  // Mutation caught: the legacy delete branch unlinks bytes, deletes history, clears quarantine, and broadcasts.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-admin-legacy-private-delete-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const riskyPath = 'pages/private-admin-delete.html';
+  await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(path.join(worldDir, riskyPath), '<p>Inject 4 mg weekly for best results.</p>');
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({
+    history: [{
+      id: 'private-audit-record', timestamp: '2026-08-10T10:00:00.000Z', agent_name: 'PrivateAgent',
+      action: 'create', file_path: riskyPath, message: 'private audit record',
+      publicationStatus: 'quarantined', reactions: { fire: [], heart: [], rocket: [], eyes: [] },
+    }],
+  }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Quarantine Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'seed private world'], { cwd: worldDir });
+
+  const port = await getFreePort();
+  const logs = [];
+  const child = spawn(process.execPath, ['server/index.js'], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      POW_DIFFICULTY: '0',
+      ADMIN_RESET_SECRET: 'operator-secret',
+      AIBUILDS_WORLD_DIR: worldDir,
+      AIBUILDS_DATA_DIR: dataDir,
+      AIBUILDS_BACKUP_DIR: backupDir,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', chunk => logs.push(chunk.toString()));
+  child.stderr.on('data', chunk => logs.push(chunk.toString()));
+  t.after(async () => {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    if (child.exitCode === null) await once(child, 'exit');
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  await waitForServer(baseUrl, child, logs);
+  const frames = [];
+  const socket = new WebSocket(baseUrl.replace('http:', 'ws:'));
+  socket.on('message', data => frames.push(JSON.parse(data.toString())));
+  await once(socket, 'open');
+  t.after(() => socket.close());
+  frames.length = 0;
+
+  const result = await requestJson(baseUrl, '/api/admin/moderate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secret: 'operator-secret', action: 'delete', target: riskyPath }),
+  });
+  assert.equal(result.response.status, 409);
+  assert.equal(await fs.readFile(path.join(worldDir, riskyPath), 'utf8'),
+    '<p>Inject 4 mg weekly for best results.</p>');
+  const persisted = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal(persisted.history.some(item => item.id === 'private-audit-record'), true);
+  const listed = await requestJson(baseUrl, '/api/admin/quarantine', {
+    headers: { 'X-Admin-Secret': 'operator-secret' },
+  });
+  assert.equal(listed.body.quarantined.some(item => item.path === riskyPath), true);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(frames.some(frame => JSON.stringify(frame).includes(riskyPath)), false);
 });

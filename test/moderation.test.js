@@ -172,6 +172,56 @@ test('legacy moderation migration propagates a persistence failure', async (t) =
   });
 });
 
+test('missing moderation and legacy files initialize empty state', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-moderation-empty-load-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const script = `
+    const moderation = require('./server/moderation');
+    moderation.load().then(() => {
+      const state = moderation.serializeModeration();
+      const empty = moderation.listQuarantined().length === 0 &&
+        Object.keys(state.moderation.approvedFiles).length === 0;
+      process.exit(empty ? 0 : 42);
+    }, () => process.exit(43));
+  `;
+  await execFileAsync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIBUILDS_DATA_DIR: dataDir },
+  });
+});
+
+test('malformed legacy moderation state aborts load', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-moderation-malformed-legacy-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  await fs.writeFile(path.join(dataDir, 'state.json'), '{ malformed legacy JSON');
+  const script = `
+    const moderation = require('./server/moderation');
+    moderation.load().then(() => process.exit(42), () => process.exit(0));
+  `;
+  await execFileAsync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIBUILDS_DATA_DIR: dataDir },
+  });
+});
+
+test('non-ENOENT legacy moderation read failures abort load', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-moderation-legacy-read-failure-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const script = `
+    const fs = require('node:fs').promises;
+    const originalReadFile = fs.readFile.bind(fs);
+    fs.readFile = (target, ...args) => String(target).endsWith('/state.json')
+      ? Promise.reject(Object.assign(new Error('forced legacy read failure'), { code: 'EACCES' }))
+      : originalReadFile(target, ...args);
+    const moderation = require('./server/moderation');
+    moderation.load().then(() => process.exit(42), () => process.exit(0));
+  `;
+  await execFileAsync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIBUILDS_DATA_DIR: dataDir },
+  });
+});
+
 test('queued moderation saves persist the immutable call-time snapshot', async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-moderation-snapshot-'));
   t.after(() => fs.rm(dataDir, { recursive: true, force: true }));

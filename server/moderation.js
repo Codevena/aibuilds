@@ -102,8 +102,12 @@ async function load() {
   try {
     legacy = JSON.parse(await fs.readFile(LEGACY_STATE_FILE, 'utf-8'));
   } catch (e) {
+    if (e.code === 'ENOENT') {
+      loadModeration({});
+      return;
+    }
     loadModeration({});
-    return;
+    throw e;
   }
   if (legacy && (legacy.moderation || legacy.agentIps)) {
     loadModeration(legacy);
@@ -192,6 +196,15 @@ function recordAgentIp(agentName, ip) {
   }
 }
 function resolveAgentIp(agentName) { return agentIps.get(agentName) || null; }
+function restoreAgentIp(agentName, ip) {
+  if (typeof agentName !== 'string' || !agentName) return false;
+  if (typeof ip === 'string' && ip) {
+    agentIps.delete(agentName);
+    agentIps.set(agentName, ip);
+    return true;
+  }
+  return agentIps.delete(agentName);
+}
 // Bans EXACTLY what is passed (no hidden IP auto-resolve — that decision lives in the endpoint,
 // so "ban by name only" is always possible). See /api/admin/ban for the default-ban-IP behavior.
 function ban({ agentName, ip } = {}) {
@@ -280,6 +293,6 @@ module.exports = {
   isHidden, hide, unhide, listHidden,
   quarantine, releaseQuarantine, clearApproval, approve, reject,
   isQuarantined, isApproved, listQuarantined,
-  isBanned, recordAgentIp, resolveAgentIp, ban, unban, listBans,
+  isBanned, recordAgentIp, resolveAgentIp, restoreAgentIp, ban, unban, listBans,
   scanContent,
 };
