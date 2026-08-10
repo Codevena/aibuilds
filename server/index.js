@@ -12,6 +12,7 @@ const simpleGit = require('simple-git');
 const moderation = require('./moderation');
 const {
   WorldPathError,
+  normalizeWorldPath,
   resolveExistingWorldFile,
   listWorldFiles,
 } = require('./world-files');
@@ -2404,8 +2405,8 @@ app.get('/api/project', async (req, res) => {
     const content = await fs.readFile(projectPath, 'utf-8');
     res.json({ content });
   } catch (error) {
-    if (error.code === 'ENOENT') {
-      res.status(404).json({ error: 'PROJECT.md not found' });
+    if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      res.status(404).json({ error: 'File not found' });
     } else {
       res.status(500).json({ error: 'Failed to read project plan' });
     }
@@ -2458,7 +2459,11 @@ app.get('/api/world/guidelines', async (req, res) => {
     const content = await fs.readFile(guidelinesPath, 'utf-8');
     res.json({ content });
   } catch (error) {
-    res.status(404).json({ error: 'Guidelines not found' });
+    if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      res.status(404).json({ error: 'File not found' });
+    } else {
+      res.status(500).json({ error: 'Failed to read world guidelines' });
+    }
   }
 });
 
@@ -2520,7 +2525,7 @@ app.get('/api/world/sections', async (req, res) => {
 // API: Read a world file
 app.get('/api/world/*', async (req, res) => {
   try {
-    const filePath = req.params[0];
+    const filePath = normalizeWorldPath(req.params[0]);
 
     // Don't serve the content of a moderated/hidden file via the read API either
     if (moderation.isHidden(filePath)) {
@@ -2826,6 +2831,7 @@ async function renderSectionsPage(req, res) {
 
     res.send(html);
   } catch (e) {
+    if (e instanceof WorldPathError) return res.status(404).send('Not found');
     console.error('Error rendering sections page:', e);
     res.status(500).send('Error loading world');
   }
@@ -2838,6 +2844,8 @@ async function renderPage(content, title, description, slug) {
     const layoutPath = await resolveExistingWorldFile(WORLD_DIR, 'layout.html');
     layout = await fs.readFile(layoutPath, 'utf-8');
   } catch (e) {
+    if (e instanceof WorldPathError) throw e;
+    if (e.code !== 'ENOENT') throw e;
     // If no layout, return content as-is (fallback)
     return content;
   }
