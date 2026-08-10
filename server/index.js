@@ -6,10 +6,15 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
 const fs = require('fs').promises;
-const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
+const { randomUUID } = require('node:crypto');
 const simpleGit = require('simple-git');
 const moderation = require('./moderation');
+const {
+  WorldPathError,
+  resolveExistingWorldFile,
+  listWorldFiles,
+} = require('./world-files');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,9 +22,11 @@ const wss = new WebSocket.Server({ server });
 
 // Config
 const PORT = process.env.PORT || 3000;
-const WORLD_DIR = path.join(__dirname, '../world');
-const DATA_FILE = path.join(__dirname, '../data/state.json');
-const BACKUP_DIR = path.join(__dirname, '../backups');
+const WORLD_DIR = process.env.AIBUILDS_WORLD_DIR || path.join(__dirname, '../world');
+const DATA_FILE = process.env.AIBUILDS_DATA_DIR
+  ? path.join(process.env.AIBUILDS_DATA_DIR, 'state.json')
+  : path.join(__dirname, '../data/state.json');
+const BACKUP_DIR = process.env.AIBUILDS_BACKUP_DIR || path.join(__dirname, '../backups');
 const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.md'];
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 1000;
@@ -41,8 +48,7 @@ const gitBinary = (() => {
     return require('child_process').execSync('which git', { encoding: 'utf-8' }).trim();
   } catch { return 'git'; }
 })();
-const WORLD_DIR_ABS = path.join(__dirname, '..', 'world');
-const git = simpleGit(WORLD_DIR_ABS, { binary: gitBinary });
+const git = simpleGit(WORLD_DIR, { binary: gitBinary });
 
 // Trust proxy (Coolify/reverse proxy) so rate limiting uses real client IP
 app.set('trust proxy', 1);
@@ -618,7 +624,9 @@ const worldCSP = (req, res, next) => {
     "img-src 'self' data: https:; " +
     "font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; " +
     "connect-src 'self' ws: wss: https://analytics.codevena.dev; " +
-    "frame-ancestors 'self';"
+    "frame-ancestors 'self'; " +
+    "sandbox allow-scripts allow-top-navigation-by-user-activation; " +
+    "form-action 'none'; object-src 'none'; base-uri 'none';"
   );
   res.setHeader('X-Frame-Options', 'SAMEORIGIN');
   next();
@@ -646,17 +654,20 @@ app.get('/world/', worldCSP, async (req, res, next) => {
     // Try pages/home.html first
     let content, title, description;
     try {
-      content = await fs.readFile(path.join(WORLD_DIR, 'pages/home.html'), 'utf-8');
+      const homePath = await resolveExistingWorldFile(WORLD_DIR, 'pages/home.html');
+      content = await fs.readFile(homePath, 'utf-8');
       const divMatch = content.match(/<div[^>]*>/i);
       const tag = divMatch ? divMatch[0] : '';
       title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || 'Home';
       description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || 'A website built entirely by AI agents.';
     } catch (e) {
+      if (e instanceof WorldPathError) return res.status(404).send('Not found');
       // Try index.html
       try {
-        await fs.access(path.join(WORLD_DIR, 'index.html'));
-        return next(); // Let static handler serve it
+        const indexPath = await resolveExistingWorldFile(WORLD_DIR, 'index.html');
+        return res.sendFile(indexPath);
       } catch (e2) {
+        if (e2 instanceof WorldPathError) return res.status(404).send('Not found');
         // No home page or index — auto-assemble sections
         return renderSectionsPage(req, res);
       }
@@ -682,17 +693,10 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
   if (reserved.includes(page)) return next();
 
   try {
-    const pagePath = path.resolve(path.join(WORLD_DIR, 'pages', `${page}.html`));
-    const pagesDir = path.resolve(path.join(WORLD_DIR, 'pages'));
-
-    // Path traversal protection
-    if (!pagePath.startsWith(pagesDir + path.sep)) {
-      return next();
-    }
-
     // Hidden pages are unreachable via their pretty URL too (not just the static handler)
     if (moderation.isHidden(`pages/${page}.html`)) return next();
 
+    const pagePath = await resolveExistingWorldFile(WORLD_DIR, `pages/${page}.html`);
     const content = await fs.readFile(pagePath, 'utf-8');
 
     // Extract metadata
@@ -704,14 +708,33 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
     const html = await renderPage(content, title, description, page);
     res.send(html);
   } catch (e) {
+    if (e instanceof WorldPathError) return res.status(404).send('Not found');
     if (e.code === 'ENOENT') return next();
     console.error('Error rendering page:', e);
     next();
   }
 });
 
-// World static fallback for CSS/JS/images
-app.use('/world', worldCSP, express.static(WORLD_DIR));
+// World static fallback for CSS/JS/images. Resolve every request before static
+// delivery so symbolic links and private paths are rejected before sendFile reads them.
+app.use('/world', worldCSP, async (req, res, next) => {
+  let relativePath;
+  try {
+    relativePath = decodeURIComponent(req.path).replace(/^\/+/, '');
+    if (!relativePath) return next();
+    await resolveExistingWorldFile(WORLD_DIR, relativePath);
+  } catch (error) {
+    if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      return res.status(404).send('Not found');
+    }
+    return next(error);
+  }
+
+  if (relativePath.startsWith('pages/') && relativePath.endsWith('.html')) {
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  }
+  next();
+}, express.static(WORLD_DIR, { dotfiles: 'deny' }));
 
 app.use(express.static(path.join(__dirname, '../public'), { index: false, maxAge: '1h', etag: true }));
 
@@ -989,7 +1012,7 @@ app.get('/live', (req, res) => {
 // API: Get current stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const files = await getWorldFiles();
+    const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => moderation.isHidden(relativePath) });
     res.json({
       viewerCount: viewers.size,
       totalContributions: history.filter(c => !moderation.isHidden(c.file_path)).length,
@@ -1130,7 +1153,7 @@ const challengeLimiter = rateLimit({
 
 // API: Get a proof-of-work challenge (solve before calling mutation endpoints)
 app.get('/api/challenge', challengeLimiter, (req, res) => {
-  const id = uuidv4();
+  const id = randomUUID();
   const prefix = crypto.randomBytes(16).toString('hex');
   const expiresAt = Date.now() + POW_EXPIRY_MS;
 
@@ -1184,7 +1207,7 @@ app.post('/api/guestbook', agentLimiter, requireProofOfWork, (req, res) => {
   moderation.save().catch(console.error); // persist last-known IP to moderation.json (not state.json)
 
     const entry = {
-      id: uuidv4(),
+      id: randomUUID(),
       timestamp: new Date().toISOString(),
       agent_name: agent_name.slice(0, 100),
       message: trimmedMessage,
@@ -1888,7 +1911,7 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, (r
   }
 
   const comment = {
-    id: uuidv4(),
+    id: randomUUID(),
     targetType: 'contribution',
     targetId: req.params.id,
     agentName: agent_name.slice(0, 100),
@@ -1988,7 +2011,7 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, (req,
   }
 
   const comment = {
-    id: uuidv4(),
+    id: randomUUID(),
     targetType: 'file',
     targetId: filePath,
     agentName: agent_name.slice(0, 100),
@@ -2377,7 +2400,7 @@ app.get('/api/pages', async (req, res) => {
 // API: Get project plan (PROJECT.md)
 app.get('/api/project', async (req, res) => {
   try {
-    const projectPath = path.join(WORLD_DIR, 'PROJECT.md');
+    const projectPath = await resolveExistingWorldFile(WORLD_DIR, 'PROJECT.md');
     const content = await fs.readFile(projectPath, 'utf-8');
     res.json({ content });
   } catch (error) {
@@ -2392,7 +2415,7 @@ app.get('/api/project', async (req, res) => {
 // API: Get world structure for agents
 app.get('/api/world/structure', async (req, res) => {
   try {
-    const files = await getWorldFiles();
+    const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => moderation.isHidden(relativePath) });
 
     // Categorize files
     const structure = {
@@ -2431,7 +2454,7 @@ app.get('/api/world/structure', async (req, res) => {
 // API: Get world guidelines
 app.get('/api/world/guidelines', async (req, res) => {
   try {
-    const guidelinesPath = path.join(WORLD_DIR, 'WORLD.md');
+    const guidelinesPath = await resolveExistingWorldFile(WORLD_DIR, 'WORLD.md');
     const content = await fs.readFile(guidelinesPath, 'utf-8');
     res.json({ content });
   } catch (error) {
@@ -2442,41 +2465,35 @@ app.get('/api/world/guidelines', async (req, res) => {
 // API: Get all world sections (HTML fragments from sections/)
 app.get('/api/world/sections', async (req, res) => {
   try {
-    const sectionsDir = path.join(WORLD_DIR, 'sections');
-    let sectionFiles = [];
-    try {
-      const entries = await fs.readdir(sectionsDir, { withFileTypes: true });
-      sectionFiles = entries.filter(e => !e.isDirectory() && e.name.endsWith('.html'));
-    } catch (e) {
-      // sections/ directory might not exist yet
-    }
+    const sectionFiles = (await listWorldFiles(WORLD_DIR, {
+      isHidden: relativePath => moderation.isHidden(relativePath),
+    })).filter(file => file.path.startsWith('sections/') && !file.path.slice('sections/'.length).includes('/') && file.path.endsWith('.html'));
 
     const sections = [];
     for (const file of sectionFiles) {
-      if (moderation.isHidden(`sections/${file.name}`)) continue;
-      const filePath = path.join(sectionsDir, file.name);
+      const fileName = path.basename(file.path);
+      const filePath = await resolveExistingWorldFile(WORLD_DIR, file.path);
       const content = await fs.readFile(filePath, 'utf-8');
-      const stats = await fs.stat(filePath);
 
       // Extract data-* attributes from the <section> tag
       const sectionMatch = content.match(/<section[^>]*>/i);
       const tag = sectionMatch ? sectionMatch[0] : '';
 
-      const title = (tag.match(/data-section-title="([^"]*)"/i) || [])[1] || file.name.replace('.html', '').replace(/-/g, ' ');
+      const title = (tag.match(/data-section-title="([^"]*)"/i) || [])[1] || fileName.replace('.html', '').replace(/-/g, ' ');
       const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
       const author = (tag.match(/data-section-author="([^"]*)"/i) || [])[1] || 'unknown';
       const note = (tag.match(/data-section-note="([^"]*)"/i) || [])[1] || null;
       const requires = (tag.match(/data-section-requires="([^"]*)"/i) || [])[1] || null;
 
       // Get vote score
-      const sectionPath = `sections/${file.name}`;
+      const sectionPath = file.path;
       const votes = sectionVotes.get(sectionPath);
       const voteScore = votes ? votes.up.size - votes.down.size : 0;
       const upvotes = votes ? votes.up.size : 0;
       const downvotes = votes ? votes.down.size : 0;
 
       sections.push({
-        file: file.name,
+        file: fileName,
         path: sectionPath,
         title,
         order,
@@ -2484,8 +2501,8 @@ app.get('/api/world/sections', async (req, res) => {
         note,
         requires,
         content,
-        size: stats.size,
-        modified: stats.mtime,
+        size: file.size,
+        modified: file.modified,
         votes: { score: voteScore, up: upvotes, down: downvotes },
       });
     }
@@ -2504,22 +2521,17 @@ app.get('/api/world/sections', async (req, res) => {
 app.get('/api/world/*', async (req, res) => {
   try {
     const filePath = req.params[0];
-    const fullPath = path.join(WORLD_DIR, filePath);
-
-    // Security: ensure path is within world (path.sep prevents traversal to sibling dirs)
-    if (!fullPath.startsWith(WORLD_DIR + path.sep)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
 
     // Don't serve the content of a moderated/hidden file via the read API either
     if (moderation.isHidden(filePath)) {
       return res.status(404).json({ error: 'File not found' });
     }
 
+    const fullPath = await resolveExistingWorldFile(WORLD_DIR, filePath);
     const content = await fs.readFile(fullPath, 'utf-8');
     res.json({ path: filePath, content });
   } catch (error) {
-    if (error.code === 'ENOENT') {
+    if (error instanceof WorldPathError || error.code === 'ENOENT' || error.code === 'ENOTDIR') {
       res.status(404).json({ error: 'File not found' });
     } else {
       res.status(500).json({ error: 'Failed to read file' });
@@ -2530,7 +2542,7 @@ app.get('/api/world/*', async (req, res) => {
 // API: List all world files
 app.get('/api/files', async (req, res) => {
   try {
-    const files = await getWorldFiles();
+    const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => moderation.isHidden(relativePath) });
     res.json(files);
   } catch (error) {
     res.status(500).json({ error: 'Failed to list files' });
@@ -2605,7 +2617,10 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
     }
 
     // Check max files
-    const currentFiles = await getWorldFiles();
+    const currentFiles = await listWorldFiles(WORLD_DIR, {
+      includeHidden: true,
+      isHidden: relativePath => moderation.isHidden(relativePath),
+    });
     if (action === 'create' && currentFiles.length >= MAX_FILES) {
       return res.status(400).json({ error: `Max file limit reached: ${MAX_FILES}` });
     }
@@ -2621,7 +2636,7 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
 
     // Perform action
     const contribution = {
-      id: uuidv4(),
+      id: randomUUID(),
       timestamp: new Date().toISOString(),
       agent_name: agent_name.slice(0, 100),
       action,
@@ -2686,48 +2701,17 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
   }
 });
 
-// Helper: Get all files in world
-async function getWorldFiles(dir = WORLD_DIR, prefix = '') {
-  const files = [];
-  try {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        files.push(...await getWorldFiles(fullPath, relativePath));
-      } else {
-        const stats = await fs.stat(fullPath);
-        files.push({
-          path: relativePath,
-          size: stats.size,
-          modified: stats.mtime,
-        });
-      }
-    }
-  } catch (e) {
-    // Directory might not exist yet
-  }
-  return files.filter(f => !moderation.isHidden(f.path));
-}
-
 // Helper: Get all pages from world/pages/*.html with metadata
 async function getPages() {
-  const pagesDir = path.join(WORLD_DIR, 'pages');
-  let pageFiles = [];
-  try {
-    const entries = await fs.readdir(pagesDir, { withFileTypes: true });
-    pageFiles = entries.filter(e => !e.isDirectory() && e.name.endsWith('.html'));
-  } catch (e) {
-    // pages/ directory might not exist yet
-    return [];
-  }
+  const pageFiles = (await listWorldFiles(WORLD_DIR, {
+    isHidden: relativePath => moderation.isHidden(relativePath),
+  })).filter(file => file.path.startsWith('pages/') && !file.path.slice('pages/'.length).includes('/') && file.path.endsWith('.html'));
 
   const pages = [];
   for (const file of pageFiles) {
-    const filePath = path.join(pagesDir, file.name);
+    const filePath = await resolveExistingWorldFile(WORLD_DIR, file.path);
     const content = await fs.readFile(filePath, 'utf-8');
-    const slug = file.name.replace('.html', '');
+    const slug = path.basename(file.path).replace('.html', '');
 
     // Extract data-page-* attributes from the wrapper div
     const divMatch = content.match(/<div[^>]*>/i);
@@ -2740,7 +2724,7 @@ async function getPages() {
 
     pages.push({
       slug,
-      file: file.name,
+      file: path.basename(file.path),
       title,
       navOrder,
       author,
@@ -2790,20 +2774,16 @@ function generateNav(pages, currentSlug) {
 // Helper: Auto-assemble all sections into a page when no index/home exists
 async function renderSectionsPage(req, res) {
   try {
-    const sectionsDir = path.join(WORLD_DIR, 'sections');
-    let sectionFiles = [];
-    try {
-      const entries = await fs.readdir(sectionsDir, { withFileTypes: true });
-      sectionFiles = entries.filter(e => !e.isDirectory() && e.name.endsWith('.html'));
-    } catch (e) { /* no sections dir */ }
+    const sectionFiles = (await listWorldFiles(WORLD_DIR, {
+      isHidden: relativePath => moderation.isHidden(relativePath),
+    })).filter(file => file.path.startsWith('sections/') && !file.path.slice('sections/'.length).includes('/') && file.path.endsWith('.html'));
 
     const sections = [];
     for (const file of sectionFiles) {
-      if (moderation.isHidden(`sections/${file.name}`)) continue;
-      const content = await fs.readFile(path.join(sectionsDir, file.name), 'utf-8');
+      const content = await fs.readFile(await resolveExistingWorldFile(WORLD_DIR, file.path), 'utf-8');
       const tag = (content.match(/<section[^>]*>/i) || [''])[0];
       const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
-      const voteData = sectionVotes.get(`sections/${file.name}`);
+      const voteData = sectionVotes.get(file.path);
       const score = voteData ? voteData.up.size - voteData.down.size : 0;
       if (score >= 0) sections.push({ order, score, content });
     }
@@ -2819,7 +2799,7 @@ async function renderSectionsPage(req, res) {
       // Load theme CSS if available
       let themeLink = '';
       try {
-        await fs.access(path.join(WORLD_DIR, 'css/theme.css'));
+        await resolveExistingWorldFile(WORLD_DIR, 'css/theme.css');
         themeLink = '<link rel="stylesheet" href="/world/css/theme.css">';
       } catch (e2) { /* no theme */ }
 
@@ -2853,9 +2833,9 @@ async function renderSectionsPage(req, res) {
 
 // Helper: Render a page through the layout template
 async function renderPage(content, title, description, slug) {
-  const layoutPath = path.join(WORLD_DIR, 'layout.html');
   let layout;
   try {
+    const layoutPath = await resolveExistingWorldFile(WORLD_DIR, 'layout.html');
     layout = await fs.readFile(layoutPath, 'utf-8');
   } catch (e) {
     // If no layout, return content as-is (fallback)
@@ -2979,7 +2959,7 @@ async function init() {
   }, POW_EXPIRY_MS);
 
   // Create initial file if world is empty
-  const files = await getWorldFiles();
+  const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => moderation.isHidden(relativePath) });
   if (files.length === 0) {
     const welcomeHtml = `<!DOCTYPE html>
 <html lang="en">

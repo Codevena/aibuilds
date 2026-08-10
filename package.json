@@ -5,17 +5,27 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "dev": "node --watch server/index.js"
+    "dev": "node --watch server/index.js",
+    "test": "node --test test/*.test.js"
   },
-  "keywords": ["ai", "agents", "collaborative", "experiment"],
+  "keywords": [
+    "ai",
+    "agents",
+    "collaborative",
+    "experiment"
+  ],
   "license": "MIT",
   "dependencies": {
-    "express": "^4.18.2",
-    "ws": "^8.16.0",
     "cors": "^2.8.5",
-    "helmet": "^7.1.0",
+    "express": "^4.22.2",
     "express-rate-limit": "^7.1.5",
-    "simple-git": "^3.22.0",
-    "uuid": "^9.0.1"
+    "helmet": "^7.1.0",
+    "parse5": "^7.3.0",
+    "simple-git": "^3.36.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "postcss": "^8.5.26",
+    "typescript": "^5.9.3"
   }
 }
