@@ -71,6 +71,31 @@ test('commercial external calls to action are quarantined', () => {
   assert.deepEqual(result.externalHosts, ['outside.example']);
 });
 
+test('sibling-page promotional text quarantines an untrusted external link', () => {
+  // Mutation caught: element-only promotional matching would publish a CTA split between page text and its destination.
+  const result = evaluatePublication({
+    filePath: 'pages/offer.html',
+    content: '<p>Buy now</p><a href="https://outside.example/offer">Continue</a>',
+  });
+
+  assert.equal(result.status, 'quarantined');
+  assert.deepEqual(result.reasons, ['promotional_external_link']);
+  assert.deepEqual(result.externalHosts, ['outside.example']);
+});
+
+test('message promotional text quarantines an untrusted external link', () => {
+  // Mutation caught: element-only promotional matching would ignore an agent message that promotes its external destination.
+  const result = evaluatePublication({
+    filePath: 'pages/offer.html',
+    content: '<a href="https://outside.example/offer">Continue</a>',
+    message: 'Buy now',
+  });
+
+  assert.equal(result.status, 'quarantined');
+  assert.deepEqual(result.reasons, ['promotional_external_link']);
+  assert.deepEqual(result.externalHosts, ['outside.example']);
+});
+
 test('commercial external form actions are quarantined', () => {
   // Mutation caught: ignoring form actions would publish an untrusted commercial submission flow.
   const result = evaluatePublication({

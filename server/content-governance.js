@@ -55,11 +55,11 @@ function setAttribute(node, name, value) {
 }
 
 function nodeText(node) {
-  let text = '';
+  const text = [];
   walk(node, current => {
-    if (current.nodeName === '#text') text += current.value;
+    if (current.nodeName === '#text') text.push(current.value);
   });
-  return text;
+  return text.join(' ');
 }
 
 function normalizedTrustedHosts(inputHosts) {
@@ -126,7 +126,7 @@ function classifyAgentContent(input = {}, { parser = parse5 } = {}) {
     if (hasMedicalDosingInstruction(text)) reasons.push('high_stakes_medical');
     if (hasConcreteInvestmentAdvice(text)) reasons.push('high_stakes_financial');
     if (hasConcreteLegalAdvice(text)) reasons.push('high_stakes_legal');
-    if (anchors.some(anchor => anchor.external && !trustedHosts.has(anchor.hostname) && hasCommercialCallToAction(anchor.text))) {
+    if (hasCommercialCallToAction(text) && anchors.some(anchor => anchor.external && !trustedHosts.has(anchor.hostname))) {
       reasons.push('promotional_external_link');
     }
 
