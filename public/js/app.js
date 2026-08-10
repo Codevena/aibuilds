@@ -8,6 +8,17 @@ class AIBuildsDashboard {
     this.reconnectDelay = 1000;
     this.soundEnabled = true;
     this.autoScroll = true;
+    this.replayApi = window.AIBuildsReplay;
+    this.replayController = null;
+    this.dashboardData = { phase: 'loading', offline: false };
+    this.resumeReplayAfterPolicy = false;
+    this.reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    this.freshnessTimer = null;
+    this.dashboardRequestGeneration = 0;
+    this.dashboardLoadToken = null;
+    this.dashboardRefreshPromise = null;
+    this.dashboardRefreshQueued = false;
+    this.pendingReplayContributions = new Map();
 
     // Leaderboard filters
     this.leaderboardPeriod = 'all';
@@ -44,6 +55,39 @@ class AIBuildsDashboard {
       diffView: document.getElementById('diffView'),
       reconnectToast: document.getElementById('reconnectToast'),
       reconnectMessage: document.getElementById('reconnectMessage'),
+      dashboardStatus: document.getElementById('dashboardStatus'),
+      relayConsole: document.getElementById('relay-console'),
+      dashboardError: document.getElementById('dashboardError'),
+      retryButton: document.getElementById('dashboardRetry'),
+      seasonPanel: document.getElementById('seasonPanel'),
+      seasonTheme: document.getElementById('seasonTheme'),
+      seasonPrompt: document.getElementById('seasonPrompt'),
+      builderStatus: document.getElementById('builderStatus'),
+      criticStatus: document.getElementById('criticStatus'),
+      curatorStatus: document.getElementById('curatorStatus'),
+      collaborationStatus: document.getElementById('collaborationStatus'),
+      hallOfFame: document.getElementById('hallOfFame'),
+      seasonCompletion: document.getElementById('seasonCompletion'),
+      replayPanel: document.getElementById('replayPanel'),
+      replayControls: document.getElementById('replayControls'),
+      replayStatus: document.getElementById('replayStatus'),
+      replayProgress: document.getElementById('replayProgress'),
+      replaySummary: document.getElementById('replaySummary'),
+      replayPrevious: document.getElementById('replayPrevious'),
+      replayPlayPause: document.getElementById('replayPlayPause'),
+      replayRestart: document.getElementById('replayRestart'),
+      replayNext: document.getElementById('replayNext'),
+      replaySpeed: document.getElementById('replaySpeed'),
+      quarantineNotice: document.getElementById('quarantineNotice'),
+      metricViewerCount: document.getElementById('metricViewerCount'),
+      metricContributionCount: document.getElementById('metricContributionCount'),
+      metricFileCount: document.getElementById('metricFileCount'),
+      metricAgentCount: document.getElementById('metricAgentCount'),
+      metricActiveDays: document.getElementById('metricActiveDays'),
+      metricCollaborativeFiles: document.getElementById('metricCollaborativeFiles'),
+      metricLastContribution: document.getElementById('metricLastContribution'),
+      metricLiveState: document.getElementById('metricLiveState'),
+      metricQuarantineCount: document.getElementById('metricQuarantineCount'),
     };
 
     // Audio context for notification sounds
@@ -54,13 +98,15 @@ class AIBuildsDashboard {
 
   init() {
     this.connectWebSocket();
-    this.fetchStats();
+    this.renderDashboard();
+    this.fetchDashboardData();
     this.fetchLeaderboard();
     this.fetchFiles();
     this.fetchGuestbook();
     this.fetchActivityHeatmap();
     this.setupEventListeners();
     this.setupLeaderboardFilters();
+    this.setupReplayPolicy();
 
     // Refresh data periodically
     setInterval(() => this.fetchLeaderboard(), 15000);
@@ -75,6 +121,28 @@ class AIBuildsDashboard {
   }
 
   setupEventListeners() {
+    this.elements.retryButton.addEventListener('click', () => this.fetchDashboardData());
+    this.elements.replayPrevious.addEventListener('click', () => {
+      this.resumeReplayAfterPolicy = false;
+      this.replayController?.pause();
+      this.replayController?.previous();
+    });
+    this.elements.replayPlayPause.addEventListener('click', () => {
+      this.toggleReplayPlayback();
+    });
+    this.elements.replayRestart.addEventListener('click', () => {
+      this.resumeReplayAfterPolicy = false;
+      this.replayController?.restart();
+    });
+    this.elements.replayNext.addEventListener('click', () => {
+      this.resumeReplayAfterPolicy = false;
+      this.replayController?.pause();
+      this.replayController?.next();
+    });
+    this.elements.replaySpeed.addEventListener('change', event => {
+      this.replayController?.setSpeed(Number(event.target.value));
+    });
+
     // Sound toggle
     this.elements.soundToggle.addEventListener('click', () => {
       this.soundEnabled = !this.soundEnabled;
@@ -181,6 +249,35 @@ class AIBuildsDashboard {
     });
   }
 
+  setupReplayPolicy() {
+    const pauseForPolicy = () => {
+      if (!this.replayController) return;
+      const state = this.replayController.getState();
+      const blocked = document.hidden || this.reducedMotionQuery.matches;
+      if (blocked && state.isPlaying) {
+        this.resumeReplayAfterPolicy = true;
+        this.replayController.pause();
+      } else if (!blocked && this.resumeReplayAfterPolicy && this.canAutoPlayReplay()) {
+        this.resumeReplayAfterPolicy = false;
+        this.replayController.play();
+      }
+    };
+    document.addEventListener('visibilitychange', pauseForPolicy);
+    if (typeof this.reducedMotionQuery.addEventListener === 'function') {
+      this.reducedMotionQuery.addEventListener('change', pauseForPolicy);
+    } else {
+      this.reducedMotionQuery.addListener(pauseForPolicy);
+    }
+  }
+
+  toggleReplayPlayback() {
+    if (!this.replayController) return;
+    this.resumeReplayAfterPolicy = false;
+    const state = this.replayController.getState();
+    if (state.isPlaying) this.replayController.pause();
+    else if (this.canAutoPlayReplay()) this.replayController.play();
+  }
+
   setupLeaderboardFilters() {
     // Period filters
     document.querySelectorAll('.filter-btn[data-period]').forEach(btn => {
@@ -214,6 +311,8 @@ class AIBuildsDashboard {
       const wasReconnect = this.reconnectAttempts > 0;
       this.reconnectAttempts = 0;
       this.updateConnectionStatus('connected');
+      this.dashboardData.offline = false;
+      this.renderDashboard();
       if (wasReconnect && this.elements.reconnectToast && this.elements.reconnectMessage) {
         this.elements.reconnectMessage.textContent = 'Reconnected!';
         this.elements.reconnectToast.classList.add('connected', 'show');
@@ -235,6 +334,8 @@ class AIBuildsDashboard {
     this.ws.onclose = () => {
       console.log('Disconnected from AI BUILDS');
       this.updateConnectionStatus('disconnected');
+      this.dashboardData.offline = true;
+      this.renderDashboard();
       this.scheduleReconnect();
     };
 
@@ -276,7 +377,7 @@ class AIBuildsDashboard {
     switch (status) {
       case 'connected':
         statusDot.classList.add('connected');
-        connectionStatus.textContent = 'Live';
+        connectionStatus.textContent = 'Connected';
         if (reconnectToast) {
           reconnectToast.classList.remove('show');
           reconnectToast.classList.remove('connected');
@@ -301,7 +402,6 @@ class AIBuildsDashboard {
       case 'welcome':
         this.updateStats({
           viewerCount: data.viewerCount,
-          contributionCount: data.totalContributions,
         });
         // Show recent history
         if (data.recentHistory && data.recentHistory.length > 0) {
@@ -318,7 +418,7 @@ class AIBuildsDashboard {
         this.contributionsCache.set(data.data.id, data.data);
         this.addFeedItem(data.data, true);
         this.updateStats({ viewerCount: data.viewerCount });
-        this.incrementContributions();
+        this.handleDashboardContribution(data.data);
         this.flashWorld();
         this.scheduleWorldRefresh();
         this.fetchFiles();
@@ -328,6 +428,10 @@ class AIBuildsDashboard {
 
       case 'viewerCount':
         this.updateStats({ viewerCount: data.count });
+        if (this.dashboardData.stats) {
+          this.dashboardData.stats = { ...this.dashboardData.stats, viewerCount: data.count };
+          this.renderDashboard();
+        }
         break;
 
       case 'guestbook':
@@ -385,7 +489,13 @@ class AIBuildsDashboard {
     const popup = this.elements.achievementPopup;
     if (!popup) return;
 
-    document.getElementById('achievementIcon').innerHTML = `<i data-lucide="${data.achievement.icon}" class="icon-lg"></i>`;
+    const requestedIcon = typeof data.achievement.icon === 'string' ? data.achievement.icon : '';
+    const iconName = /^[a-z0-9-]{1,40}$/.test(requestedIcon) ? requestedIcon : 'award';
+    const icon = document.createElement('i');
+    icon.className = 'icon-lg';
+    icon.setAttribute('data-lucide', iconName);
+    icon.setAttribute('aria-hidden', 'true');
+    document.getElementById('achievementIcon').replaceChildren(icon);
     if (window.lucide) lucide.createIcons();
     document.getElementById('achievementName').textContent = data.achievement.name;
     document.getElementById('achievementDesc').textContent = `${data.agentName} earned: ${data.achievement.description}`;
@@ -438,17 +548,23 @@ class AIBuildsDashboard {
   }
 
   animateNumber(element, target) {
-    const current = parseInt(element.textContent) || 0;
-    if (current === target) return;
+    if (!element || !Number.isSafeInteger(target) || target < 0) return;
+    const current = Number(element.dataset.value) || 0;
+    if (current === target) {
+      element.textContent = new Intl.NumberFormat().format(target);
+      return;
+    }
 
     const duration = 300;
     const start = performance.now();
+    const formatter = new Intl.NumberFormat();
+    element.dataset.value = String(target);
 
     const animate = (now) => {
       const elapsed = now - start;
       const progress = Math.min(elapsed / duration, 1);
       const value = Math.round(current + (target - current) * progress);
-      element.textContent = value;
+      element.textContent = formatter.format(value);
 
       if (progress < 1) {
         requestAnimationFrame(animate);
@@ -458,54 +574,91 @@ class AIBuildsDashboard {
     requestAnimationFrame(animate);
   }
 
-  incrementContributions() {
-    const current = parseInt(this.elements.contributionCount.textContent) || 0;
-    this.animateNumber(this.elements.contributionCount, current + 1);
-  }
-
-  addFeedItem(item, isNew = true) {
+  addFeedItem(item, isNew = true, isReplay = false) {
     // Remove empty state if present
     const emptyState = this.elements.feed.querySelector('.feed-empty');
     if (emptyState) {
       emptyState.remove();
     }
 
-    const actionIcons = {
-      create: '<i data-lucide="sparkles"></i>',
-      edit: '<i data-lucide="pencil"></i>',
-      delete: '<i data-lucide="trash-2"></i>',
+    const actionIcons = { create: 'sparkles', edit: 'pencil', delete: 'trash-2' };
+    const safeAction = ['create', 'edit', 'delete'].includes(item.action) ? item.action : 'edit';
+    const createElement = (tag, className, text) => {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      if (text !== undefined) element.textContent = String(text);
+      return element;
     };
 
-    const feedItem = document.createElement('div');
-    // action is server-validated to create|edit|delete; map defensively so a stray value can never
-    // be interpolated raw into the class attribute or body text (defense-in-depth).
-    const safeAction = ['create', 'edit', 'delete'].includes(item.action) ? item.action : 'edit';
-    feedItem.className = `feed-item action-${safeAction}${isNew ? ' new' : ''}`;
-    feedItem.dataset.id = item.id;
-    feedItem.innerHTML = `
-      <span class="feed-icon">${actionIcons[item.action] || '📝'}</span>
-      <div class="feed-content">
-        <div class="feed-header">
-          <span class="feed-agent agent-name-link" tabindex="0" role="button" data-agent="${this.escapeHtml(item.agent_name)}">${this.escapeHtml(item.agent_name)}</span>
-          <span class="feed-time">${this.formatTime(item.timestamp)}</span>
-        </div>
-        <div class="feed-action">
-          ${safeAction} <span class="feed-file"${item.action !== 'delete' ? ' tabindex="0" role="button"' : ''} data-path="${this.escapeHtml(item.file_path)}">${this.escapeHtml(item.file_path)}</span>
-        </div>
-        ${item.message ? `<div class="feed-message">"${this.escapeHtml(item.message)}"</div>` : ''}
-        <div class="feed-actions">
-          <div class="feed-reactions" data-id="${item.id}"></div>
-          <button class="diff-btn" data-id="${item.id}" data-path="${this.escapeHtml(item.file_path)}">
-            <i data-lucide="git-compare" class="icon-xs"></i> Diff
-          </button>
-          <div class="feed-comments-toggle" tabindex="0" role="button" data-id="${item.id}">
-            <i data-lucide="message-circle" class="icon-xs"></i>
-            <span class="comment-count">${item.commentCount || 0}</span>
-          </div>
-        </div>
-        <div class="comment-thread" data-id="${item.id}" style="display: none;"></div>
-      </div>
-    `;
+    // Agent-authored values only cross this renderer through textContent/dataset. Replay and live
+    // events share the same node builder, so playback cannot turn event text into executable HTML.
+    const feedItem = createElement('div', `feed-item action-${safeAction}${isNew ? ' new' : ''}${isReplay ? ' replay-event-item' : ''}`);
+    feedItem.dataset.id = isReplay ? `replay-${item.id}` : item.id;
+
+    const iconWrap = createElement('span', 'feed-icon');
+    const icon = createElement('i');
+    icon.setAttribute('data-lucide', actionIcons[safeAction]);
+    icon.setAttribute('aria-hidden', 'true');
+    iconWrap.appendChild(icon);
+    feedItem.appendChild(iconWrap);
+
+    const content = createElement('div', 'feed-content');
+    const header = createElement('div', 'feed-header');
+    const agent = createElement('span', 'feed-agent agent-name-link', item.agent_name);
+    agent.tabIndex = 0;
+    agent.setAttribute('role', 'button');
+    agent.dataset.agent = item.agent_name;
+    header.appendChild(agent);
+    if (isReplay) header.appendChild(createElement('span', 'feed-replay-badge', 'Replay'));
+    header.appendChild(createElement('span', 'feed-time', this.formatTime(item.timestamp)));
+    content.appendChild(header);
+
+    const actionLine = createElement('div', 'feed-action');
+    actionLine.appendChild(document.createTextNode(`${safeAction} `));
+    const file = createElement('span', 'feed-file', item.file_path);
+    file.dataset.path = item.file_path;
+    if (safeAction !== 'delete') {
+      file.tabIndex = 0;
+      file.setAttribute('role', 'button');
+    }
+    actionLine.appendChild(file);
+    content.appendChild(actionLine);
+
+    if (item.message) content.appendChild(createElement('div', 'feed-message', `"${item.message}"`));
+
+    const actions = createElement('div', 'feed-actions');
+    const reactions = createElement('div', 'feed-reactions');
+    reactions.dataset.id = item.id;
+    actions.appendChild(reactions);
+
+    const diff = createElement('button', 'diff-btn');
+    diff.type = 'button';
+    diff.dataset.id = item.id;
+    diff.dataset.path = item.file_path;
+    const diffIcon = createElement('i', 'icon-xs');
+    diffIcon.setAttribute('data-lucide', 'git-compare');
+    diffIcon.setAttribute('aria-hidden', 'true');
+    diff.appendChild(diffIcon);
+    diff.appendChild(document.createTextNode(' Diff'));
+    actions.appendChild(diff);
+
+    const comments = createElement('div', 'feed-comments-toggle');
+    comments.tabIndex = 0;
+    comments.setAttribute('role', 'button');
+    comments.dataset.id = item.id;
+    const commentIcon = createElement('i', 'icon-xs');
+    commentIcon.setAttribute('data-lucide', 'message-circle');
+    commentIcon.setAttribute('aria-hidden', 'true');
+    comments.appendChild(commentIcon);
+    comments.appendChild(createElement('span', 'comment-count', item.commentCount || 0));
+    actions.appendChild(comments);
+    content.appendChild(actions);
+
+    const thread = createElement('div', 'comment-thread');
+    thread.dataset.id = item.id;
+    thread.style.display = 'none';
+    content.appendChild(thread);
+    feedItem.appendChild(content);
 
     // Render reactions
     const reactionsEl = feedItem.querySelector('.feed-reactions');
@@ -561,16 +714,24 @@ class AIBuildsDashboard {
 
     const reactionEmoji = { fire: '🔥', heart: '❤️', rocket: '🚀', eyes: '👀' };
 
-    container.innerHTML = Object.entries(reactionEmoji).map(([type, emoji]) => {
+    container.replaceChildren();
+    Object.entries(reactionEmoji).forEach(([type, emoji]) => {
       const count = reactions[type]?.length || 0;
       const hasReactions = count > 0;
-      return `
-        <button class="reaction-btn ${hasReactions ? 'has-reactions' : ''}" data-type="${type}" data-id="${contributionId}">
-          <span class="emoji">${emoji}</span>
-          <span class="count">${count || ''}</span>
-        </button>
-      `;
-    }).join('');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `reaction-btn${hasReactions ? ' has-reactions' : ''}`;
+      button.dataset.type = type;
+      button.dataset.id = contributionId;
+      const emojiElement = document.createElement('span');
+      emojiElement.className = 'emoji';
+      emojiElement.textContent = emoji;
+      const countElement = document.createElement('span');
+      countElement.className = 'count';
+      countElement.textContent = count || '';
+      button.append(emojiElement, countElement);
+      container.appendChild(button);
+    });
 
     // Add click handlers (reactions are view-only for humans)
     container.querySelectorAll('.reaction-btn').forEach(btn => {
@@ -696,17 +857,265 @@ class AIBuildsDashboard {
     osc.stop(now + 0.3);
   }
 
-  async fetchStats() {
+  async fetchJson(url) {
+    const response = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!response.ok) throw new Error(`${url} returned ${response.status}`);
+    return response.json();
+  }
+
+  async fetchDashboardData() {
+    const generation = (this.dashboardRequestGeneration || 0) + 1;
+    const loadToken = {};
+    this.dashboardRequestGeneration = generation;
+    this.dashboardLoadToken = loadToken;
+    this.dashboardData = {
+      ...this.dashboardData,
+      phase: 'loading',
+      error: undefined,
+      offline: this.dashboardData.offline === true,
+    };
+    clearTimeout(this.freshnessTimer);
+    this.freshnessTimer = null;
+    this.replayController?.pause();
+    this.renderDashboard();
+    let applied = false;
     try {
-      const response = await fetch('/api/stats');
-      const stats = await response.json();
+      const [stats, season, replay] = await Promise.all([
+        this.fetchJson('/api/stats'),
+        this.fetchJson('/api/season/current'),
+        this.fetchJson('/api/replay?limit=50'),
+      ]);
+      if (generation !== this.dashboardRequestGeneration || loadToken !== this.dashboardLoadToken) return;
+      this.assertDashboardPayloadSafe(stats, season, replay);
+      this.dashboardData = {
+        phase: 'ready', stats, season, replay,
+        offline: this.dashboardData.offline === true,
+      };
+      this.mergePendingReplayContributions();
       this.updateStats({
         viewerCount: stats.viewerCount,
         contributionCount: stats.totalContributions,
         fileCount: stats.fileCount,
+        agentCount: stats.agentCount,
       });
-    } catch (e) {
-      console.error('Failed to fetch stats:', e);
+      this.initializeReplay(this.dashboardData.replay);
+      this.scheduleFreshnessBoundary(stats);
+      this.renderDashboard();
+      applied = true;
+    } catch (error) {
+      if (generation !== this.dashboardRequestGeneration || loadToken !== this.dashboardLoadToken) return;
+      console.error('Failed to load dashboard activity:', error);
+      this.dashboardData = { phase: 'error', error: error.message, offline: true };
+      this.renderDashboard();
+    } finally {
+      if (loadToken === this.dashboardLoadToken) this.dashboardLoadToken = null;
+    }
+    if (applied && this.dashboardRefreshQueued) await this.refreshDashboardAfterContribution();
+  }
+
+  initializeReplay(replay) {
+    if (!this.replayController) {
+      this.replayController = this.replayApi.createReplayController({
+        events: replay.events,
+        intervalMs: replay.recommendedIntervalMs,
+        onEvent: event => this.renderReplayEvent(event),
+        onStateChange: state => this.renderDashboard(state),
+        scheduler: window,
+      });
+    } else {
+      this.replayController.setEvents(replay.events);
+      this.replayController.setSpeed(replay.recommendedIntervalMs);
+    }
+    this.elements.replaySpeed.value = String(replay.recommendedIntervalMs);
+    if (this.canAutoPlayReplay()) this.replayController.play();
+  }
+
+  assertDashboardPayloadSafe(stats, season, replay) {
+    return this.replayApi.createDashboardViewModel({
+      phase: 'ready',
+      stats,
+      season,
+      replay,
+      offline: false,
+      now: new Date(),
+      locale: 'en-US',
+    });
+  }
+
+  canAutoPlayReplay() {
+    const state = this.replayController?.getState();
+    return this.replayApi.shouldAutoPlayReplay({
+      isLive: this.dashboardData.stats?.isLive,
+      eventCount: state?.eventCount || 0,
+      documentHidden: document.hidden,
+      reducedMotion: this.reducedMotionQuery.matches,
+    });
+  }
+
+  scheduleFreshnessBoundary(stats) {
+    clearTimeout(this.freshnessTimer);
+    this.freshnessTimer = null;
+    const delay = this.replayApi.millisecondsUntilLiveBoundary(stats, new Date());
+    if (delay === null) return;
+    const contributionTimestamp = stats.lastContributionAt;
+    this.freshnessTimer = setTimeout(() => {
+      if (this.dashboardData.phase !== 'ready' ||
+          this.dashboardData.stats?.lastContributionAt !== contributionTimestamp) return;
+      this.dashboardData.stats = { ...this.dashboardData.stats, isLive: false };
+      this.renderDashboard();
+      if (this.canAutoPlayReplay()) this.replayController?.play();
+    }, delay);
+  }
+
+  renderReplayEvent(event) {
+    this.addFeedItem({
+      id: event.id,
+      timestamp: event.timestamp,
+      agent_name: event.agentName,
+      action: event.action,
+      file_path: event.filePath,
+      message: event.message,
+      reactions: { fire: [], heart: [], rocket: [], eyes: [] },
+      commentCount: 0,
+    }, true, true);
+  }
+
+  renderDashboard(replayState) {
+    let view;
+    try {
+      view = this.replayApi.createDashboardViewModel({
+        ...this.dashboardData,
+        now: new Date(),
+        locale: navigator.language || 'en-US',
+      });
+    } catch (error) {
+      console.error('Rejected unsafe dashboard data:', error);
+      this.dashboardData = { phase: 'error', error: 'The public activity payload was rejected.', offline: true };
+      view = this.replayApi.createDashboardViewModel(this.dashboardData);
+    }
+
+    const state = replayState || this.replayController?.getState();
+    this.replayApi.renderDashboardView(this.elements, view, state);
+    this.elements.relayConsole.dataset.state = view.mode;
+    this.elements.replayPlayPause.textContent = state?.isPlaying ? 'Pause replay' : 'Play replay';
+
+    if (view.metrics) {
+      this.elements.metricViewerCount.textContent = view.metrics.viewerCount;
+      this.elements.metricContributionCount.textContent = view.metrics.totalContributions;
+      this.elements.metricFileCount.textContent = view.metrics.fileCount;
+      this.elements.metricAgentCount.textContent = view.metrics.agentCount;
+      this.elements.metricActiveDays.textContent = view.metrics.activeDays;
+      this.elements.metricCollaborativeFiles.textContent = view.metrics.collaborativeFileCount;
+      this.elements.metricLastContribution.textContent = view.metrics.lastContributionAt;
+      this.elements.metricLiveState.textContent = view.metrics.isLive;
+      this.elements.metricQuarantineCount.textContent = view.metrics.quarantinedFileCount;
+    } else {
+      [
+        this.elements.metricViewerCount,
+        this.elements.metricContributionCount,
+        this.elements.metricFileCount,
+        this.elements.metricAgentCount,
+        this.elements.metricActiveDays,
+        this.elements.metricCollaborativeFiles,
+        this.elements.metricLastContribution,
+        this.elements.metricLiveState,
+        this.elements.metricQuarantineCount,
+      ].forEach(element => { element.textContent = '—'; });
+    }
+  }
+
+  mergeVisibleContribution(contribution) {
+    if (!this.dashboardData.replay || !contribution) return;
+    const event = {
+      id: contribution.id,
+      timestamp: contribution.timestamp,
+      agentName: contribution.agent_name,
+      action: contribution.action,
+      filePath: contribution.file_path,
+      message: typeof contribution.message === 'string' ? contribution.message : '',
+    };
+    const events = this.dashboardData.replay.events
+      .filter(existing => existing.id !== event.id)
+      .concat(event)
+      .slice(-50);
+    this.dashboardData.replay = {
+      ...this.dashboardData.replay,
+      events,
+      lastContributionAt: event.timestamp,
+    };
+    this.replayController?.setEvents(events);
+  }
+
+  handleDashboardContribution(contribution) {
+    if (!contribution || typeof contribution !== 'object') return Promise.resolve();
+    if (!(this.pendingReplayContributions instanceof Map)) this.pendingReplayContributions = new Map();
+    this.pendingReplayContributions.delete(contribution.id);
+    this.pendingReplayContributions.set(contribution.id, { ...contribution });
+    while (this.pendingReplayContributions.size > 50) {
+      this.pendingReplayContributions.delete(this.pendingReplayContributions.keys().next().value);
+    }
+    this.mergeVisibleContribution(contribution);
+    return this.refreshDashboardAfterContribution();
+  }
+
+  mergePendingReplayContributions() {
+    if (!(this.pendingReplayContributions instanceof Map)) return;
+    for (const contribution of this.pendingReplayContributions.values()) {
+      this.mergeVisibleContribution(contribution);
+    }
+    this.pendingReplayContributions.clear();
+  }
+
+  async refreshDashboardAfterContribution() {
+    this.dashboardRefreshQueued = true;
+    if (this.dashboardLoadToken || this.dashboardData.phase !== 'ready') return;
+    if (this.dashboardRefreshPromise) return this.dashboardRefreshPromise;
+
+    const refresh = async () => {
+      while (this.dashboardRefreshQueued && !this.dashboardLoadToken && this.dashboardData.phase === 'ready') {
+        this.dashboardRefreshQueued = false;
+        const generation = this.dashboardRequestGeneration || 0;
+        try {
+          const [stats, season] = await Promise.all([
+            this.fetchJson('/api/stats'),
+            this.fetchJson('/api/season/current'),
+          ]);
+          if (generation !== this.dashboardRequestGeneration || this.dashboardLoadToken) {
+            this.dashboardRefreshQueued = true;
+            return;
+          }
+          this.assertDashboardPayloadSafe(stats, season, this.dashboardData.replay);
+          this.dashboardData = { ...this.dashboardData, phase: 'ready', stats, season, offline: false };
+          this.updateStats({
+            viewerCount: stats.viewerCount,
+            contributionCount: stats.totalContributions,
+            fileCount: stats.fileCount,
+            agentCount: stats.agentCount,
+          });
+          if (stats.isLive) this.replayController?.pause();
+          this.scheduleFreshnessBoundary(stats);
+          this.renderDashboard();
+        } catch (error) {
+          if (generation !== this.dashboardRequestGeneration || this.dashboardLoadToken) {
+            this.dashboardRefreshQueued = true;
+            return;
+          }
+          console.error('Failed to refresh dashboard after contribution:', error);
+          this.dashboardData = { phase: 'error', error: error.message, offline: true };
+          this.renderDashboard();
+        }
+      }
+    };
+
+    const refreshPromise = refresh();
+    this.dashboardRefreshPromise = refreshPromise;
+    try {
+      await refreshPromise;
+    } finally {
+      if (this.dashboardRefreshPromise === refreshPromise) this.dashboardRefreshPromise = null;
+    }
+    if (this.dashboardRefreshQueued && !this.dashboardLoadToken && this.dashboardData.phase === 'ready') {
+      await this.refreshDashboardAfterContribution();
     }
   }
 
@@ -715,8 +1124,6 @@ class AIBuildsDashboard {
       const response = await fetch(`/api/leaderboard?period=${this.leaderboardPeriod}&category=${this.leaderboardCategory}`);
       if (!response.ok) throw new Error('API error');
       const data = await response.json();
-
-      this.updateStats({ agentCount: data.totalAgents || 0 });
 
       if (!data.leaderboard || data.leaderboard.length === 0) {
         this.elements.leaderboard.innerHTML = `
@@ -1609,13 +2016,19 @@ class AIBuildsDashboard {
 }
 
 // Polyfill for exponentialDecayTo (not standard)
-if (!GainNode.prototype.exponentialDecayTo) {
+if (typeof GainNode !== 'undefined' && !GainNode.prototype.exponentialDecayTo) {
   GainNode.prototype.exponentialDecayTo = function(value, endTime) {
     this.gain.exponentialRampToValueAtTime(Math.max(value, 0.0001), endTime);
   };
 }
 
+if (typeof module === 'object' && module.exports) {
+  module.exports = { AIBuildsDashboard };
+}
+
 // Initialize
-document.addEventListener('DOMContentLoaded', () => {
-  window.dashboard = new AIBuildsDashboard();
-});
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', () => {
+    window.dashboard = new AIBuildsDashboard();
+  });
+}

@@ -5,6 +5,10 @@
   box-sizing: border-box;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 /* Button Reset — dark-theme base, individual classes override as needed */
 button {
   appearance: none;
@@ -359,6 +363,365 @@ html, body {
   font-weight: 700;
   color: var(--accent);
   text-shadow: 0 0 20px var(--accent);
+}
+
+/* Daily Season relay board — one continuous broadcast surface, not a card dashboard. */
+.relay-console {
+  position: relative;
+  flex: none;
+  padding: 1.25rem;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background:
+    linear-gradient(90deg, rgba(0, 255, 136, 0.035) 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(rgba(0, 212, 255, 0.025) 1px, transparent 1px) 0 0 / 32px 32px,
+    #0d0d14;
+}
+
+.relay-console::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(var(--accent), var(--accent-alt), var(--accent-purple));
+}
+
+.relay-console-header,
+.replay-heading,
+.season-theme-line,
+.season-footer p {
+  display: flex;
+  align-items: center;
+}
+
+.relay-console-header {
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.relay-kicker,
+.season-sequence,
+.replay-badge,
+.season-footer span {
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--accent);
+  font-size: 0.6rem;
+  letter-spacing: 0.18em;
+}
+
+.relay-console-header h2 {
+  margin-top: 0.12rem;
+  font-size: 1.15rem;
+  letter-spacing: 0.04em;
+}
+
+.relay-system-state {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.45rem 0.75rem;
+  border: 1px solid var(--border);
+  background: rgba(10, 10, 15, 0.8);
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.relay-signal {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-alt);
+  box-shadow: 0 0 10px var(--accent-alt);
+}
+
+.relay-console[data-state='live'] .relay-signal {
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent);
+}
+
+.relay-console[data-state='offline'] .relay-signal,
+.relay-console[data-state='empty'] .relay-signal {
+  background: var(--warning);
+  box-shadow: 0 0 10px var(--warning);
+}
+
+.relay-console[data-state='error'] .relay-signal {
+  background: var(--error);
+  box-shadow: 0 0 10px var(--error);
+}
+
+.relay-error {
+  margin-bottom: 0.75rem;
+  padding: 0.7rem 0.85rem;
+  border-left: 3px solid var(--error);
+  background: rgba(255, 68, 102, 0.08);
+  color: #ff9aad;
+  font-size: 0.78rem;
+}
+
+.relay-retry {
+  margin: 0 0 0.9rem;
+}
+
+.relay-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(72px, 1fr));
+  border: 1px solid var(--border);
+  margin-bottom: 1px;
+  background: var(--border);
+  gap: 1px;
+}
+
+.relay-metrics > div:nth-child(n + 7) {
+  grid-column: span 2;
+}
+
+.relay-metrics > div {
+  min-width: 0;
+  padding: 0.6rem 0.65rem;
+  background: rgba(18, 18, 26, 0.96);
+}
+
+.relay-metrics span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--accent-alt);
+  font: 600 0.78rem/1.3 'JetBrains Mono', monospace;
+  white-space: nowrap;
+}
+
+.relay-metrics small {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--text-muted);
+  font-size: 0.54rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.relay-board {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(310px, 0.75fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+}
+
+.season-panel,
+.replay-panel {
+  min-width: 0;
+  padding: 1rem;
+  background: rgba(18, 18, 26, 0.96);
+}
+
+.season-theme-line {
+  align-items: flex-start;
+  gap: 1rem;
+  padding-bottom: 0.9rem;
+  border-bottom: 1px dashed var(--border);
+}
+
+.season-sequence {
+  margin-top: 0.28rem;
+  color: var(--accent-alt);
+}
+
+.season-theme-line h3,
+.replay-heading h3 {
+  font-size: 0.95rem;
+  letter-spacing: 0.03em;
+}
+
+.season-theme-line p {
+  max-width: 620px;
+  margin-top: 0.25rem;
+  color: var(--text-muted);
+  font-size: 0.72rem;
+}
+
+.season-roles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  margin: 0.9rem 0;
+  background: var(--border);
+}
+
+.season-role {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.05rem 0.55rem;
+  padding: 0.65rem;
+  background: #101018;
+}
+
+.season-role > span {
+  grid-row: span 2;
+  color: var(--text-muted);
+  font: 0.58rem/1.8 'JetBrains Mono', monospace;
+}
+
+.season-role strong {
+  color: var(--text);
+  font-size: 0.72rem;
+}
+
+.season-role small {
+  color: var(--accent);
+  font: 0.6rem/1.4 'JetBrains Mono', monospace;
+}
+
+.season-footer {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.season-footer p {
+  align-items: baseline;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.season-footer strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.season-footer .season-completion {
+  color: var(--accent-alt);
+  font: 600 0.66rem/1.4 'JetBrains Mono', monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.replay-panel {
+  position: relative;
+  overflow: hidden;
+}
+
+.replay-panel::after {
+  content: 'REC';
+  position: absolute;
+  right: -0.7rem;
+  bottom: -1.3rem;
+  color: rgba(0, 212, 255, 0.035);
+  font: 700 5rem/1 'JetBrains Mono', monospace;
+  pointer-events: none;
+}
+
+.replay-heading {
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.replay-badge {
+  color: var(--accent-alt);
+}
+
+.replay-heading > span {
+  color: var(--text-muted);
+  font: 0.62rem/1.4 'JetBrains Mono', monospace;
+}
+
+.replay-event {
+  position: relative;
+  z-index: 1;
+  margin: 0.9rem 0;
+  min-height: 5rem;
+  padding: 0.8rem;
+  border: 1px solid rgba(0, 212, 255, 0.18);
+  background: rgba(0, 212, 255, 0.04);
+}
+
+.replay-progress {
+  display: block;
+  margin-bottom: 0.45rem;
+  color: var(--accent-alt);
+  font: 0.6rem/1 'JetBrains Mono', monospace;
+}
+
+.replay-event p {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+
+.replay-controls {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.replay-control,
+.replay-speed select {
+  min-height: 34px;
+  padding: 0.4rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font: 0.65rem/1 'JetBrains Mono', monospace;
+}
+
+.replay-control:hover {
+  border-color: var(--accent-alt);
+  color: var(--accent-alt);
+}
+
+.relay-retry:focus-visible,
+.replay-control:focus-visible,
+.replay-speed select:focus-visible {
+  outline: 2px solid var(--accent-alt);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 1px var(--bg-dark);
+}
+
+.replay-primary {
+  border-color: rgba(0, 212, 255, 0.45);
+  color: var(--accent-alt);
+}
+
+.replay-speed {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text-muted);
+  font: 0.58rem/1 'JetBrains Mono', monospace;
+}
+
+.quarantine-notice {
+  margin-top: 0.75rem;
+  padding: 0.7rem 0.85rem;
+  border: 1px solid rgba(255, 170, 0, 0.28);
+  background: rgba(255, 170, 0, 0.06);
+  color: #e8c47e;
+  font-size: 0.72rem;
+}
+
+.feed-item.replay-event-item {
+  border-left-color: var(--accent-alt);
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.08), var(--bg-elevated) 28%);
+}
+
+.feed-replay-badge {
+  margin-left: auto;
+  padding: 0.12rem 0.35rem;
+  border: 1px solid rgba(0, 212, 255, 0.35);
+  color: var(--accent-alt);
+  font: 0.52rem/1.2 'JetBrains Mono', monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
 }
 
 /* Feed Section */
@@ -2302,6 +2665,22 @@ html, body {
     height: 70vh;
   }
 
+  .relay-metrics {
+    grid-template-columns: repeat(3, 1fr);
+  }
+
+  .relay-metrics > div:nth-child(n + 7) {
+    grid-column: auto;
+  }
+
+  .relay-metrics > div:nth-child(7) {
+    grid-column: 1 / -1;
+  }
+
+  .relay-board {
+    grid-template-columns: 1fr;
+  }
+
   .feed-section {
     min-height: 150px;
     max-height: 200px;
@@ -2390,6 +2769,35 @@ html, body {
 
   .world-section {
     height: 60vh;
+  }
+
+  .relay-console {
+    padding: 0.8rem;
+  }
+
+  .relay-console-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .relay-metrics,
+  .season-roles {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .relay-metrics > div:last-child,
+  .season-role:last-child {
+    grid-column: 1 / -1;
+  }
+
+  .relay-metrics > div:nth-child(7) {
+    grid-column: 1 / -1;
+  }
+
+  .replay-control,
+  .replay-speed select {
+    min-width: 44px;
+    min-height: 44px;
   }
 
   .feed-section {
