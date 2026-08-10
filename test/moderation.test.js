@@ -3,11 +3,75 @@ const assert = require('node:assert');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const mod = require('../server/moderation.js');
 
 const execFileAsync = promisify(execFile);
+const MAX_REPAIR_FILE_BYTES = 500 * 1024;
+const MAX_REPAIR_AGENT_IPS = 5000;
+const MAX_REPAIR_RECORDS = 1000;
+const MAX_TOTAL_REPAIR_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_MODERATION_FILE_BYTES = 16 * 1024 * 1024;
+
+function sha256(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest('hex');
+}
+
+function validGitRepair(filePath = 'pages/recover.html', {
+  bytes = Buffer.from('public bytes'),
+  agentIps = [['RecoveryAgent', '203.0.113.10']],
+  entries = [{ mode: '100644', hash: 'b'.repeat(40), stage: 0 }],
+} = {}) {
+  return {
+    filePath,
+    gitHash: null,
+    status: 'armed',
+    contributionId: 'recover-transaction',
+    expectedGitSubject: `[RecoveryAgent] edit: ${filePath}`,
+    publicationState: { quarantine: null, approval: null },
+    agentIps,
+    fileState: {
+      existed: true,
+      bytesBase64: bytes.toString('base64'),
+      sha256: sha256(bytes),
+    },
+    gitPathState: {
+      head: 'a'.repeat(40),
+      treeEntry: { mode: '100644', hash: 'b'.repeat(40) },
+      indexState: {
+        entries,
+        assumeUnchanged: false,
+        skipWorktree: false,
+      },
+    },
+  };
+}
+
+function moderationStateWithRepairs(repairs) {
+  return {
+    moderation: {
+      hiddenFiles: [], bannedAgents: [], bannedIps: [], quarantinedFiles: {}, approvedFiles: {},
+    },
+    agentIps: {},
+    gitRepairs: repairs,
+  };
+}
+
+async function assertPersistedModerationRejected(t, state, label) {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), `aibuilds-invalid-wal-${label}-`));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify(state));
+  const script = `
+    const moderation = require('./server/moderation');
+    moderation.load().then(() => process.exit(42), () => process.exit(0));
+  `;
+  await execFileAsync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, AIBUILDS_DATA_DIR: dataDir },
+  });
+}
 
 test('hide/unhide/isHidden with path normalization', () => {
   mod.loadModeration({});
@@ -31,6 +95,352 @@ test('serialize/load round-trip', () => {
   assert.equal(mod.isHidden('sections/a.html'), false);
   mod.loadModeration(snap);                 // re-hydrate from a serialized snapshot
   assert.equal(mod.isHidden('sections/a.html'), true);
+});
+
+test('persisted Git repair records reject malformed or over-limit security state', async (t) => {
+  const cases = [
+    {
+      name: 'missing-file-state',
+      build() {
+        const repair = validGitRepair();
+        delete repair.fileState;
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'noncanonical-map-path',
+      build() {
+        const repair = validGitRepair();
+        return moderationStateWithRepairs({ 'pages//recover.html': repair });
+      },
+    },
+    {
+      name: 'noncanonical-record-path',
+      build() {
+        const repair = validGitRepair();
+        repair.filePath = 'pages\\recover.html';
+        return moderationStateWithRepairs({ 'pages/recover.html': repair });
+      },
+    },
+    {
+      name: 'private-record-path',
+      build() {
+        const repair = validGitRepair();
+        repair.filePath = 'pages/.private/recover.html';
+        return moderationStateWithRepairs({ 'pages/.private/recover.html': repair });
+      },
+    },
+    {
+      name: 'invalid-base64',
+      build() {
+        const repair = validGitRepair();
+        repair.fileState.bytesBase64 = 'not+base64$';
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'noncanonical-base64',
+      build() {
+        const repair = validGitRepair();
+        repair.fileState.bytesBase64 = 'YQ';
+        repair.fileState.sha256 = sha256(Buffer.from('a'));
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'file-hash-mismatch',
+      build() {
+        const repair = validGitRepair();
+        repair.fileState.sha256 = '0'.repeat(64);
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'file-over-500kb',
+      build() {
+        const repair = validGitRepair('pages/oversize.html', {
+          bytes: Buffer.alloc(MAX_REPAIR_FILE_BYTES + 1, 0x61),
+        });
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'over-5000-agent-ips',
+      build() {
+        const agentIps = Array.from({ length: MAX_REPAIR_AGENT_IPS + 1 }, (_, index) => [
+          `Agent${index}`,
+          `198.18.${Math.floor(index / 256)}.${index % 256}`,
+        ]);
+        const repair = validGitRepair('pages/too-many-ips.html', { agentIps });
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'unbounded-agent-ip-string',
+      build() {
+        const repair = validGitRepair('pages/long-agent.html', {
+          agentIps: [['A'.repeat(101), '203.0.113.10']],
+        });
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'invalid-agent-ip',
+      build() {
+        const repair = validGitRepair('pages/invalid-ip.html', {
+          agentIps: [['RecoveryAgent', 'not-an-ip']],
+        });
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'over-four-index-entries',
+      build() {
+        const entries = Array.from({ length: 5 }, (_, index) => ({
+          mode: '100644', hash: String(index + 1).repeat(40), stage: index % 4,
+        }));
+        const repair = validGitRepair('pages/too-many-index-entries.html', { entries });
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'invalid-index-stage',
+      build() {
+        const repair = validGitRepair();
+        repair.gitPathState.indexState.entries[0].stage = 4;
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'duplicate-index-stage',
+      build() {
+        const repair = validGitRepair('pages/duplicate-stage.html', {
+          entries: [
+            { mode: '100644', hash: '1'.repeat(40), stage: 1 },
+            { mode: '100644', hash: '2'.repeat(40), stage: 1 },
+          ],
+        });
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'stage-zero-with-conflict-stages',
+      build() {
+        const repair = validGitRepair('pages/mixed-stages.html', {
+          entries: [
+            { mode: '100644', hash: '1'.repeat(40), stage: 0 },
+            { mode: '100644', hash: '2'.repeat(40), stage: 1 },
+          ],
+        });
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'noncanonical-index-stage-order',
+      build() {
+        const repair = validGitRepair('pages/stage-order.html', {
+          entries: [
+            { mode: '100644', hash: '2'.repeat(40), stage: 2 },
+            { mode: '100644', hash: '1'.repeat(40), stage: 1 },
+          ],
+        });
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'index-flags-without-stage-zero',
+      build() {
+        const repair = validGitRepair('pages/conflict-flags.html', {
+          entries: [
+            { mode: '100644', hash: '1'.repeat(40), stage: 1 },
+            { mode: '100644', hash: '2'.repeat(40), stage: 2 },
+          ],
+        });
+        repair.gitPathState.indexState.skipWorktree = true;
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'invalid-index-flags',
+      build() {
+        const repair = validGitRepair();
+        repair.gitPathState.indexState.assumeUnchanged = 'false';
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'invalid-index-mode',
+      build() {
+        const repair = validGitRepair();
+        repair.gitPathState.indexState.entries[0].mode = '777777';
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'invalid-object-hash',
+      build() {
+        const repair = validGitRepair();
+        repair.gitPathState.head = 'g'.repeat(40);
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'unbounded-reasons-array',
+      build() {
+        const repair = validGitRepair();
+        repair.publicationState.quarantine = {
+          filePath: repair.filePath,
+          contentHash: 'c'.repeat(64),
+          reasons: Array.from({ length: 17 }, (_, index) => `reason-${index}`),
+          agentName: 'RecoveryAgent',
+          timestamp: '2026-08-10T12:00:00.000Z',
+        };
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'unbounded-transaction-id',
+      build() {
+        const repair = validGitRepair();
+        repair.contributionId = 'x'.repeat(129);
+        return moderationStateWithRepairs({ [repair.filePath]: repair });
+      },
+    },
+    {
+      name: 'over-1000-repair-records',
+      build() {
+        const repairs = {};
+        for (let index = 0; index < MAX_REPAIR_RECORDS + 1; index++) {
+          const filePath = `pages/recover-${index}.html`;
+          repairs[filePath] = validGitRepair(filePath);
+        }
+        return moderationStateWithRepairs(repairs);
+      },
+    },
+    {
+      name: 'aggregate-repair-bytes-over-limit',
+      build() {
+        const repairs = {};
+        const bytesPerRepair = Buffer.alloc(MAX_REPAIR_FILE_BYTES, 0x61);
+        const repairCount = Math.floor(MAX_TOTAL_REPAIR_FILE_BYTES / MAX_REPAIR_FILE_BYTES) + 1;
+        for (let index = 0; index < repairCount; index++) {
+          const filePath = `pages/aggregate-${index}.html`;
+          repairs[filePath] = validGitRepair(filePath, { bytes: bytesPerRepair, agentIps: [] });
+        }
+        return moderationStateWithRepairs(repairs);
+      },
+    },
+  ];
+
+  for (const fixture of cases) {
+    await t.test(fixture.name, async (t) => {
+      await assertPersistedModerationRejected(t, fixture.build(), fixture.name);
+    });
+  }
+});
+
+test('valid Git repair boundary values round-trip without truncating recovery state', () => {
+  const bytes = Buffer.alloc(MAX_REPAIR_FILE_BYTES, 0x61);
+  const agentIps = Array.from({ length: MAX_REPAIR_AGENT_IPS }, (_, index) => [
+    `Agent${index}`,
+    `198.18.${Math.floor(index / 256)}.${index % 256}`,
+  ]);
+  const entries = [1, 2, 3].map(stage => ({
+    mode: '100644', hash: String(stage + 1).repeat(40), stage,
+  }));
+  const repair = validGitRepair('pages/boundary.html', { bytes, agentIps, entries });
+
+  mod.loadModeration(moderationStateWithRepairs({ [repair.filePath]: repair }));
+  const serialized = mod.serializeModeration();
+  assert.equal(serialized.gitRepairs[repair.filePath].fileState.bytesBase64, bytes.toString('base64'));
+  assert.equal(serialized.gitRepairs[repair.filePath].fileState.sha256, sha256(bytes));
+  assert.equal(serialized.gitRepairs[repair.filePath].agentIps.length, MAX_REPAIR_AGENT_IPS);
+  assert.equal(serialized.gitRepairs[repair.filePath].gitPathState.indexState.entries.length, 3);
+
+  mod.loadModeration(serialized);
+  const recovered = mod.getGitRepair(repair.filePath);
+  assert.equal(recovered.fileState.sha256, sha256(bytes));
+  assert.equal(recovered.agentIps.length, MAX_REPAIR_AGENT_IPS);
+  assert.equal(recovered.gitPathState.indexState.entries.length, 3);
+});
+
+test('exactly 1000 persisted Git repair records load without silent truncation', () => {
+  const repairs = {};
+  for (let index = 0; index < MAX_REPAIR_RECORDS; index++) {
+    const filePath = `pages/boundary-${index}.html`;
+    repairs[filePath] = validGitRepair(filePath, { agentIps: [] });
+  }
+  mod.loadModeration(moderationStateWithRepairs(repairs));
+  assert.equal(mod.listGitRepairs().length, MAX_REPAIR_RECORDS);
+  assert.equal(Object.keys(mod.serializeModeration().gitRepairs).length, MAX_REPAIR_RECORDS);
+});
+
+test('oversized moderation state is rejected before its bytes are read or parsed', async (t) => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-oversize-moderation-file-'));
+  t.after(() => fs.rm(dataDir, { recursive: true, force: true }));
+  const moderationPath = path.join(dataDir, 'moderation.json');
+  const readObservedPath = path.join(dataDir, 'read-observed');
+  await fs.writeFile(moderationPath, '');
+  await fs.truncate(moderationPath, MAX_MODERATION_FILE_BYTES + 1);
+  const script = `
+    const fs = require('node:fs');
+    const originalReadFile = fs.promises.readFile.bind(fs.promises);
+    fs.promises.readFile = async function observeRead(filePath, ...args) {
+      if (String(filePath) === process.env.AIBUILDS_MODERATION_TARGET) {
+        fs.writeFileSync(process.env.AIBUILDS_READ_OBSERVED, 'read');
+      }
+      return originalReadFile(filePath, ...args);
+    };
+    const moderation = require('./server/moderation');
+    moderation.load().then(
+      () => process.exit(42),
+      error => process.exit(error && error.code === 'ERR_MODERATION_FILE_TOO_LARGE' &&
+        !fs.existsSync(process.env.AIBUILDS_READ_OBSERVED) ? 0 : 43),
+    );
+  `;
+  await execFileAsync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      AIBUILDS_DATA_DIR: dataDir,
+      AIBUILDS_MODERATION_TARGET: moderationPath,
+      AIBUILDS_READ_OBSERVED: readObservedPath,
+    },
+  });
+});
+
+test('malformed persisted Git repair state exits before the HTTP server listens', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-invalid-wal-startup-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  await fs.mkdir(worldDir, { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  const repair = validGitRepair();
+  delete repair.fileState;
+  await fs.writeFile(
+    path.join(dataDir, 'moderation.json'),
+    JSON.stringify(moderationStateWithRepairs({ [repair.filePath]: repair })),
+  );
+
+  await assert.rejects(execFileAsync(process.execPath, ['server/index.js'], {
+    cwd: path.join(__dirname, '..'),
+    timeout: 3000,
+    env: {
+      ...process.env,
+      PORT: '0',
+      AIBUILDS_WORLD_DIR: worldDir,
+      AIBUILDS_DATA_DIR: dataDir,
+      AIBUILDS_BACKUP_DIR: backupDir,
+    },
+  }), error => {
+    assert.notEqual(error.killed, true, 'server listened until the test timeout instead of failing startup');
+    assert.equal(error.code, 1);
+    assert.doesNotMatch(error.stdout || '', /Server:\s+http:/);
+    return true;
+  });
 });
 
 test('quarantine and approval records serialize and load with exact hashes', () => {

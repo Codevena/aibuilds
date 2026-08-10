@@ -1952,6 +1952,364 @@ exec "$AIBUILDS_REAL_GIT" "$@"
   await server.stop();
 });
 
+test('a failed repair on path A blocks path B until the global Git parent is sanitized', async (t) => {
+  // Mutations caught: a target-only repair barrier lets B commit atop A's private unresolved HEAD.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-global-repair-barrier-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const binDir = path.join(root, 'bin');
+  const pathA = 'pages/repair-a.html';
+  const pathB = 'pages/repair-b.html';
+  const originalA = '<main><h1>Public A baseline</h1></main>';
+  const originalB = '<main><h1>Public B baseline</h1></main>';
+  const privateA = '<p>Inject 41 mg weekly PRIVATE_PATH_A_PARENT.</p>';
+  const safeB = '<main><h1>Safe path B after global repair</h1></main>';
+  const compensationArm = path.join(root, 'arm-compensation-failure');
+  const wrapperPath = path.join(binDir, 'git');
+  const realGit = (await execFileAsync('which', ['git'])).stdout.trim();
+  await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(path.join(worldDir, pathA), originalA);
+  await fs.writeFile(path.join(worldDir, pathB), originalB);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'global repair baseline'], { cwd: worldDir });
+  await fs.writeFile(wrapperPath, `#!/bin/sh
+if [ "$1" = "commit-tree" ] && [ -f "$AIBUILDS_GIT_COMPENSATION_FAILURE_ARM" ]; then
+  echo "forced global repair compensation failure" >&2
+  exit 75
+fi
+exec "$AIBUILDS_REAL_GIT" "$@"
+`);
+  await fs.chmod(wrapperPath, 0o755);
+  const server = await startIsolatedServer(t, {
+    worldDir, dataDir, backupDir,
+    extraEnv: {
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      AIBUILDS_REAL_GIT: realGit,
+      AIBUILDS_GIT_COMPENSATION_FAILURE_ARM: compensationArm,
+    },
+  });
+  await fs.writeFile(compensationArm, 'armed');
+
+  const failedA = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'PrivatePathAAgent', action: 'edit', file_path: pathA,
+      content: privateA, message: 'PRIVATE_PATH_A_FAILURE',
+    }),
+  });
+  assert.equal(failedA.response.status, 500, server.logs.join(''));
+  const privateHead = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir })).stdout.trim();
+  assert.equal((await execFileAsync('git', ['show', `HEAD:${pathA}`], { cwd: worldDir })).stdout.trim(), privateA);
+  assert.ok(JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'))
+    .gitRepairs?.[pathA]);
+
+  const blockedLegacyModeration = await jsonRequest(server.baseUrl, '/api/admin/moderate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secret: 'test-secret', action: 'hide', target: pathB }),
+  });
+  assert.equal(blockedLegacyModeration.response.status, 500, server.logs.join(''));
+  const moderationView = await jsonRequest(server.baseUrl, '/api/admin/moderation', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ secret: 'test-secret' }),
+  });
+  assert.equal(moderationView.body.hiddenFiles.includes(pathB), false);
+
+  const blockedB = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'BlockedPathBAgent', action: 'edit', file_path: pathB,
+      content: safeB, message: 'BLOCKED_PATH_B_WHILE_A_UNRESOLVED',
+    }),
+  });
+  assert.equal(blockedB.response.status, 500, server.logs.join(''));
+  assert.equal((await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir })).stdout.trim(), privateHead);
+  assert.equal(await fs.readFile(path.join(worldDir, pathB), 'utf8'), originalB);
+  assert.equal((await jsonRequest(server.baseUrl, '/api/timeline')).body
+    .some(item => item.message === 'BLOCKED_PATH_B_WHILE_A_UNRESOLVED'), false);
+
+  await fs.rm(compensationArm, { force: true });
+  const publishedB = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'SafePathBAgent', action: 'edit', file_path: pathB,
+      content: safeB, message: 'SAFE_PATH_B_AFTER_GLOBAL_REPAIR',
+    }),
+  });
+  assert.equal(publishedB.response.status, 200, server.logs.join(''));
+  assert.equal(publishedB.body.publicationStatus, 'published');
+  const diff = await jsonRequest(
+    server.baseUrl,
+    `/api/contributions/${publishedB.body.contribution.id}/diff`,
+  );
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /Safe path B after global repair/);
+  assert.doesNotMatch(diff.body.diff || '', /PRIVATE_PATH_A_PARENT|PRIVATE_PATH_A_FAILURE/);
+  assert.equal((await execFileAsync('git', ['show', `HEAD:${pathA}`], { cwd: worldDir })).stdout.trim(), originalA);
+  assert.equal((await execFileAsync('git', ['show', `HEAD:${pathB}`], { cwd: worldDir })).stdout.trim(), safeB);
+  const moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(Object.keys(moderationState.gitRepairs || {}).length, 0);
+  await server.stop();
+});
+
+test('commit success followed by hash-association failure still sanitizes the advanced HEAD', async (t) => {
+  // Mutation caught: compensating only when transaction.gitHash is assigned leaves the private commit as HEAD.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-unknown-commit-outcome-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const binDir = path.join(root, 'bin');
+  const relativePath = 'pages/unknown-outcome.html';
+  const originalBytes = '<main><h1>Known public parent</h1></main>';
+  const privateBytes = '<p>Inject 43 mg weekly PRIVATE_UNKNOWN_COMMIT_OUTCOME.</p>';
+  const safeBytes = '<main><h1>Safe after unknown commit outcome</h1></main>';
+  const logFailureArm = path.join(root, 'arm-log-failure');
+  const logFailureObserved = path.join(root, 'log-failure-observed');
+  const wrapperPath = path.join(binDir, 'git');
+  const realGit = (await execFileAsync('which', ['git'])).stdout.trim();
+  await fs.mkdir(path.dirname(path.join(worldDir, relativePath)), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(path.join(worldDir, relativePath), originalBytes);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'unknown outcome baseline'], { cwd: worldDir });
+  const baselineHead = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir })).stdout.trim();
+  await fs.writeFile(wrapperPath, `#!/bin/sh
+if [ "$1" = "log" ] && [ -f "$AIBUILDS_GIT_LOG_FAILURE_ARM" ] && [ ! -f "$AIBUILDS_GIT_LOG_FAILURE_OBSERVED" ]; then
+  : > "$AIBUILDS_GIT_LOG_FAILURE_OBSERVED"
+  echo "forced post-commit log/hash association failure" >&2
+  exit 76
+fi
+exec "$AIBUILDS_REAL_GIT" "$@"
+`);
+  await fs.chmod(wrapperPath, 0o755);
+  const server = await startIsolatedServer(t, {
+    worldDir, dataDir, backupDir,
+    extraEnv: {
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      AIBUILDS_REAL_GIT: realGit,
+      AIBUILDS_GIT_LOG_FAILURE_ARM: logFailureArm,
+      AIBUILDS_GIT_LOG_FAILURE_OBSERVED: logFailureObserved,
+    },
+  });
+  await fs.writeFile(logFailureArm, 'armed');
+
+  const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'UnknownOutcomeAgent', action: 'edit', file_path: relativePath,
+      content: privateBytes, message: 'PRIVATE_UNKNOWN_OUTCOME_FAILURE',
+    }),
+  });
+  assert.equal(failed.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(logFailureObserved, 'utf8'), '');
+  const sanitizedHead = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir })).stdout.trim();
+  assert.notEqual(sanitizedHead, baselineHead, 'the successful commit outcome must be detected and compensated');
+  assert.equal(
+    (await execFileAsync('git', ['show', `HEAD:${relativePath}`], { cwd: worldDir })).stdout.trim(),
+    originalBytes,
+  );
+  assert.match(
+    (await execFileAsync('git', ['log', '-1', '--pretty=%s'], { cwd: worldDir })).stdout.trim(),
+    /^rollback: unfinished pages\/unknown-outcome\.html$/,
+  );
+  assert.equal(await fs.readFile(path.join(worldDir, relativePath), 'utf8'), originalBytes);
+  let moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(Object.keys(moderationState.gitRepairs || {}).length, 0);
+
+  const safe = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'SafeUnknownOutcomeAgent', action: 'edit', file_path: relativePath,
+      content: safeBytes, message: 'SAFE_AFTER_UNKNOWN_OUTCOME',
+    }),
+  });
+  assert.equal(safe.response.status, 200, server.logs.join(''));
+  const diff = await jsonRequest(server.baseUrl, `/api/contributions/${safe.body.contribution.id}/diff`);
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /Safe after unknown commit outcome/);
+  assert.doesNotMatch(diff.body.diff || '', /PRIVATE_UNKNOWN_COMMIT_OUTCOME|PRIVATE_UNKNOWN_OUTCOME_FAILURE/);
+  moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
+  assert.equal(Object.keys(moderationState.gitRepairs || {}).length, 0);
+  await server.stop();
+});
+
+test('failed WAL-clear persistence keeps the global barrier armed before path B can commit', async (t) => {
+  // Mutation caught: clearing only the in-memory marker before its save lets B bypass durable WAL A.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-durable-clear-barrier-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const binDir = path.join(root, 'bin');
+  const pathA = 'pages/durable-clear-a.html';
+  const pathB = 'pages/durable-clear-b.html';
+  const originalA = '<main><h1>Durable clear A baseline</h1></main>';
+  const originalB = '<main><h1>Durable clear B baseline</h1></main>';
+  const privateA = '<main><h1>PRIVATE_DURABLE_CLEAR_A</h1></main>';
+  const safeB = '<main><h1>Safe B after durable clear repair</h1></main>';
+  const persistenceArm = path.join(root, 'arm-empty-repair-save-failure');
+  const clearFailureObserved = path.join(root, 'empty-repair-save-failure-observed');
+  const logFailureObserved = path.join(root, 'log-failure-observed');
+  const bCommitObserved = path.join(root, 'path-b-commit-observed');
+  const preloadPath = path.join(root, 'fail-empty-repair-save.cjs');
+  const wrapperPath = path.join(binDir, 'git');
+  const realGit = (await execFileAsync('which', ['git'])).stdout.trim();
+  await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.mkdir(binDir, { recursive: true });
+  await fs.writeFile(path.join(worldDir, pathA), originalA);
+  await fs.writeFile(path.join(worldDir, pathB), originalB);
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'durable clear baseline'], { cwd: worldDir });
+  await fs.writeFile(preloadPath, `
+    const fs = require('node:fs');
+    const promises = fs.promises;
+    const originalRename = promises.rename.bind(promises);
+    promises.rename = async function failEmptyRepairSave(source, target) {
+      if (fs.existsSync(process.env.AIBUILDS_CLEAR_PERSISTENCE_ARM) &&
+          !fs.existsSync(process.env.AIBUILDS_PATH_B_COMMIT_OBSERVED) &&
+          String(target) === process.env.AIBUILDS_MODERATION_TARGET) {
+        const snapshot = JSON.parse(fs.readFileSync(source, 'utf8'));
+        const repairs = snapshot.gitRepairs || {};
+        if (!Object.hasOwn(repairs, process.env.AIBUILDS_REPAIR_PATH_A) &&
+            Object.keys(repairs).length === 0) {
+          fs.writeFileSync(process.env.AIBUILDS_CLEAR_FAILURE_OBSERVED, 'failed');
+          throw Object.assign(new Error('forced empty repair-registry save failure'), { code: 'EIO' });
+        }
+      }
+      return originalRename(source, target);
+    };
+  `);
+  await fs.writeFile(wrapperPath, `#!/bin/sh
+if [ "$1" = "log" ] && [ ! -f "$AIBUILDS_GIT_LOG_FAILURE_OBSERVED" ]; then
+  : > "$AIBUILDS_GIT_LOG_FAILURE_OBSERVED"
+  echo "forced post-commit log association failure" >&2
+  exit 76
+fi
+if [ "$1" = "commit" ]; then
+  case "$*" in
+    *"$AIBUILDS_REPAIR_PATH_B"*) : > "$AIBUILDS_PATH_B_COMMIT_OBSERVED" ;;
+  esac
+fi
+exec "$AIBUILDS_REAL_GIT" "$@"
+`);
+  await fs.chmod(wrapperPath, 0o755);
+  const server = await startIsolatedServer(t, {
+    worldDir, dataDir, backupDir,
+    extraEnv: {
+      NODE_OPTIONS: `--require=${preloadPath}`,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      AIBUILDS_REAL_GIT: realGit,
+      AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
+      AIBUILDS_CLEAR_PERSISTENCE_ARM: persistenceArm,
+      AIBUILDS_CLEAR_FAILURE_OBSERVED: clearFailureObserved,
+      AIBUILDS_GIT_LOG_FAILURE_OBSERVED: logFailureObserved,
+      AIBUILDS_REPAIR_PATH_A: pathA,
+      AIBUILDS_REPAIR_PATH_B: pathB,
+      AIBUILDS_PATH_B_COMMIT_OBSERVED: bCommitObserved,
+    },
+  });
+  await fs.writeFile(persistenceArm, 'armed');
+
+  const failedA = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'DurableClearAAgent', action: 'edit', file_path: pathA,
+      content: privateA, message: 'PRIVATE_DURABLE_CLEAR_FAILURE',
+    }),
+  });
+  assert.equal(failedA.response.status, 500, server.logs.join(''));
+  assert.equal(await fs.readFile(clearFailureObserved, 'utf8'), 'failed');
+  const sanitizedHead = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir })).stdout.trim();
+  assert.equal((await execFileAsync('git', ['show', `HEAD:${pathA}`], { cwd: worldDir })).stdout.trim(), originalA);
+  assert.ok(JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8')).gitRepairs?.[pathA]);
+
+  const blockedB = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'BlockedDurableClearBAgent', action: 'edit', file_path: pathB,
+      content: safeB, message: 'BLOCKED_BY_DURABLE_CLEAR_A',
+    }),
+  });
+  assert.equal(blockedB.response.status, 500, server.logs.join(''));
+  assert.equal((await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worldDir })).stdout.trim(), sanitizedHead);
+  assert.equal(await fs.readFile(path.join(worldDir, pathB), 'utf8'), originalB);
+  await assert.rejects(fs.access(bCommitObserved), error => error.code === 'ENOENT');
+
+  await fs.rm(persistenceArm, { force: true });
+  const publishedB = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'SafeDurableClearBAgent', action: 'edit', file_path: pathB,
+      content: safeB, message: 'SAFE_AFTER_DURABLE_CLEAR_REPAIR',
+    }),
+  });
+  assert.equal(publishedB.response.status, 200, server.logs.join(''));
+  const diff = await jsonRequest(
+    server.baseUrl,
+    `/api/contributions/${publishedB.body.contribution.id}/diff`,
+  );
+  assert.equal(diff.response.status, 200);
+  assert.match(diff.body.diff || '', /Safe B after durable clear repair/);
+  assert.doesNotMatch(diff.body.diff || '', /PRIVATE_DURABLE_CLEAR_A|PRIVATE_DURABLE_CLEAR_FAILURE/);
+  assert.equal((await execFileAsync('git', ['show', `HEAD:${pathA}`], { cwd: worldDir })).stdout.trim(), originalA);
+  assert.equal(Object.keys(JSON.parse(
+    await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'),
+  ).gitRepairs || {}).length, 0);
+  await server.stop();
+});
+
+test('WAL integrity hashes the exact non-UTF-8 working-file preimage bytes', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-raw-wal-hash-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  const relativePath = 'misc/raw-preimage.txt';
+  const replacement = 'safe text after a raw byte preimage\n';
+  await fs.mkdir(path.dirname(path.join(worldDir, relativePath)), { recursive: true });
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(path.join(worldDir, relativePath), Buffer.from([0xff, 0x00, 0x61, 0x0a]));
+  await fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [] }));
+  await execFileAsync('git', ['init'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
+  await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
+  await execFileAsync('git', ['add', '.'], { cwd: worldDir });
+  await execFileAsync('git', ['commit', '-m', 'raw byte preimage baseline'], { cwd: worldDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+
+  const result = await jsonRequest(server.baseUrl, '/api/contribute', {
+    method: 'POST', headers: await challengeHeaders(server.baseUrl),
+    body: JSON.stringify({
+      agent_name: 'RawPreimageAgent', action: 'edit', file_path: relativePath,
+      content: replacement, message: 'replace non-UTF-8 preimage safely',
+    }),
+  });
+  assert.equal(result.response.status, 200, server.logs.join(''));
+  assert.equal(await fs.readFile(path.join(worldDir, relativePath), 'utf8'), replacement);
+  assert.equal(Object.keys(JSON.parse(
+    await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'),
+  ).gitRepairs || {}).length, 0);
+  await server.stop();
+});
+
 test('unfinished correction restores its exact pretransaction moderation boundary on restart', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-repair-moderation-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -2087,9 +2445,14 @@ test('failed repair-preimage persistence cannot discard the exact moderation rol
     gitHash: null,
     status: 'armed',
     contributionId: 'missing-preimage-transaction',
+    expectedGitSubject: `[InterruptedPrivateAgent] edit: ${relativePath}`,
     publicationState: { quarantine: null, approval: null },
     agentIps: [[removedIpAgent, removedIp]],
-    fileState: { existed: true, bytesBase64: Buffer.from(safeBytes).toString('base64') },
+    fileState: {
+      existed: true,
+      bytesBase64: Buffer.from(safeBytes).toString('base64'),
+      sha256: contentHash(safeBytes),
+    },
     gitPathState: {
       head: originalHead,
       treeEntry: { mode: treeMatch[1], hash: treeMatch[2] },

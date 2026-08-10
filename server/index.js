@@ -395,6 +395,9 @@ async function snapshotContributionTransaction({ fullPath, filePath, agentName, 
     if (error.code !== 'ENOENT') throw error;
     fileExisted = false;
   }
+  if (fileBytes && fileBytes.length > MAX_FILE_SIZE) {
+    throw new Error(`Existing file exceeds the ${MAX_FILE_SIZE}-byte durable rollback limit`);
+  }
   const quarantine = moderation.listQuarantined().find(record => record.filePath === filePath);
   const approval = moderation.serializeModeration().moderation.approvedFiles[filePath];
   const gitPathState = await snapshotContributionGitPath(filePath);
@@ -554,6 +557,9 @@ async function compensateContributionGit(transaction) {
     const currentTreeEntry = parseHeadTreeEntry(
       await runGitFile(['ls-tree', currentHead, '--', literalGitPathspec(transaction.filePath)]),
     );
+    const currentSubject = (await runGitFile(['show', '-s', '--format=%s', currentHead])).trim();
+    const headHasExpectedTransaction = currentHead !== transaction.gitPathState.head &&
+      currentSubject === transaction.expectedGitSubject;
     const gitIndexPath = (await runGitFile(['rev-parse', '--git-path', 'index'])).trim();
     const resolvedIndexPath = path.isAbsolute(gitIndexPath)
       ? gitIndexPath
@@ -561,7 +567,7 @@ async function compensateContributionGit(transaction) {
     let temporaryIndex = null;
     const subject = `rollback: ${transaction.gitHash || 'unfinished'} ${transaction.filePath}`;
     try {
-      if (JSON.stringify(currentTreeEntry) !== JSON.stringify(treeEntry)) {
+      if (JSON.stringify(currentTreeEntry) !== JSON.stringify(treeEntry) || headHasExpectedTransaction) {
         temporaryIndex = path.join(
           path.dirname(resolvedIndexPath),
           `aibuilds-rollback-index-${randomUUID()}`,
@@ -599,7 +605,6 @@ async function compensateContributionGit(transaction) {
 }
 
 async function restoreGitRepairWorkingState(repair) {
-  if (!repair.fileState) return;
   const fullPath = await resolveWorldWriteFile(repair.filePath, {
     createParents: repair.fileState.existed,
   });
@@ -695,11 +700,38 @@ async function repairRequiredGitPath(filePath) {
   return true;
 }
 
+// HEAD and the real index are repository-global, so every World Git mutation must cross one
+// all-WAL barrier while holding CONTRIBUTION_STATE_LOCK. A target-local repair is insufficient:
+// path B would otherwise commit atop path A's unresolved private HEAD.
+async function repairAllRequiredGitPaths() {
+  await consumePendingGitRepairAgentIps();
+  const repairs = moderation.listGitRepairs()
+    .sort((left, right) => left.filePath.localeCompare(right.filePath));
+  for (const repair of repairs) {
+    const releaseMutation = await acquireWorldMutation(repair.filePath);
+    try {
+      if (!moderation.isGitRepairRequired(repair.filePath)) {
+        throw new Error(`Git repair for ${repair.filePath} is not safely repairable`);
+      }
+      await repairRequiredGitPath(repair.filePath);
+    } finally {
+      releaseMutation();
+    }
+  }
+  const remaining = moderation.listGitRepairs();
+  if (remaining.length > 0) {
+    throw new Error(`World Git mutation blocked by ${remaining.length} unresolved repair transaction(s)`);
+  }
+}
+
 async function armContributionGitRepair(transaction, contribution) {
+  const previousBytes = transaction.fileExisted ? transaction.fileBytes : Buffer.alloc(0);
+  const expectedGitSubject = contributionGitSubject(contribution);
   const repair = {
     filePath: transaction.filePath,
     gitHash: null,
     contributionId: contribution.id,
+    expectedGitSubject,
     publicationState: {
       quarantine: transaction.quarantine,
       approval: transaction.approval || null,
@@ -707,7 +739,8 @@ async function armContributionGitRepair(transaction, contribution) {
     agentIps: transaction.agentIps,
     fileState: {
       existed: transaction.fileExisted,
-      bytesBase64: transaction.fileExisted ? transaction.fileBytes.toString('base64') : null,
+      bytesBase64: previousBytes.toString('base64'),
+      sha256: crypto.createHash('sha256').update(previousBytes).digest('hex'),
     },
     gitPathState: transaction.gitPathState,
   };
@@ -716,6 +749,7 @@ async function armContributionGitRepair(transaction, contribution) {
   }
   transaction.gitRepairArmed = true;
   transaction.gitRepairRecord = repair;
+  transaction.expectedGitSubject = expectedGitSubject;
   await moderation.save();
 }
 
@@ -770,7 +804,7 @@ async function rollbackContributionTransaction(transaction) {
   else agents.delete(transaction.agentName);
 
   let gitStateRestored = false;
-  if (transaction.gitHash) {
+  if (transaction.gitRepairArmed) {
     try {
       await compensateContributionGit(transaction);
       gitStateRestored = true;
@@ -796,8 +830,13 @@ async function rollbackContributionTransaction(transaction) {
     }
   }
   if (gitStateRestored && transaction.gitRepairArmed) {
-    moderation.clearGitRepair(transaction.filePath);
-    transaction.gitRepairArmed = false;
+    try {
+      // The global barrier reads the in-memory registry. Clear it only through the durable helper,
+      // which restores a `required` marker if the no-WAL snapshot cannot be persisted.
+      await clearContributionGitRepair(transaction);
+    } catch (error) {
+      rollbackErrors.push(error);
+    }
   }
 
   try {
@@ -1919,10 +1958,10 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
   catch { return res.status(403).json({ error: 'Access denied' }); }
   const fullPath = resolveWorldPath(WORLD_DIR, relPath);
   const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
-  const releaseMutation = await acquireWorldMutation(relPath);
+  let releaseMutation;
   try {
-    await consumePendingGitRepairAgentIps();
-    await repairRequiredGitPath(relPath);
+    await repairAllRequiredGitPaths();
+    releaseMutation = await acquireWorldMutation(relPath);
     if (action === 'delete' && moderation.isQuarantined(relPath)) {
       return res.status(409).json({
         error: 'Quarantined files must be rejected through the quarantine decision endpoint.',
@@ -1956,8 +1995,11 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
     await moderation.save();
     broadcast({ type: 'moderation', data: { action, target: relPath } });
     res.json({ success: true, action, target: relPath, hidden: moderation.listHidden() });
+  } catch (error) {
+    console.error('Legacy moderation error:', error.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to moderate target' });
   } finally {
-    releaseMutation();
+    releaseMutation?.();
     releaseContributionState();
   }
 });
@@ -2054,10 +2096,10 @@ app.post('/api/admin/quarantine/approve', adminLimiter, async (req, res) => {
   try { filePath = normalizeWorldPath(requestedPath); }
   catch { return res.status(404).json({ error: 'File not found' }); }
   const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
-  const releaseMutation = await acquireWorldMutation(filePath);
+  let releaseMutation;
   try {
-    await consumePendingGitRepairAgentIps();
-    await repairRequiredGitPath(filePath);
+    await repairAllRequiredGitPaths();
+    releaseMutation = await acquireWorldMutation(filePath);
     // Re-read both metadata and bytes inside the same path transaction. An operator decision is
     // valid only for the exact record/version returned by the list route.
     const quarantineRecord = moderation.listQuarantined().find(record => record.filePath === filePath);
@@ -2098,7 +2140,7 @@ app.post('/api/admin/quarantine/approve', adminLimiter, async (req, res) => {
     console.error('Quarantine approval error:', error.message);
     if (!res.headersSent) res.status(500).json({ error: 'Failed to approve quarantine' });
   } finally {
-    releaseMutation();
+    releaseMutation?.();
     releaseContributionState();
   }
 });
@@ -2113,10 +2155,10 @@ app.post('/api/admin/quarantine/reject', adminLimiter, async (req, res) => {
   try { filePath = normalizeWorldPath(requestedPath); }
   catch { return res.status(404).json({ error: 'File not found' }); }
   const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
-  const releaseMutation = await acquireWorldMutation(filePath);
+  let releaseMutation;
   try {
-    await consumePendingGitRepairAgentIps();
-    await repairRequiredGitPath(filePath);
+    await repairAllRequiredGitPaths();
+    releaseMutation = await acquireWorldMutation(filePath);
     const quarantineRecord = moderation.listQuarantined().find(record => record.filePath === filePath);
     if (!quarantineRecord) return res.status(404).json({ error: 'Quarantine record not found' });
     const previousApproval = moderation.serializeModeration().moderation.approvedFiles[filePath];
@@ -2179,7 +2221,7 @@ app.post('/api/admin/quarantine/reject', adminLimiter, async (req, res) => {
     console.error('Quarantine rejection error:', error.message);
     if (!res.headersSent) res.status(500).json({ error: 'Failed to reject quarantine' });
   } finally {
-    releaseMutation();
+    releaseMutation?.();
     releaseContributionState();
   }
 });
@@ -3363,11 +3405,11 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
     }
 
     const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
-    const releaseMutation = await acquireWorldMutation(canonicalPath);
+    let releaseMutation;
     let transaction = null;
     try {
-    await consumePendingGitRepairAgentIps();
-    await repairRequiredGitPath(canonicalPath);
+    await repairAllRequiredGitPaths();
+    releaseMutation = await acquireWorldMutation(canonicalPath);
     if (moderation.isBanned(agent_name, req.ip)) {
       return res.status(403).json({ error: 'This agent is banned.' });
     }
@@ -3546,7 +3588,7 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       }
       throw error;
     } finally {
-      releaseMutation();
+      releaseMutation?.();
       releaseContributionState();
     }
 
@@ -3773,6 +3815,11 @@ function sanitizeForGit(str) {
   return str.replace(/[\x00-\x1f\x7f]/g, '').trim();
 }
 
+function contributionGitSubject(contribution) {
+  const agentName = sanitizeForGit(contribution.agent_name);
+  return `[${agentName}] ${contribution.action}: ${contribution.file_path}`;
+}
+
 // Helper: Git commit (serialized to prevent concurrent git operations)
 let gitPromise = Promise.resolve();
 function queueGitOperation(operation) {
@@ -3786,7 +3833,6 @@ function gitCommit(contribution, previousIndexState) {
 async function _gitCommitImpl(contribution, previousIndexState) {
   let pathWasStaged = false;
   try {
-    const agentName = sanitizeForGit(contribution.agent_name);
     const message = sanitizeForGit(contribution.message) || 'No message';
     const pathspec = literalGitPathspec(contribution.file_path);
     // An explicitly skipped path cannot be staged by `git add`. Clear only the two path flags that
@@ -3809,7 +3855,7 @@ async function _gitCommitImpl(contribution, previousIndexState) {
       await git.add(['--', pathspec]);
       pathWasStaged = true;
     }
-    const commitMessage = `[${agentName}] ${contribution.action}: ${contribution.file_path}\n\n${message}`;
+    const commitMessage = `${contributionGitSubject(contribution)}\n\n${message}`;
     if (pathWasStaged) {
       await git.raw(['commit', '--only', '--allow-empty', '-m', commitMessage, '--', pathspec]);
     } else {
@@ -3831,20 +3877,15 @@ async function _gitCommitImpl(contribution, previousIndexState) {
 }
 
 async function retryRequiredGitRepairsAtStartup() {
-  for (const repair of moderation.listGitRepairs()) {
-    const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
-    const releaseMutation = await acquireWorldMutation(repair.filePath);
-    try {
-      await consumePendingGitRepairAgentIps();
-      await repairRequiredGitPath(repair.filePath);
-    } catch (error) {
-      // Keep the durable repair record and quarantine boundary. Startup may serve other paths, but
-      // this exact path remains unavailable and every later mutation retries before doing any work.
-      console.error(`Startup Git repair failed for ${repair.filePath}:`, error.message);
-    } finally {
-      releaseMutation();
-      releaseContributionState();
-    }
+  const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
+  try {
+    await repairAllRequiredGitPaths();
+  } catch (error) {
+    // Keep every unresolved record durable. Reads may remain available for unaffected paths, but
+    // the same global barrier rejects all later World mutations until every WAL can be repaired.
+    console.error('Startup Git repair barrier failed:', error.message);
+  } finally {
+    releaseContributionState();
   }
 }
 
@@ -4023,20 +4064,32 @@ async function init() {
   }
 
   // Init git repo inside world/ directory (separate from project repo)
+  const releaseGitInitializationState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
   try {
-    await git.status();
-    console.log('World git repo already initialized');
-  } catch (e) {
-    try {
-      await git.init();
-      await git.addConfig('user.email', 'ai@aibuilds.dev');
-      await git.addConfig('user.name', 'AI BUILDS');
-      await git.add('.');
-      await git.commit('Initial commit - AI BUILDS begins');
-      console.log('Initialized new world git repo');
-    } catch (e2) {
-      console.log('World git not available:', e2.message);
+    // Startup already ran the all-WAL repair pass under this lock before the audit. Re-check the
+    // global registry while holding the same mutation boundary so a failed repair can never be
+    // followed by bootstrap Git writes, while avoiding a second recovery attempt in one startup.
+    if (moderation.listGitRepairs().length > 0) {
+      console.error('World Git initialization blocked by unresolved durable repair state');
+      return;
     }
+    try {
+      await git.status();
+      console.log('World git repo already initialized');
+    } catch (e) {
+      try {
+        await git.init();
+        await git.addConfig('user.email', 'ai@aibuilds.dev');
+        await git.addConfig('user.name', 'AI BUILDS');
+        await git.add('.');
+        await git.commit('Initial commit - AI BUILDS begins');
+        console.log('Initialized new world git repo');
+      } catch (e2) {
+        console.log('World git not available:', e2.message);
+      }
+    }
+  } finally {
+    releaseGitInitializationState();
   }
 }
 
@@ -4091,4 +4144,9 @@ init().then(() => {
 ╚═══════════════════════════════════════════════════════════╝
     `);
   });
+}, error => {
+  // Startup validation is fail-closed. In particular, never let the generic unhandled-rejection
+  // shutdown path save a partial/empty moderation snapshot over a malformed durable WAL.
+  console.error('Initialization failed:', error);
+  process.exit(1);
 });

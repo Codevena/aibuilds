@@ -2,6 +2,8 @@
 
 const path = require('path');
 const fs = require('fs').promises;
+const crypto = require('node:crypto');
+const net = require('node:net');
 const { normalizeWorldPath } = require('./world-files');
 
 // Moderation state lives in its OWN server-only file (gitignored) so agent IPs / banned IPs are
@@ -9,6 +11,25 @@ const { normalizeWorldPath } = require('./world-files');
 const DATA_DIR = process.env.AIBUILDS_DATA_DIR || path.join(__dirname, '../data');
 const MODERATION_FILE = path.join(DATA_DIR, 'moderation.json');
 const LEGACY_STATE_FILE = path.join(DATA_DIR, 'state.json');
+const MAX_REPAIR_FILE_BYTES = 500 * 1024;
+const MAX_GIT_REPAIRS = 1000;
+const MAX_TOTAL_REPAIR_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_MODERATION_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_AGENT_IPS = 5000;
+const MAX_INDEX_ENTRIES = 4;
+const MAX_WORLD_PATH_BYTES = 1024;
+const MAX_WORLD_PATH_SEGMENTS = 64;
+const MAX_WORLD_PATH_SEGMENT_BYTES = 255;
+const MAX_AGENT_NAME_BYTES = 100;
+const MAX_IP_BYTES = 64;
+const MAX_TRANSACTION_ID_BYTES = 128;
+const MAX_GIT_SUBJECT_BYTES = 2048;
+const MAX_QUARANTINE_REASONS = 16;
+const MAX_REASON_BYTES = 128;
+const MAX_TIMESTAMP_BYTES = 64;
+const GIT_OBJECT_ID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const GIT_MODE_RE = /^(?:100644|100755|120000|160000)$/;
 
 // In-memory moderation state (persisted via serializeModeration / loadModeration).
 const hiddenFiles = new Set();   // normalized world-relative paths
@@ -42,26 +63,75 @@ function normalizePublicationPath(p) {
   catch { return ''; }
 }
 
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasExactKeys(value, expected) {
+  if (!isPlainObject(value)) return false;
+  const actual = Object.keys(value).sort();
+  const expectedKeys = [...expected].sort();
+  return actual.length === expectedKeys.length &&
+    actual.every((key, index) => key === expectedKeys[index]);
+}
+
+function isBoundedString(value, maxBytes, { allowEmpty = false } = {}) {
+  if (typeof value !== 'string' || (!allowEmpty && value.length === 0) ||
+      Buffer.byteLength(value, 'utf8') > maxBytes || /[\x00-\x1f\x7f]/.test(value)) return false;
+  // Reject unpaired UTF-16 surrogates: Node would otherwise map them to U+FFFD, letting two
+  // distinct moderation/lock keys resolve to the same filesystem bytes.
+  return Buffer.from(value, 'utf8').toString('utf8') === value;
+}
+
+function strictPublicationPath(value) {
+  if (!isBoundedString(value, MAX_WORLD_PATH_BYTES)) return '';
+  const segments = value.split('/');
+  if (segments.length > MAX_WORLD_PATH_SEGMENTS ||
+      segments.some(segment => Buffer.byteLength(segment, 'utf8') > MAX_WORLD_PATH_SEGMENT_BYTES)) return '';
+  const normalized = normalizePublicationPath(value);
+  return normalized === value ? normalized : '';
+}
+
+function normalizeCanonicalBase64(value) {
+  const maxEncodedLength = Math.ceil(MAX_REPAIR_FILE_BYTES / 3) * 4;
+  if (typeof value !== 'string' || value.length > maxEncodedLength ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return null;
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.length > MAX_REPAIR_FILE_BYTES || bytes.toString('base64') !== value) return null;
+  return bytes;
+}
+
+function canonicalBase64ByteLength(value) {
+  if (!value) return 0;
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
+}
+
 function normalizeGitEntry(entry, { allowStage = false } = {}) {
-  if (!entry || typeof entry !== 'object' || !/^[0-7]{6}$/.test(entry.mode || '') ||
-      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(entry.hash || '')) return null;
+  const expectedKeys = allowStage ? ['hash', 'mode', 'stage'] : ['hash', 'mode'];
+  if (!hasExactKeys(entry, expectedKeys) || !GIT_MODE_RE.test(entry.mode) ||
+      !GIT_OBJECT_ID_RE.test(entry.hash)) return null;
   if (!allowStage) return { mode: entry.mode, hash: entry.hash };
   if (!Number.isInteger(entry.stage) || entry.stage < 0 || entry.stage > 3) return null;
   return { mode: entry.mode, hash: entry.hash, stage: entry.stage };
 }
 
 function normalizeGitRepairPublicationState(filePath, state) {
-  if (state === undefined || state === null) return null;
-  if (typeof state !== 'object' ||
-      (state.approval !== null && typeof state.approval !== 'string')) return null;
+  if (state === null) return null;
+  if (!hasExactKeys(state, ['approval', 'quarantine']) ||
+      (state.approval !== null && !SHA256_RE.test(state.approval))) return null;
   let quarantine = null;
   if (state.quarantine !== null) {
     const record = state.quarantine;
-    const normalized = normalizePublicationPath(record?.filePath || filePath);
-    if (!record || typeof record !== 'object' || normalized !== filePath ||
-        typeof record.contentHash !== 'string' || !Array.isArray(record.reasons) ||
-        record.reasons.some(reason => typeof reason !== 'string') ||
-        typeof record.agentName !== 'string' || typeof record.timestamp !== 'string') return null;
+    const normalized = strictPublicationPath(record?.filePath);
+    if (!hasExactKeys(record, ['agentName', 'contentHash', 'filePath', 'reasons', 'timestamp']) ||
+        normalized !== filePath || !SHA256_RE.test(record.contentHash) ||
+        !Array.isArray(record.reasons) || record.reasons.length > MAX_QUARANTINE_REASONS ||
+        record.reasons.some(reason => !isBoundedString(reason, MAX_REASON_BYTES)) ||
+        !isBoundedString(record.agentName, MAX_AGENT_NAME_BYTES) ||
+        !isBoundedString(record.timestamp, MAX_TIMESTAMP_BYTES)) return null;
     quarantine = {
       filePath: normalized,
       contentHash: record.contentHash,
@@ -74,57 +144,74 @@ function normalizeGitRepairPublicationState(filePath, state) {
 }
 
 function normalizeGitRepairAgentIps(snapshot) {
-  if (snapshot === undefined || snapshot === null) return null;
-  if (!Array.isArray(snapshot) || snapshot.some(entry => (
+  if (snapshot === null) return null;
+  if (!Array.isArray(snapshot) || snapshot.length > MAX_AGENT_IPS || snapshot.some(entry => (
     !Array.isArray(entry) || entry.length !== 2 ||
-    typeof entry[0] !== 'string' || !entry[0] || typeof entry[1] !== 'string' || !entry[1]
+    !isBoundedString(entry[0], MAX_AGENT_NAME_BYTES) ||
+    !isBoundedString(entry[1], MAX_IP_BYTES) || net.isIP(entry[1]) === 0
   ))) return null;
+  if (new Set(snapshot.map(entry => entry[0])).size !== snapshot.length) return null;
   return snapshot.map(entry => [...entry]);
 }
 
 function normalizeGitRepair(filePath, repair, { fromDisk = false } = {}) {
-  const normalized = normalizePublicationPath(repair?.filePath || filePath);
+  const normalizedKey = strictPublicationPath(filePath);
+  const normalized = strictPublicationPath(repair?.filePath);
   const gitPathState = repair?.gitPathState;
   const indexState = gitPathState?.indexState;
   const rawFileState = repair?.fileState;
-  const fileState = rawFileState === undefined || rawFileState === null
-    ? null
-    : {
-        existed: rawFileState.existed === true,
-        bytesBase64: rawFileState.existed === true ? rawFileState.bytesBase64 : null,
-      };
-  const gitHash = repair?.gitHash === null || repair?.gitHash === undefined
-    ? null
-    : repair.gitHash;
-  const storedStatus = repair?.status || 'required';
+  const fileBytes = hasExactKeys(rawFileState, ['bytesBase64', 'existed', 'sha256'])
+    ? normalizeCanonicalBase64(rawFileState.bytesBase64)
+    : null;
+  const fileState = fileBytes === null ? null : {
+    existed: rawFileState.existed,
+    bytesBase64: rawFileState.bytesBase64,
+    sha256: rawFileState.sha256,
+  };
+  const gitHash = repair?.gitHash;
+  const storedStatus = repair?.status;
   const status = fromDisk ? 'required' : storedStatus;
-  const contributionId = repair?.contributionId === undefined || repair?.contributionId === null
-    ? null
-    : repair.contributionId;
+  const contributionId = repair?.contributionId;
+  const expectedGitSubject = repair?.expectedGitSubject;
   const publicationState = normalizeGitRepairPublicationState(normalized, repair?.publicationState);
   const agentIps = normalizeGitRepairAgentIps(repair?.agentIps);
-  if (!normalized || !repair || typeof repair !== 'object' ||
-      (gitHash !== null && !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(gitHash)) ||
+  if (!hasExactKeys(repair, [
+    'agentIps', 'contributionId', 'expectedGitSubject', 'filePath', 'fileState', 'gitHash',
+    'gitPathState', 'publicationState', 'status',
+  ]) || !normalizedKey || normalized !== normalizedKey ||
+      (gitHash !== null && !GIT_OBJECT_ID_RE.test(gitHash)) ||
       !['armed', 'required'].includes(storedStatus) ||
-      (contributionId !== null && (typeof contributionId !== 'string' || !contributionId)) ||
-      (repair.publicationState !== undefined && repair.publicationState !== null && !publicationState) ||
-      (repair.agentIps !== undefined && repair.agentIps !== null && !agentIps) ||
-      (rawFileState !== undefined && rawFileState !== null &&
-        (typeof rawFileState !== 'object' || typeof rawFileState.existed !== 'boolean' ||
-          (rawFileState.existed && typeof rawFileState.bytesBase64 !== 'string'))) ||
-      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(gitPathState?.head || '') ||
-      !indexState || !Array.isArray(indexState.entries)) return null;
+      (contributionId !== null && !isBoundedString(contributionId, MAX_TRANSACTION_ID_BYTES)) ||
+      !isBoundedString(expectedGitSubject, MAX_GIT_SUBJECT_BYTES) ||
+      (repair.publicationState !== null && !publicationState) ||
+      (repair.agentIps !== null && !agentIps) || !fileState ||
+      typeof rawFileState.existed !== 'boolean' ||
+      (!rawFileState.existed && rawFileState.bytesBase64 !== '') ||
+      !SHA256_RE.test(rawFileState.sha256) ||
+      crypto.createHash('sha256').update(fileBytes || Buffer.alloc(0)).digest('hex') !== rawFileState.sha256 ||
+      !hasExactKeys(gitPathState, ['head', 'indexState', 'treeEntry']) ||
+      !GIT_OBJECT_ID_RE.test(gitPathState.head) ||
+      !hasExactKeys(indexState, ['assumeUnchanged', 'entries', 'skipWorktree']) ||
+      !Array.isArray(indexState.entries) || indexState.entries.length > MAX_INDEX_ENTRIES ||
+      typeof indexState.assumeUnchanged !== 'boolean' || typeof indexState.skipWorktree !== 'boolean') return null;
   const treeEntry = gitPathState.treeEntry === null
     ? null
     : normalizeGitEntry(gitPathState.treeEntry);
   if (gitPathState.treeEntry !== null && !treeEntry) return null;
   const entries = indexState.entries.map(entry => normalizeGitEntry(entry, { allowStage: true }));
   if (entries.some(entry => !entry)) return null;
+  const stages = entries.map(entry => entry.stage);
+  const hasStageZero = stages.includes(0);
+  if (new Set(stages).size !== stages.length ||
+      stages.some((stage, index) => index > 0 && stage <= stages[index - 1]) ||
+      (hasStageZero && entries.length !== 1) ||
+      (!hasStageZero && (indexState.assumeUnchanged || indexState.skipWorktree))) return null;
   return {
     filePath: normalized,
     gitHash,
     status,
     contributionId,
+    expectedGitSubject,
     publicationState,
     agentIps,
     fileState,
@@ -146,6 +233,7 @@ function cloneGitRepair(repair) {
     gitHash: repair.gitHash,
     status: repair.status,
     contributionId: repair.contributionId,
+    expectedGitSubject: repair.expectedGitSubject,
     publicationState: repair.publicationState ? {
       quarantine: repair.publicationState.quarantine
         ? { ...repair.publicationState.quarantine, reasons: [...repair.publicationState.quarantine.reasons] }
@@ -153,7 +241,7 @@ function cloneGitRepair(repair) {
       approval: repair.publicationState.approval,
     } : null,
     agentIps: repair.agentIps ? repair.agentIps.map(entry => [...entry]) : null,
-    fileState: repair.fileState ? { ...repair.fileState } : null,
+    fileState: { ...repair.fileState },
     gitPathState: {
       head: repair.gitPathState.head,
       treeEntry: repair.gitPathState.treeEntry ? { ...repair.gitPathState.treeEntry } : null,
@@ -167,18 +255,29 @@ function cloneGitRepair(repair) {
 }
 
 function loadModeration(state) {
-  hiddenFiles.clear(); bannedAgents.clear(); bannedIps.clear(); agentIps.clear();
-  quarantinedFiles.clear(); approvedFiles.clear(); gitRepairs.clear();
+  // Validate into isolated collections first. A malformed durable repair must never partially
+  // replace live security state or become a truncated snapshot through a later save.
+  const nextHiddenFiles = new Set();
+  const nextBannedAgents = new Set();
+  const nextBannedIps = new Set();
+  const nextAgentIps = new Map();
+  const nextQuarantinedFiles = new Map();
+  const nextApprovedFiles = new Map();
+  const nextGitRepairs = new Map();
+  let totalRepairFileBytes = 0;
   const m = (state && state.moderation) || {};
-  for (const p of m.hiddenFiles || []) hiddenFiles.add(normalizePath(p));
-  for (const a of m.bannedAgents || []) bannedAgents.add(a);
-  for (const ip of m.bannedIps || []) bannedIps.add(ip);
+  for (const p of m.hiddenFiles || []) nextHiddenFiles.add(normalizePath(p));
+  for (const a of m.bannedAgents || []) nextBannedAgents.add(a);
+  for (const ip of m.bannedIps || []) nextBannedIps.add(ip);
   const ips = (state && state.agentIps) || {};
-  for (const [name, ip] of Object.entries(ips)) agentIps.set(name, ip);
+  if (!isPlainObject(ips)) throw new Error('Invalid persisted agent IP state');
+  const normalizedAgentIps = normalizeGitRepairAgentIps(Object.entries(ips));
+  if (!normalizedAgentIps) throw new Error('Invalid persisted agent IP state');
+  for (const [name, ip] of normalizedAgentIps) nextAgentIps.set(name, ip);
   for (const [filePath, record] of Object.entries(m.quarantinedFiles || {})) {
     const normalized = normalizePublicationPath(record?.filePath || filePath);
     if (!normalized || !record || typeof record !== 'object' || typeof record.contentHash !== 'string') continue;
-    quarantinedFiles.set(normalized, {
+    nextQuarantinedFiles.set(normalized, {
       filePath: normalized,
       contentHash: record.contentHash,
       reasons: Array.isArray(record.reasons) ? record.reasons.filter(reason => typeof reason === 'string') : [],
@@ -188,15 +287,35 @@ function loadModeration(state) {
   }
   for (const [filePath, contentHash] of Object.entries(m.approvedFiles || {})) {
     const normalized = normalizePublicationPath(filePath);
-    if (normalized && typeof contentHash === 'string' && contentHash) approvedFiles.set(normalized, contentHash);
+    if (normalized && typeof contentHash === 'string' && contentHash) nextApprovedFiles.set(normalized, contentHash);
   }
-  for (const [filePath, repair] of Object.entries((state && state.gitRepairs) || {})) {
+  const persistedRepairs = state && Object.hasOwn(state, 'gitRepairs') ? state.gitRepairs : {};
+  if (!isPlainObject(persistedRepairs)) throw new Error('Invalid durable Git repair registry');
+  const repairEntries = Object.entries(persistedRepairs);
+  if (repairEntries.length > MAX_GIT_REPAIRS) {
+    throw new Error(`Durable Git repair registry exceeds ${MAX_GIT_REPAIRS} records`);
+  }
+  for (const [filePath, repair] of repairEntries) {
     // A persisted write-ahead marker means the previous process did not durably finish the Git
-    // transaction. Treat both legacy records and unfinished `armed` records as repair-required.
+    // transaction. Treat both unfinished `armed` and explicit `required` records as repair-required.
     const normalized = normalizeGitRepair(filePath, repair, { fromDisk: true });
     if (!normalized) throw new Error(`Invalid durable Git repair state for ${filePath}`);
-    gitRepairs.set(normalized.filePath, normalized);
+    totalRepairFileBytes += canonicalBase64ByteLength(normalized.fileState.bytesBase64);
+    if (totalRepairFileBytes > MAX_TOTAL_REPAIR_FILE_BYTES) {
+      throw new Error(`Durable Git repair preimages exceed ${MAX_TOTAL_REPAIR_FILE_BYTES} bytes`);
+    }
+    nextGitRepairs.set(normalized.filePath, normalized);
   }
+
+  hiddenFiles.clear(); bannedAgents.clear(); bannedIps.clear(); agentIps.clear();
+  quarantinedFiles.clear(); approvedFiles.clear(); gitRepairs.clear();
+  for (const value of nextHiddenFiles) hiddenFiles.add(value);
+  for (const value of nextBannedAgents) bannedAgents.add(value);
+  for (const value of nextBannedIps) bannedIps.add(value);
+  for (const entry of nextAgentIps) agentIps.set(...entry);
+  for (const entry of nextQuarantinedFiles) quarantinedFiles.set(...entry);
+  for (const entry of nextApprovedFiles) approvedFiles.set(...entry);
+  for (const entry of nextGitRepairs) gitRepairs.set(...entry);
 }
 
 function serializeModeration() {
@@ -219,17 +338,30 @@ function serializeModeration() {
 // ---- file persistence (separate from state.json) ----
 let saveChain = Promise.resolve();
 
+function moderationFileTooLargeError() {
+  const error = new Error(`Moderation state exceeds ${MAX_MODERATION_FILE_BYTES} bytes`);
+  error.code = 'ERR_MODERATION_FILE_TOO_LARGE';
+  return error;
+}
+
+async function readModerationFile() {
+  const stats = await fs.stat(MODERATION_FILE);
+  if (stats.size > MAX_MODERATION_FILE_BYTES) throw moderationFileTooLargeError();
+  const source = await fs.readFile(MODERATION_FILE, 'utf-8');
+  if (Buffer.byteLength(source, 'utf8') > MAX_MODERATION_FILE_BYTES) {
+    throw moderationFileTooLargeError();
+  }
+  return source;
+}
+
 // Load moderation state from its own file. Missing file => empty state, with a one-time migration
 // from older builds that stored moderation inside data/state.json.
 async function load() {
   try {
-    loadModeration(JSON.parse(await fs.readFile(MODERATION_FILE, 'utf-8')));
+    loadModeration(JSON.parse(await readModerationFile()));
     return;
   } catch (e) {
-    if (e.code !== 'ENOENT') {
-      loadModeration({});
-      throw e;
-    }
+    if (e.code !== 'ENOENT') throw e;
   }
   // One-time migration: pull moderation/agentIps out of a legacy state.json if present. Reading
   // an absent/invalid legacy file is optional; once valid security state is loaded, its required
@@ -242,7 +374,6 @@ async function load() {
       loadModeration({});
       return;
     }
-    loadModeration({});
     throw e;
   }
   if (legacy && (legacy.moderation || legacy.agentIps)) {
@@ -257,16 +388,25 @@ async function load() {
 // Persist moderation state atomically, serialized via a mutex to prevent interleaved writes.
 function save() {
   const snapshot = serializeModeration();
-  const operation = saveChain.then(() => _saveImpl(snapshot));
+  let serialized;
+  try {
+    serialized = JSON.stringify(snapshot, null, 2);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_MODERATION_FILE_BYTES) {
+      throw moderationFileTooLargeError();
+    }
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  const operation = saveChain.then(() => _saveImpl(serialized));
   // Keep the mutex usable after a failed operation, but return the original rejecting promise so
   // startup and security-critical routes cannot mistake a logged write failure for durability.
   saveChain = operation.catch(() => {});
   return operation;
 }
-async function _saveImpl(snapshot) {
+async function _saveImpl(serialized) {
   await fs.mkdir(path.dirname(MODERATION_FILE), { recursive: true });
   const tmp = MODERATION_FILE + '.tmp';
-  await fs.writeFile(tmp, JSON.stringify(snapshot, null, 2));
+  await fs.writeFile(tmp, serialized);
   await fs.rename(tmp, MODERATION_FILE);
 }
 
@@ -322,6 +462,14 @@ function setGitRepair(filePath, repair, status) {
   const normalized = normalizeGitRepair(filePath, { ...repair, status });
   if (!normalized) return false;
   const previous = gitRepairs.get(normalized.filePath);
+  if (!previous && gitRepairs.size >= MAX_GIT_REPAIRS) return false;
+  let totalRepairFileBytes = canonicalBase64ByteLength(normalized.fileState.bytesBase64);
+  for (const [existingPath, existing] of gitRepairs) {
+    if (existingPath !== normalized.filePath) {
+      totalRepairFileBytes += canonicalBase64ByteLength(existing.fileState.bytesBase64);
+    }
+  }
+  if (totalRepairFileBytes > MAX_TOTAL_REPAIR_FILE_BYTES) return false;
   if (previous && JSON.stringify(previous) === JSON.stringify(normalized)) return false;
   gitRepairs.set(normalized.filePath, normalized);
   return true;
@@ -341,14 +489,13 @@ function getGitRepair(filePath) {
 }
 function listGitRepairs() { return Array.from(gitRepairs.values(), cloneGitRepair); }
 
-const MAX_AGENT_IPS = 5000; // bound the IP map (GDPR data-minimization); evict oldest (LRU-ish)
-
 function isBanned(agentName, ip) {
   return (typeof agentName === 'string' && bannedAgents.has(agentName)) ||
          (typeof ip === 'string' && bannedIps.has(ip));
 }
 function recordAgentIp(agentName, ip) {
-  if (typeof agentName === 'string' && agentName && typeof ip === 'string' && ip) {
+  if (isBoundedString(agentName, MAX_AGENT_NAME_BYTES) &&
+      isBoundedString(ip, MAX_IP_BYTES) && net.isIP(ip) !== 0) {
     if (agentIps.has(agentName)) agentIps.delete(agentName); // refresh insertion order (LRU)
     agentIps.set(agentName, ip);
     if (agentIps.size > MAX_AGENT_IPS) agentIps.delete(agentIps.keys().next().value);
@@ -357,20 +504,15 @@ function recordAgentIp(agentName, ip) {
 function resolveAgentIp(agentName) { return agentIps.get(agentName) || null; }
 function snapshotAgentIps() { return Array.from(agentIps.entries()); }
 function restoreAgentIps(snapshot) {
-  if (!Array.isArray(snapshot)) return false;
+  const normalized = normalizeGitRepairAgentIps(snapshot);
+  if (!normalized) return false;
   agentIps.clear();
-  for (const entry of snapshot) {
-    if (!Array.isArray(entry) || entry.length !== 2) continue;
-    const [agentName, ip] = entry;
-    if (typeof agentName === 'string' && agentName && typeof ip === 'string' && ip) {
-      agentIps.set(agentName, ip);
-    }
-  }
+  for (const [agentName, ip] of normalized) agentIps.set(agentName, ip);
   return true;
 }
 function restoreAgentIp(agentName, ip) {
-  if (typeof agentName !== 'string' || !agentName) return false;
-  if (typeof ip === 'string' && ip) {
+  if (!isBoundedString(agentName, MAX_AGENT_NAME_BYTES)) return false;
+  if (isBoundedString(ip, MAX_IP_BYTES) && net.isIP(ip) !== 0) {
     agentIps.delete(agentName);
     agentIps.set(agentName, ip);
     return true;
