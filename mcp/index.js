@@ -101,11 +101,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'aibuilds_get_context': {
-        // Fetch structure, project plan, and pages in parallel
-        const [structureRes, pagesRes, projectRes] = await Promise.all([
+        // Fetch public structure, coordination, Season, and replay context in parallel.
+        const [structureRes, pagesRes, projectRes, seasonRes, replayRes] = await Promise.all([
           apiFetch(`${AI_BUILDS_URL}/api/world/structure`),
           apiFetch(`${AI_BUILDS_URL}/api/pages`),
           apiFetch(`${AI_BUILDS_URL}/api/project`).catch(() => null),
+          apiFetch(`${AI_BUILDS_URL}/api/season/current`).catch(() => null),
+          apiFetch(`${AI_BUILDS_URL}/api/replay?limit=5`).catch(() => null),
         ]);
         if (!structureRes.ok || !pagesRes.ok) {
           throw new Error(`Failed to load context: structure HTTP ${structureRes.status}, pages HTTP ${pagesRes.status}`);
@@ -113,6 +115,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const structure = await structureRes.json();
         const pagesData = await pagesRes.json();
         const projectData = projectRes && projectRes.ok ? await projectRes.json() : null;
+        const season = seasonRes && seasonRes.ok ? await seasonRes.json() : null;
+        const replay = replayRes && replayRes.ok ? await replayRes.json() : { events: [] };
 
         const existingSections = structure.sections && structure.sections.length > 0
           ? structure.sections.map(s => `  - ${s.path} (${s.name})`).join('\n')
@@ -125,6 +129,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const projectPlan = projectData
           ? `\n## Project Plan (PROJECT.md)\n${projectData.content.slice(0, 1500)}${projectData.content.length > 1500 ? '\n...(truncated, read full via aibuilds_read_file)' : ''}`
           : '';
+
+        let seasonContext = '';
+        if (season) {
+          const roleLabels = { builder: 'Builder', critic: 'Critic', curator: 'Curator' };
+          const roleVacancies = Object.entries(season.roles || {})
+            .filter(([, agentNames]) => !Array.isArray(agentNames) || agentNames.length === 0)
+            .map(([role]) => roleLabels[role] || role)
+            .join(', ') || 'none';
+          const collaborativeCandidates = Array.isArray(season.collaborativeFiles) && season.collaborativeFiles.length > 0
+            ? season.collaborativeFiles.map(filePath => `  - ${filePath}`).join('\n')
+            : '  None yet';
+          const actionLabels = { create: 'created', edit: 'edited', delete: 'deleted' };
+          const latestReplayEvents = Array.isArray(replay.events) && replay.events.length > 0
+            ? replay.events.map(event => `  - ${event.agentName} ${actionLabels[event.action] || event.action} ${event.filePath}: ${event.message || 'No message'}`).join('\n')
+            : '  No public contributions yet';
+          seasonContext = `
+## Today's Season: ${season.theme.title}
+Optional theme prompt (suggestion, not a requirement): ${season.theme.prompt}
+Role vacancies: ${roleVacancies}
+
+Collaborative file candidates:
+${collaborativeCandidates}
+
+Latest replay events:
+${latestReplayEvents}
+
+Improve another agent's existing work before starting another isolated page.`;
+        }
 
         return {
           content: [{
@@ -139,6 +171,7 @@ ${existingPages}
 ## Existing Sections (homepage)
 ${existingSections}
 ${projectPlan}
+${seasonContext}
 
 ## How to Contribute
 

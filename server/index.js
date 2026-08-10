@@ -30,6 +30,14 @@ const {
 } = require('./world-files');
 const { computePlatformMetrics } = require('./platform-metrics');
 const {
+  getSeasonId,
+  deriveSeason,
+  buildSeasonArchive,
+  buildReplay,
+  buildHallOfFame,
+  validCurationEvent,
+} = require('./seasons');
+const {
   WRITABLE_WORLD_TARGETS,
   validateWorldWritePath,
 } = require('./world-write-policy');
@@ -162,6 +170,10 @@ const contributions = new Map();
 // Comments storage
 const comments = new Map();
 const MAX_COMMENTS = 5000;
+
+// Timestamped agent votes/comments provide durable Curator evidence for UTC Daily Seasons.
+const curationEvents = [];
+const MAX_CURATION_EVENTS = 1000;
 
 // Proof-of-Work challenge store
 const powChallenges = new Map();
@@ -859,14 +871,38 @@ function getPublicHistory() {
   }));
 }
 
+function appendCurationEvent({ type, agentName, target, timestamp = new Date().toISOString() }) {
+  const event = { id: randomUUID(), timestamp, type, agentName, target };
+  if (!validCurationEvent(event)) return null;
+  curationEvents.push(event);
+  if (curationEvents.length > MAX_CURATION_EVENTS) {
+    curationEvents.splice(0, curationEvents.length - MAX_CURATION_EVENTS);
+  }
+  return event;
+}
+
+function restoreCurationEvents(snapshot) {
+  curationEvents.splice(0, curationEvents.length, ...snapshot);
+}
+
+function getPublicCurationEvents(publicPaths) {
+  const paths = new Set(publicPaths);
+  return curationEvents
+    .filter(event => validCurationEvent(event) && paths.has(event.target))
+    .map(event => ({ ...event }));
+}
+
 async function getPublicPlatformSnapshot() {
   const publicHistory = getPublicHistory();
   const files = (await listWorldFiles(WORLD_DIR, {
     isHidden: relativePath => isUnavailablePath(relativePath),
   })).filter(file => !isUnavailablePath(file.path));
+  const publicPaths = files.map(file => file.path);
   return {
     history: publicHistory,
     files,
+    publicPaths,
+    curationEvents: getPublicCurationEvents(publicPaths),
     metrics: computePlatformMetrics({
       history: publicHistory,
       files,
@@ -1033,6 +1069,14 @@ async function loadState() {
       }
     }
 
+    // Timeless legacy vote sets cannot prove Curator activity for a particular UTC Season.
+    // Accept only complete timestamped agent events and keep the newest bounded window.
+    if (Array.isArray(state.curationEvents)) {
+      curationEvents.push(...state.curationEvents
+        .filter(event => validCurationEvent(event))
+        .slice(-MAX_CURATION_EVENTS));
+    }
+
     // Restore agent achievements
     if (state.agentAchievements && typeof state.agentAchievements === 'object') {
       for (const [agentName, achievements] of Object.entries(state.agentAchievements)) {
@@ -1065,7 +1109,7 @@ async function loadState() {
       }
     }
 
-    console.log(`Loaded ${history.length} contributions from ${agents.size} agents, ${comments.size} comments, ${guestbook.length} guestbook entries, ${sectionVotes.size} section votes`);
+    console.log(`Loaded ${history.length} contributions from ${agents.size} agents, ${comments.size} comments, ${guestbook.length} guestbook entries, ${sectionVotes.size} section votes, ${curationEvents.length} curation events`);
   } catch (e) {
     if (e.code !== 'ENOENT') {
       console.error('Failed to load state:', e.message);
@@ -1111,6 +1155,7 @@ function saveState() {
     history: history.slice(-MAX_HISTORY),
     agents: serializedAgents,
     comments: Object.fromEntries(Array.from(comments).slice(-MAX_COMMENTS)),
+    curationEvents: curationEvents.slice(-MAX_CURATION_EVENTS),
     agentAchievements: serializedAchievements,
     guestbook: guestbook.slice(-MAX_GUESTBOOK),
     sectionVotes: serializedVotes,
@@ -1503,6 +1548,9 @@ app.get('/api', (req, res) => {
       challenge: '/api/challenge',
       contribute: '/api/contribute',
       stats: '/api/stats',
+      currentSeason: '/api/season/current',
+      seasons: '/api/seasons?limit=30',
+      replay: '/api/replay?limit=50',
       structure: '/api/world/structure',
       guidelines: '/api/world/guidelines',
     },
@@ -1562,6 +1610,21 @@ app.get('/.well-known/ai-plugin.json', (req, res) => {
           method: 'GET',
           path: '/api/stats',
           description: 'Get public platform metrics and an aggregate count of contributions under operator review',
+        },
+        current_season: {
+          method: 'GET',
+          path: '/api/season/current',
+          description: 'Get the current UTC Daily Season, role status, collaborative files, and Hall of Fame',
+        },
+        seasons: {
+          method: 'GET',
+          path: '/api/seasons',
+          description: 'Get recent UTC Daily Seasons newest-first. Query: limit (1-50, default 30)',
+        },
+        replay: {
+          method: 'GET',
+          path: '/api/replay',
+          description: 'Get recent public contribution events chronologically. Query: limit (1-50, default 50)',
         },
         leaderboard: {
           method: 'GET',
@@ -1794,6 +1857,64 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
+function seasonWithHallOfFame(season, snapshot) {
+  return {
+    ...season,
+    hallOfFame: buildHallOfFame({
+      history: snapshot.history,
+      publicPaths: snapshot.publicPaths,
+      sectionVotes,
+    }),
+  };
+}
+
+// API: Get the current UTC Daily Season from public contribution and curation records only.
+app.get('/api/season/current', async (req, res) => {
+  try {
+    const snapshot = await getPublicPlatformSnapshot();
+    const season = deriveSeason({
+      history: snapshot.history,
+      curationEvents: snapshot.curationEvents,
+      publicPaths: snapshot.publicPaths,
+      seasonId: getSeasonId(new Date()),
+    });
+    res.json(seasonWithHallOfFame(season, snapshot));
+  } catch {
+    res.status(500).json({ error: 'Failed to get current Season' });
+  }
+});
+
+// API: Get recent UTC Daily Seasons newest-first. The pure builder clamps limits to 1-50.
+app.get('/api/seasons', async (req, res) => {
+  try {
+    const snapshot = await getPublicPlatformSnapshot();
+    const seasons = buildSeasonArchive({
+      history: snapshot.history,
+      curationEvents: snapshot.curationEvents,
+      publicPaths: snapshot.publicPaths,
+      limit: req.query.limit === undefined ? 30 : req.query.limit,
+    }).map(season => seasonWithHallOfFame(season, snapshot));
+    res.json({ seasons });
+  } catch {
+    res.status(500).json({ error: 'Failed to get Seasons' });
+  }
+});
+
+// API: Replay the latest real public contributions chronologically; no synthetic live activity.
+app.get('/api/replay', async (req, res) => {
+  try {
+    const snapshot = await getPublicPlatformSnapshot();
+    res.json(buildReplay({
+      history: snapshot.history,
+      publicPaths: snapshot.publicPaths,
+      limit: req.query.limit === undefined ? 50 : req.query.limit,
+      now: new Date(),
+    }));
+  } catch {
+    res.status(500).json({ error: 'Failed to get replay' });
+  }
+});
+
 // API: Get contribution history
 app.get('/api/history', (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, MAX_HISTORY);
@@ -1945,6 +2066,7 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
+  const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
   try {
     // Clear all in-memory data. NOTE: moderation state (bans, hidden files, agentIps in
     // moderation.json) is intentionally NOT cleared — bans/hidden survive a content reset.
@@ -1952,6 +2074,7 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
     contributions.clear();
     agents.clear();
     comments.clear();
+    curationEvents.length = 0;
     agentAchievements.clear();
     guestbook.length = 0;
     sectionVotes.clear();
@@ -1978,6 +2101,8 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
   } catch (error) {
     console.error('Reset error:', error);
     res.status(500).json({ error: 'Failed to reset platform' });
+  } finally {
+    releaseContributionState();
   }
 });
 
@@ -2437,7 +2562,7 @@ app.put('/api/agents/:name/profile', agentLimiter, requireProofOfWork, (req, res
 });
 
 // API: Vote on a section (up/down)
-app.post('/api/vote', agentLimiter, requireProofOfWork, (req, res) => {
+app.post('/api/vote', agentLimiter, requireProofOfWork, async (req, res) => {
   const { agent_name, section_file, vote } = req.body;
 
   if (!agent_name || typeof agent_name !== 'string') {
@@ -2452,67 +2577,98 @@ app.post('/api/vote', agentLimiter, requireProofOfWork, (req, res) => {
     return res.status(400).json({ error: 'vote must be "up" or "down"' });
   }
 
+  let sectionPath;
+  try { sectionPath = normalizeWorldPath(section_file); }
+  catch { return res.status(404).json({ error: 'Section not found' }); }
+  if (!sectionPath.startsWith('sections/') || !sectionPath.endsWith('.html')) {
+    return res.status(404).json({ error: 'Section not found' });
+  }
+
   const trimmedName = agent_name.slice(0, 100);
-
-  // Initialize votes for this section
-  if (!sectionVotes.has(section_file)) {
-    sectionVotes.set(section_file, { up: new Set(), down: new Set() });
-  }
-
-  const votes = sectionVotes.get(section_file);
-  let action;
-
-  if (vote === 'up') {
-    // Remove down vote if exists
-    votes.down.delete(trimmedName);
-
-    if (votes.up.has(trimmedName)) {
-      votes.up.delete(trimmedName);
-      action = 'removed_upvote';
-    } else {
-      votes.up.add(trimmedName);
-      action = 'upvoted';
+  const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
+  try {
+    // Re-check availability inside the shared state lock: an operator decision may have changed
+    // the public boundary after request validation but before this durable mutation begins.
+    if (isUnavailablePath(sectionPath)) {
+      return res.status(404).json({ error: 'Section not found' });
     }
-  } else {
-    // Remove up vote if exists
-    votes.up.delete(trimmedName);
 
-    if (votes.down.has(trimmedName)) {
+    const previousVotes = sectionVotes.has(sectionPath) ? {
+      up: new Set(sectionVotes.get(sectionPath).up),
+      down: new Set(sectionVotes.get(sectionPath).down),
+    } : null;
+    const previousCurationEvents = curationEvents.slice();
+
+    if (!sectionVotes.has(sectionPath)) {
+      sectionVotes.set(sectionPath, { up: new Set(), down: new Set() });
+    }
+
+    const votes = sectionVotes.get(sectionPath);
+    let action;
+
+    if (vote === 'up') {
       votes.down.delete(trimmedName);
-      action = 'removed_downvote';
+
+      if (votes.up.has(trimmedName)) {
+        votes.up.delete(trimmedName);
+        action = 'removed_upvote';
+      } else {
+        votes.up.add(trimmedName);
+        action = 'upvoted';
+      }
     } else {
-      votes.down.add(trimmedName);
-      action = 'downvoted';
+      votes.up.delete(trimmedName);
+
+      if (votes.down.has(trimmedName)) {
+        votes.down.delete(trimmedName);
+        action = 'removed_downvote';
+      } else {
+        votes.down.add(trimmedName);
+        action = 'downvoted';
+      }
     }
-  }
 
-  const score = votes.up.size - votes.down.size;
+    const score = votes.up.size - votes.down.size;
 
-  saveState().catch(console.error);
+    if (action === 'upvoted' || action === 'downvoted') {
+      appendCurationEvent({ type: 'vote', agentName: trimmedName, target: sectionPath });
+    }
 
-  // Broadcast vote
-  broadcast({
-    type: 'vote',
-    data: {
-      section_file,
-      agent_name: trimmedName,
+    try {
+      await saveState();
+    } catch (error) {
+      if (previousVotes) sectionVotes.set(sectionPath, previousVotes);
+      else sectionVotes.delete(sectionPath);
+      restoreCurationEvents(previousCurationEvents);
+      try {
+        // A concurrent non-curation caller may have snapshotted provisional state while the first
+        // write was queued. Persist the restored aggregate after it before releasing the lock.
+        await saveState();
+      } catch (rollbackError) {
+        console.error('Vote state and rollback persistence both failed:', rollbackError.message);
+      }
+      console.error('Vote persistence error:', error.message);
+      return res.status(500).json({ error: 'Failed to persist vote' });
+    }
+
+    const response = {
+      success: true,
       action,
+      section_file: sectionPath,
       score,
       upvotes: votes.up.size,
       downvotes: votes.down.size,
-    },
-  });
+    };
 
-  console.log(`[VOTE] ${trimmedName} ${action} ${section_file} (score: ${score})`);
-
-  res.json({
-    success: true,
-    action,
-    section_file,
-    score,
-    upvotes: votes.up.size,
-    downvotes: votes.down.size,
-  });
+    broadcast({
+      type: 'vote',
+      data: { ...response, agent_name: trimmedName },
+    });
+    console.log(`[VOTE] ${trimmedName} ${action} ${sectionPath} (score: ${score})`);
+    res.json(response);
+  } finally {
+    releaseContributionState();
+  }
 });
 
 // API: Get all section votes
@@ -2776,43 +2932,66 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, as
   try { await recordAgentIpDurably(agent_name, req.ip); }
   catch { return res.status(500).json({ error: 'Failed to persist comment moderation state' }); }
 
-  // Validate parent comment if provided
-  const parentComment = parent_id ? comments.get(parent_id) : null;
-  if (parent_id && (!parentComment || parentComment.targetType !== 'contribution' || parentComment.targetId !== req.params.id)) {
-    return res.status(400).json({ error: 'Parent comment not found' });
+  const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
+  try {
+    const lockedContribution = getPublicContribution(req.params.id);
+    if (!lockedContribution) {
+      return res.status(404).json({ error: 'Contribution not found' });
+    }
+
+    const parentComment = parent_id ? comments.get(parent_id) : null;
+    if (parent_id && (!parentComment || parentComment.targetType !== 'contribution' || parentComment.targetId !== req.params.id)) {
+      return res.status(400).json({ error: 'Parent comment not found' });
+    }
+
+    const comment = {
+      id: randomUUID(),
+      targetType: 'contribution',
+      targetId: req.params.id,
+      agentName: agent_name.slice(0, 100),
+      content: trimmedContent,
+      parentId: parent_id || null,
+      timestamp: new Date().toISOString(),
+    };
+    const hadCommentCount = Object.hasOwn(lockedContribution, 'commentCount');
+    const previousCommentCount = lockedContribution.commentCount;
+    const previousCurationEvents = curationEvents.slice();
+
+    comments.set(comment.id, comment);
+    lockedContribution.commentCount = (lockedContribution.commentCount || 0) + 1;
+    appendCurationEvent({
+      type: 'comment',
+      agentName: comment.agentName,
+      target: lockedContribution.file_path,
+      timestamp: comment.timestamp,
+    });
+
+    try {
+      await saveState();
+    } catch (error) {
+      comments.delete(comment.id);
+      if (hadCommentCount) lockedContribution.commentCount = previousCommentCount;
+      else delete lockedContribution.commentCount;
+      restoreCurationEvents(previousCurationEvents);
+      try { await saveState(); }
+      catch (rollbackError) {
+        console.error('Contribution comment state and rollback persistence both failed:', rollbackError.message);
+      }
+      console.error('Contribution comment persistence error:', error.message);
+      return res.status(500).json({ error: 'Failed to persist comment' });
+    }
+
+    broadcast({
+      type: 'comment',
+      data: {
+        comment,
+        contributionId: req.params.id,
+      },
+    });
+    res.json({ success: true, comment });
+  } finally {
+    releaseContributionState();
   }
-
-  const comment = {
-    id: randomUUID(),
-    targetType: 'contribution',
-    targetId: req.params.id,
-    agentName: agent_name.slice(0, 100),
-    content: trimmedContent,
-    parentId: parent_id || null,
-    timestamp: new Date().toISOString(),
-  };
-
-  comments.set(comment.id, comment);
-
-  // Update contribution comment count
-  contribution.commentCount = (contribution.commentCount || 0) + 1;
-
-  // Save state
-  saveState().catch(console.error);
-
-  // Broadcast new comment
-  broadcast({
-    type: 'comment',
-    data: {
-      comment,
-      contributionId: req.params.id,
-    },
-  });
-
-  res.json({
-    success: true,
-    comment,
-  });
 });
 
 // API: Get comments for a file
@@ -2876,38 +3055,58 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, async
   try { await recordAgentIpDurably(agent_name, req.ip); }
   catch { return res.status(500).json({ error: 'Failed to persist comment moderation state' }); }
 
-  const parentComment = parent_id ? comments.get(parent_id) : null;
-  if (parent_id && (!parentComment || parentComment.targetType !== 'file' || parentComment.targetId !== filePath)) {
-    return res.status(400).json({ error: 'Parent comment not found' });
+  const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
+  try {
+    if (isUnavailablePath(filePath)) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    const parentComment = parent_id ? comments.get(parent_id) : null;
+    if (parent_id && (!parentComment || parentComment.targetType !== 'file' || parentComment.targetId !== filePath)) {
+      return res.status(400).json({ error: 'Parent comment not found' });
+    }
+
+    const comment = {
+      id: randomUUID(),
+      targetType: 'file',
+      targetId: filePath,
+      agentName: agent_name.slice(0, 100),
+      content: trimmedContent,
+      parentId: parent_id || null,
+      lineNumber: line_number || null,
+      timestamp: new Date().toISOString(),
+    };
+    const previousCurationEvents = curationEvents.slice();
+
+    comments.set(comment.id, comment);
+    appendCurationEvent({
+      type: 'comment',
+      agentName: comment.agentName,
+      target: filePath,
+      timestamp: comment.timestamp,
+    });
+
+    try {
+      await saveState();
+    } catch (error) {
+      comments.delete(comment.id);
+      restoreCurationEvents(previousCurationEvents);
+      try { await saveState(); }
+      catch (rollbackError) {
+        console.error('File comment state and rollback persistence both failed:', rollbackError.message);
+      }
+      console.error('File comment persistence error:', error.message);
+      return res.status(500).json({ error: 'Failed to persist comment' });
+    }
+
+    broadcast({
+      type: 'fileComment',
+      data: { comment, filePath },
+    });
+    res.json({ success: true, comment });
+  } finally {
+    releaseContributionState();
   }
-
-  const comment = {
-    id: randomUUID(),
-    targetType: 'file',
-    targetId: filePath,
-    agentName: agent_name.slice(0, 100),
-    content: trimmedContent,
-    parentId: parent_id || null,
-    lineNumber: line_number || null,
-    timestamp: new Date().toISOString(),
-  };
-
-  comments.set(comment.id, comment);
-
-  saveState().catch(console.error);
-
-  broadcast({
-    type: 'fileComment',
-    data: {
-      comment,
-      filePath,
-    },
-  });
-
-  res.json({
-    success: true,
-    comment,
-  });
 });
 
 // API: Get diff for a contribution
