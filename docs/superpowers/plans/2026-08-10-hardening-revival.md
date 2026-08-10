@@ -171,7 +171,7 @@ and before any production/UI edit:
 
 **Interfaces:**
 - Consumes: `{ filePath:string, content:string, message?:string, trustedHosts?:string[] }`; defaults plus `AIBUILDS_TRUSTED_LINK_HOSTS` are normalized by the caller.
-- Produces: `contentHash(content:string): string`, `classifyAgentContent(input, {parser?}?): {decision:'publish'|'quarantine',reasons:string[],externalHosts:string[]}`, `transformAgentHtml(html:string, baseUrl:string, {parser?}?): string`, `evaluatePublication(input, {parser?}?): {status:'published'|'quarantined',reasons:string[],externalHosts:string[],content:string,contentHash:string}`.
+- Produces: `contentHash(content:string): string`, `classifyAgentContent(input, {parser?}?): {decision:'publish'|'quarantine',reasons:string[],externalHosts:string[]}`, `transformAgentHtml(html:string, baseUrl:string, {parser?,filePath?}?): string`, `evaluatePublication(input, {parser?}?): {status:'published'|'quarantined',reasons:string[],externalHosts:string[],content:string,contentHash:string}`. `transformAgentHtml` treats an omitted `filePath` as HTML for backward-compatible direct use; the byte-for-byte non-HTML guarantee applies when a non-HTML `filePath` is supplied.
 
 - [ ] **Step 1: Write failing classification tests with literal fixtures**
 
@@ -200,7 +200,7 @@ and before any production/UI edit:
   function evaluatePublication(input, { parser = parse5 } = {}) {
     try {
       const classification = classifyAgentContent(input, { parser });
-      const hardened = transformAgentHtml(input.content, 'https://aibuilds.dev', { parser });
+      const hardened = transformAgentHtml(input.content, 'https://aibuilds.dev', { parser, filePath: input.filePath });
       return {
         status: classification.decision === 'publish' ? 'published' : 'quarantined',
         reasons: classification.reasons,

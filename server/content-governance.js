@@ -1,0 +1,198 @@
+'use strict';
+
+const crypto = require('node:crypto');
+const parse5 = require('parse5');
+
+const DEFAULT_TRUSTED_HOSTS = new Set([
+  'aibuilds.dev',
+  'codevena.dev',
+  'github.com',
+  'npmjs.com',
+  'www.npmjs.com',
+  'developer.mozilla.org',
+]);
+const REQUIRED_REL_TOKENS = ['noopener', 'noreferrer', 'nofollow', 'ugc'];
+const HTML_FILE_RE = /\.(?:html?|xhtml)$/i;
+
+function contentHash(content) {
+  return crypto.createHash('sha256').update(String(content ?? ''), 'utf8').digest('hex');
+}
+
+function normalizeText(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\u2060\uFEFF\u00AD]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function isHtmlFile(filePath) {
+  return typeof filePath !== 'string' || filePath.length === 0 || HTML_FILE_RE.test(filePath);
+}
+
+function parseHtml(content, parser) {
+  const source = String(content ?? '');
+  return /<!doctype\b|<html\b/i.test(source)
+    ? parser.parse(source)
+    : parser.parseFragment(source);
+}
+
+function walk(node, visit) {
+  visit(node);
+  for (const child of node.childNodes || []) walk(child, visit);
+  if (node.content) walk(node.content, visit);
+}
+
+function getAttribute(node, name) {
+  return (node.attrs || []).find(attribute => attribute.name.toLowerCase() === name) || null;
+}
+
+function setAttribute(node, name, value) {
+  const existing = getAttribute(node, name);
+  if (existing) existing.value = value;
+  else node.attrs.push({ name, value });
+}
+
+function nodeText(node) {
+  let text = '';
+  walk(node, current => {
+    if (current.nodeName === '#text') text += current.value;
+  });
+  return text;
+}
+
+function normalizedTrustedHosts(inputHosts) {
+  const trusted = new Set(DEFAULT_TRUSTED_HOSTS);
+  const configured = String(process.env.AIBUILDS_TRUSTED_LINK_HOSTS || '')
+    .split(',')
+    .concat(Array.isArray(inputHosts) ? inputHosts : []);
+
+  for (const host of configured) {
+    const normalized = String(host || '').trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
+    if (normalized) trusted.add(normalized);
+  }
+  return trusted;
+}
+
+function inspectLinks(document, baseUrl) {
+  const anchors = [];
+  const externalHosts = new Set();
+  const base = new URL(baseUrl);
+
+  walk(document, node => {
+    if (node.tagName !== 'a' && node.tagName !== 'form') return;
+    const destination = getAttribute(node, node.tagName === 'a' ? 'href' : 'action');
+    if (!destination || !destination.value) return;
+    let target;
+    try {
+      target = new URL(destination.value, base);
+    } catch {
+      return;
+    }
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return;
+    const external = target.origin !== base.origin;
+    if (external) externalHosts.add(target.hostname.toLowerCase());
+    anchors.push({ node, external, hostname: target.hostname.toLowerCase(), text: normalizeText(nodeText(node)) });
+  });
+
+  return { anchors, externalHosts: Array.from(externalHosts).sort() };
+}
+
+function hasMedicalDosingInstruction(text) {
+  return /\binject(?:ion)?\b[^.]{0,80}\b\d+(?:\.\d+)?\s*(?:mg|mcg|ml|units?)\b[^.]{0,80}\b(?:daily|weekly|once\s+(?:a|per)?\s*week)\b/i.test(text);
+}
+
+function hasConcreteInvestmentAdvice(text) {
+  return /\binvest\s+\d+(?:\.\d+)?\s*%\s+of\s+(?:your\s+)?savings\b/i.test(text);
+}
+
+function hasConcreteLegalAdvice(text) {
+  return /\bfile\s+(?:this\s+)?lawsuit\s+under\s+statute\b[^.]{0,120}\bto\s+win\s+your\s+case\b/i.test(text);
+}
+
+function hasCommercialCallToAction(text) {
+  return /\b(?:buy\s+now|shop\s+now|sign\s+up\s+now|start\s+your\s+free\s+trial|save\s+\d+(?:\.\d+)?\s*%)\b/i.test(text);
+}
+
+function classifyAgentContent(input = {}, { parser = parse5 } = {}) {
+  try {
+    const document = parseHtml(input.content, parser);
+    const text = `${normalizeText(nodeText(document))} ${normalizeText(input.message)}`.trim();
+    const { anchors, externalHosts } = inspectLinks(document, 'https://aibuilds.dev');
+    const trustedHosts = normalizedTrustedHosts(input.trustedHosts);
+    const reasons = [];
+
+    if (hasMedicalDosingInstruction(text)) reasons.push('high_stakes_medical');
+    if (hasConcreteInvestmentAdvice(text)) reasons.push('high_stakes_financial');
+    if (hasConcreteLegalAdvice(text)) reasons.push('high_stakes_legal');
+    if (anchors.some(anchor => anchor.external && !trustedHosts.has(anchor.hostname) && hasCommercialCallToAction(anchor.text))) {
+      reasons.push('promotional_external_link');
+    }
+
+    return {
+      decision: reasons.length === 0 ? 'publish' : 'quarantine',
+      reasons,
+      externalHosts,
+    };
+  } catch {
+    return { decision: 'quarantine', reasons: ['parser_failure'], externalHosts: [] };
+  }
+}
+
+function transformAgentHtml(html, baseUrl, { parser = parse5, filePath } = {}) {
+  if (!isHtmlFile(filePath)) return html;
+
+  const document = parseHtml(html, parser);
+  const base = new URL(baseUrl);
+  walk(document, node => {
+    if (node.tagName !== 'a') return;
+    const href = getAttribute(node, 'href');
+    if (!href || !href.value) return;
+    let target;
+    try {
+      target = new URL(href.value, base);
+    } catch {
+      return;
+    }
+    if ((target.protocol !== 'http:' && target.protocol !== 'https:') || target.origin === base.origin) return;
+
+    const rel = getAttribute(node, 'rel');
+    const tokens = new Set(normalizeText(rel ? rel.value : '').split(' ').filter(Boolean));
+    for (const token of REQUIRED_REL_TOKENS) tokens.add(token);
+    setAttribute(node, 'rel', Array.from(tokens).join(' '));
+  });
+  return parser.serialize(document);
+}
+
+function evaluatePublication(input = {}, { parser = parse5 } = {}) {
+  try {
+    const classification = classifyAgentContent(input, { parser });
+    const hardened = transformAgentHtml(input.content, 'https://aibuilds.dev', {
+      parser,
+      filePath: input.filePath,
+    });
+    return {
+      status: classification.decision === 'publish' ? 'published' : 'quarantined',
+      reasons: classification.reasons,
+      externalHosts: classification.externalHosts,
+      content: hardened,
+      contentHash: contentHash(hardened),
+    };
+  } catch {
+    return {
+      status: 'quarantined',
+      reasons: ['parser_failure'],
+      externalHosts: [],
+      content: input.content,
+      contentHash: contentHash(input.content),
+    };
+  }
+}
+
+module.exports = {
+  contentHash,
+  classifyAgentContent,
+  transformAgentHtml,
+  evaluatePublication,
+};
