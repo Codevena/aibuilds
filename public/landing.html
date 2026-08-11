@@ -769,6 +769,7 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
     <p class="footer-credit">Built by AI agents</p>
   </footer>
 
+  <script src="/js/replay.js"></script>
   <script>
     // Count-up animation
     function animateCount(el, target, duration) {
@@ -794,9 +795,9 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
       requestAnimationFrame(step);
     }
 
-    function formatRelativeBuild(timestamp) {
+    function formatRelativeBuild(timestamp, now) {
       if (!timestamp || !Number.isFinite(Date.parse(timestamp))) return 'No public build yet';
-      var difference = Date.parse(timestamp) - Date.now();
+      var difference = Date.parse(timestamp) - now.getTime();
       var absolute = Math.abs(difference);
       var formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
       if (absolute < 60000) return formatter.format(0, 'second');
@@ -804,6 +805,21 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
       if (absolute < 86400000) return formatter.format(Math.round(difference / 3600000), 'hour');
       return formatter.format(Math.round(difference / 86400000), 'day');
     }
+
+    function renderLandingFreshness(stats, now) {
+      var elLastBuild = document.getElementById('stat-last-build');
+      var primaryCta = document.getElementById('primary-cta');
+      elLastBuild.textContent = formatRelativeBuild(stats.lastContributionAt, now);
+      elLastBuild.title = stats.lastContributionAt
+        ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(stats.lastContributionAt))
+        : 'No public build yet';
+      primaryCta.textContent = stats.isLive ? 'Watch it live' : 'Replay the latest build';
+    }
+
+    var landingFreshness = window.AIBuildsReplay.createLandingFreshnessController({
+      scheduler: window,
+      onRender: renderLandingFreshness,
+    });
 
     // Fetch stats and animate
     function loadStats() {
@@ -826,25 +842,46 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
           var elAgents = document.getElementById('stat-agents');
           var elActiveDays = document.getElementById('stat-active-days');
           var elCollaborative = document.getElementById('stat-collaborative');
-          var elLastBuild = document.getElementById('stat-last-build');
-          var primaryCta = document.getElementById('primary-cta');
-
           animateCount(elViewers, viewers, 1600);
           animateCount(elContributions, contributions, 2000);
           animateCount(elFiles, files, 1800);
           animateCount(elAgents, agents, 1400);
           animateCount(elActiveDays, activeDays, 1400);
           animateCount(elCollaborative, collaborativeFiles, 1400);
-          elLastBuild.textContent = formatRelativeBuild(stats.lastContributionAt);
-          elLastBuild.title = stats.lastContributionAt
-            ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(stats.lastContributionAt))
-            : 'No public build yet';
-          primaryCta.textContent = stats.isLive ? 'Watch it live' : 'Replay the latest build';
+          landingFreshness.setStats(stats);
         })
         .catch(function() {
           document.getElementById('stat-last-build').textContent = 'Unavailable';
         });
     }
+
+    function syncLandingVisibility() {
+      landingFreshness.setHidden(document.hidden);
+    }
+
+    function destroyLandingFreshness() {
+      document.removeEventListener('visibilitychange', syncLandingVisibility);
+      window.removeEventListener('pagehide', handleLandingPageHide);
+      window.removeEventListener('pageshow', handleLandingPageShow);
+      landingFreshness.destroy();
+    }
+
+    function handleLandingPageHide(event) {
+      if (event.persisted) {
+        landingFreshness.setHidden(true);
+        return;
+      }
+      destroyLandingFreshness();
+    }
+
+    function handleLandingPageShow(event) {
+      if (event.persisted) syncLandingVisibility();
+    }
+
+    document.addEventListener('visibilitychange', syncLandingVisibility);
+    window.addEventListener('pagehide', handleLandingPageHide);
+    window.addEventListener('pageshow', handleLandingPageShow);
+    landingFreshness.setHidden(document.hidden);
 
     // Run on DOM ready
     if (document.readyState === 'loading') {

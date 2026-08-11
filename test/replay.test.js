@@ -9,6 +9,7 @@ const {
   QUARANTINE_NOTICE,
   createReplayController,
   createDashboardViewModel,
+  createLandingFreshnessController,
   renderDashboardView,
   shouldAutoPlayReplay,
   millisecondsUntilLiveBoundary,
@@ -30,6 +31,48 @@ function createScheduler() {
     tick() {
       for (const timer of [...timers.values()]) timer.callback();
     },
+  };
+}
+
+function createClockScheduler(startMilliseconds) {
+  let nowMilliseconds = startMilliseconds;
+  let nextId = 1;
+  const timers = new Map();
+
+  function addTimer(callback, delay, intervalMs) {
+    const id = nextId++;
+    timers.set(id, {
+      callback,
+      dueAt: nowMilliseconds + Number(delay),
+      intervalMs,
+    });
+    return id;
+  }
+
+  return {
+    now: () => nowMilliseconds,
+    setTimeout: (callback, delay) => addTimer(callback, delay, null),
+    clearTimeout: id => timers.delete(id),
+    setInterval: (callback, intervalMs) => addTimer(callback, intervalMs, Number(intervalMs)),
+    clearInterval: id => timers.delete(id),
+    advance(milliseconds) {
+      const target = nowMilliseconds + milliseconds;
+      while (true) {
+        const next = [...timers.entries()]
+          .filter(([, timer]) => timer.dueAt <= target)
+          .sort((left, right) => left[1].dueAt - right[1].dueAt || left[0] - right[0])[0];
+        if (!next) break;
+        const [id, timer] = next;
+        nowMilliseconds = timer.dueAt;
+        if (timer.intervalMs === null) timers.delete(id);
+        else timer.dueAt += timer.intervalMs;
+        timer.callback();
+      }
+      nowMilliseconds = target;
+    },
+    pendingCount: () => timers.size,
+    pendingTimeouts: () => [...timers.values()].filter(timer => timer.intervalMs === null),
+    pendingIntervals: () => [...timers.values()].filter(timer => timer.intervalMs !== null),
   };
 }
 
@@ -227,6 +270,44 @@ const READY_REPLAY = Object.freeze({
   recommendedIntervalMs: 1800,
 });
 
+test('the full replay payload is rejected beyond 50 events and for fractional intervals', () => {
+  // Mutations caught: restoring slice(0, 50) hides an invalid 51st event; truncating 900.5 silently changes timing.
+  const invalidFiftyFirst = [
+    ...Array.from({ length: 50 }, (_, index) => ({
+      ...replayEvents()[0],
+      id: `event-${index + 1}`,
+    })),
+    { ...replayEvents()[0], id: 'event-51', timestamp: 'not-a-timestamp' },
+  ];
+
+  assert.throws(() => createDashboardViewModel({
+    phase: 'ready', stats: READY_STATS, season: READY_SEASON,
+    replay: { ...READY_REPLAY, events: invalidFiftyFirst },
+  }), /at most 50/);
+  assert.throws(() => createDashboardViewModel({
+    phase: 'ready', stats: READY_STATS, season: READY_SEASON,
+    replay: { ...READY_REPLAY, recommendedIntervalMs: 900.5 },
+  }), /positive integer/);
+  assert.throws(() => createReplayController({
+    events: invalidFiftyFirst,
+    scheduler: createScheduler(),
+  }), /at most 50/);
+  assert.throws(() => createReplayController({
+    events: replayEvents(),
+    intervalMs: 900.5,
+    scheduler: createScheduler(),
+  }), /positive integer/);
+});
+
+test('replay controller consumes normalized public events rather than caller-owned extra fields', () => {
+  // Mutation caught: cloning raw controller input retains fields outside the public replay record.
+  const event = { ...replayEvents()[0], operatorNote: 'must not reach playback' };
+  const { controller } = createController({ events: [event] });
+
+  assert.deepEqual(controller.getState().currentEvent, replayEvents()[0]);
+  assert.equal(Object.hasOwn(controller.getState().currentEvent, 'operatorNote'), false);
+});
+
 test('dashboard view exposes every metric with Intl formatting and an honest replay state', () => {
   // Mutation caught: deriving mode from the socket instead of stats.isLive labels stale data live.
   const view = createDashboardViewModel({
@@ -270,6 +351,29 @@ test('live mode hides automatic replay controls and never treats a connected soc
   assert.equal(view.statusText, 'Live · last build 5 minutes ago');
   assert.equal(view.replay.controlsVisible, false);
   assert.equal(view.metrics.isLive, 'Live');
+});
+
+test('offline cached-live data exposes no inert replay control or play eligibility', () => {
+  // Mutation caught: deriving controls from offline mode shows Play even though the same live bit blocks playback.
+  const view = createDashboardViewModel({
+    phase: 'ready',
+    stats: { ...READY_STATS, isLive: true },
+    season: READY_SEASON,
+    replay: { ...READY_REPLAY, isLive: true },
+    offline: true,
+  });
+
+  assert.equal(view.mode, 'offline');
+  assert.equal(view.replay.controlsVisible, false);
+  const replayControls = { hidden: false };
+  renderDashboardView({ replayControls }, view);
+  assert.equal(replayControls.hidden, true);
+  assert.equal(shouldAutoPlayReplay({
+    isLive: true, eventCount: view.replay.events.length, documentHidden: false, reducedMotion: false,
+  }), false);
+  assert.equal(shouldAutoPlayReplay({
+    isLive: undefined, eventCount: view.replay.events.length, documentHidden: false, reducedMotion: false,
+  }), false);
 });
 
 test('dashboard distinguishes loading, empty, error, and offline stale states with user retry', () => {
@@ -392,6 +496,77 @@ test('live freshness schedules one boundary refresh just after the inclusive 15-
   assert.equal(millisecondsUntilLiveBoundary({ isLive: true, lastContributionAt: null }), null);
 });
 
+test('landing freshness refreshes periodically and flips exactly one millisecond after the live boundary', () => {
+  // Mutations caught: omitting +1 flips early; leaving timers active keeps hidden/destroyed pages updating.
+  const scheduler = createClockScheduler(Date.parse('2026-08-10T10:05:00.000Z'));
+  const renders = [];
+  const controller = createLandingFreshnessController({
+    scheduler,
+    now: scheduler.now,
+    refreshIntervalMs: 60000,
+    onRender: snapshot => renders.push({ now: scheduler.now(), isLive: snapshot.isLive }),
+  });
+  controller.setStats({
+    ...READY_STATS,
+    isLive: true,
+    lastContributionAt: '2026-08-10T10:00:00.000Z',
+  });
+
+  assert.deepEqual(scheduler.pendingTimeouts().map(timer => timer.dueAt - scheduler.now()), [600001]);
+  assert.equal(scheduler.pendingIntervals().length, 1);
+  const originalTimers = [...scheduler.pendingTimeouts(), ...scheduler.pendingIntervals()];
+  controller.setStats({
+    ...READY_STATS,
+    isLive: true,
+    lastContributionAt: '2026-08-10T10:00:00.000Z',
+  });
+  assert.equal(scheduler.pendingCount(), 2);
+  assert.equal(
+    [...scheduler.pendingTimeouts(), ...scheduler.pendingIntervals()]
+      .some(timer => originalTimers.includes(timer)),
+    false,
+  );
+  scheduler.advance(60000);
+  assert.deepEqual(renders.at(-1), {
+    now: Date.parse('2026-08-10T10:06:00.000Z'), isLive: true,
+  });
+  scheduler.advance(540000);
+  assert.deepEqual(renders.at(-1), {
+    now: Date.parse('2026-08-10T10:15:00.000Z'), isLive: true,
+  });
+  scheduler.advance(1);
+  assert.deepEqual(renders.at(-1), {
+    now: Date.parse('2026-08-10T10:15:00.001Z'), isLive: false,
+  });
+
+  controller.setHidden(true);
+  assert.equal(scheduler.pendingCount(), 0);
+  const hiddenRenderCount = renders.length;
+  scheduler.advance(60000);
+  assert.equal(renders.length, hiddenRenderCount);
+  controller.setHidden(false);
+  assert.equal(renders.length, hiddenRenderCount + 1);
+  assert.equal(scheduler.pendingIntervals().length, 1);
+  controller.setHidden(false);
+  assert.equal(scheduler.pendingIntervals().length, 1);
+  controller.destroy();
+  assert.equal(scheduler.pendingCount(), 0);
+});
+
+test('landing wires the shared freshness controller to visibility and page lifecycle cleanup', () => {
+  // Mutation caught: a one-shot landing render has no shared clock or lifecycle cleanup calls.
+  const html = fs.readFileSync(require.resolve('../public/landing.html'), 'utf8');
+  assert.match(html, /<script src="\/js\/replay\.js"><\/script>/);
+  assert.match(html, /createLandingFreshnessController/);
+  assert.match(html, /landingFreshness\.setStats\(stats\)/);
+  assert.match(html, /setHidden\(document\.hidden\)/);
+  assert.match(html, /addEventListener\('visibilitychange'/);
+  assert.match(html, /addEventListener\('pagehide'/);
+  assert.match(html, /addEventListener\('pageshow'/);
+  assert.match(html, /event\.persisted/);
+  assert.match(html, /\.destroy\(\)/);
+});
+
 function deferred() {
   let resolve;
   let reject;
@@ -426,6 +601,39 @@ function createDashboardHarness() {
   dashboard.scheduleFreshnessBoundary = () => {};
   return dashboard;
 }
+
+test('dashboard effects receive only the authoritative sanitized payload', async () => {
+  // Mutation caught: validating a derived view but retaining raw API objects leaks extra fields into controller state.
+  const dashboard = createDashboardHarness();
+  const rawStats = { ...READY_STATS, operatorNote: 'not a public metric' };
+  const rawSeason = { ...READY_SEASON, internalScore: 99 };
+  const rawReplay = {
+    ...READY_REPLAY,
+    events: READY_REPLAY.events.map((event, index) => (
+      index === 0 ? { ...event, operatorNote: 'not a public event field' } : event
+    )),
+    internalCursor: 'private-cursor',
+  };
+  let initializedReplay = null;
+  dashboard.fetchJson = async url => {
+    if (url === '/api/stats') return rawStats;
+    if (url === '/api/season/current') return rawSeason;
+    return rawReplay;
+  };
+  dashboard.initializeReplay = replay => { initializedReplay = replay; };
+
+  await dashboard.fetchDashboardData();
+
+  assert.equal(dashboard.dashboardData.phase, 'ready');
+  assert.notEqual(dashboard.dashboardData.stats, rawStats);
+  assert.notEqual(dashboard.dashboardData.season, rawSeason);
+  assert.notEqual(dashboard.dashboardData.replay, rawReplay);
+  assert.equal(Object.hasOwn(dashboard.dashboardData.stats, 'operatorNote'), false);
+  assert.equal(Object.hasOwn(dashboard.dashboardData.season, 'internalScore'), false);
+  assert.equal(Object.hasOwn(dashboard.dashboardData.replay, 'internalCursor'), false);
+  assert.equal(Object.hasOwn(dashboard.dashboardData.replay.events[0], 'operatorNote'), false);
+  assert.equal(initializedReplay, dashboard.dashboardData.replay);
+});
 
 test('manual replay playback obeys the same hidden/reduced-motion policy as auto-play', () => {
   // Mutation caught: unconditionally calling play starts animation after policy has rejected it.

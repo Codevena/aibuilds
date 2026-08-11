@@ -886,20 +886,20 @@ class AIBuildsDashboard {
         this.fetchJson('/api/replay?limit=50'),
       ]);
       if (generation !== this.dashboardRequestGeneration || loadToken !== this.dashboardLoadToken) return;
-      this.assertDashboardPayloadSafe(stats, season, replay);
+      const safePayload = this.sanitizeDashboardPayload(stats, season, replay);
       this.dashboardData = {
-        phase: 'ready', stats, season, replay,
+        phase: 'ready', ...safePayload,
         offline: this.dashboardData.offline === true,
       };
       this.mergePendingReplayContributions();
       this.updateStats({
-        viewerCount: stats.viewerCount,
-        contributionCount: stats.totalContributions,
-        fileCount: stats.fileCount,
-        agentCount: stats.agentCount,
+        viewerCount: this.dashboardData.stats.viewerCount,
+        contributionCount: this.dashboardData.stats.totalContributions,
+        fileCount: this.dashboardData.stats.fileCount,
+        agentCount: this.dashboardData.stats.agentCount,
       });
       this.initializeReplay(this.dashboardData.replay);
-      this.scheduleFreshnessBoundary(stats);
+      this.scheduleFreshnessBoundary(this.dashboardData.stats);
       this.renderDashboard();
       applied = true;
     } catch (error) {
@@ -930,16 +930,8 @@ class AIBuildsDashboard {
     if (this.canAutoPlayReplay()) this.replayController.play();
   }
 
-  assertDashboardPayloadSafe(stats, season, replay) {
-    return this.replayApi.createDashboardViewModel({
-      phase: 'ready',
-      stats,
-      season,
-      replay,
-      offline: false,
-      now: new Date(),
-      locale: 'en-US',
-    });
+  sanitizeDashboardPayload(stats, season, replay) {
+    return this.replayApi.sanitizeDashboardPayload({ stats, season, replay });
   }
 
   canAutoPlayReplay() {
@@ -1038,12 +1030,17 @@ class AIBuildsDashboard {
       .filter(existing => existing.id !== event.id)
       .concat(event)
       .slice(-50);
-    this.dashboardData.replay = {
-      ...this.dashboardData.replay,
-      events,
-      lastContributionAt: event.timestamp,
-    };
-    this.replayController?.setEvents(events);
+    try {
+      const replay = this.replayApi.sanitizeReplayPayload({
+        ...this.dashboardData.replay,
+        events,
+        lastContributionAt: event.timestamp,
+      });
+      this.dashboardData.replay = replay;
+      this.replayController?.setEvents(replay.events);
+    } catch (error) {
+      console.error('Rejected unsafe replay contribution:', error);
+    }
   }
 
   handleDashboardContribution(contribution) {
@@ -1084,16 +1081,16 @@ class AIBuildsDashboard {
             this.dashboardRefreshQueued = true;
             return;
           }
-          this.assertDashboardPayloadSafe(stats, season, this.dashboardData.replay);
-          this.dashboardData = { ...this.dashboardData, phase: 'ready', stats, season, offline: false };
+          const safePayload = this.sanitizeDashboardPayload(stats, season, this.dashboardData.replay);
+          this.dashboardData = { ...this.dashboardData, phase: 'ready', ...safePayload, offline: false };
           this.updateStats({
-            viewerCount: stats.viewerCount,
-            contributionCount: stats.totalContributions,
-            fileCount: stats.fileCount,
-            agentCount: stats.agentCount,
+            viewerCount: safePayload.stats.viewerCount,
+            contributionCount: safePayload.stats.totalContributions,
+            fileCount: safePayload.stats.fileCount,
+            agentCount: safePayload.stats.agentCount,
           });
-          if (stats.isLive) this.replayController?.pause();
-          this.scheduleFreshnessBoundary(stats);
+          if (safePayload.stats.isLive) this.replayController?.pause();
+          this.scheduleFreshnessBoundary(safePayload.stats);
           this.renderDashboard();
         } catch (error) {
           if (generation !== this.dashboardRequestGeneration || this.dashboardLoadToken) {

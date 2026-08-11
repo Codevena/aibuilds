@@ -42,14 +42,20 @@
       throw new TypeError('scheduler must provide setInterval and clearInterval');
     }
 
-    let replayEvents = cloneEvents(events);
+    const initialReplay = normalizeReplay({
+      events,
+      lastContributionAt: null,
+      isLive: false,
+      recommendedIntervalMs: intervalMs,
+    });
+    let replayEvents = cloneEvents(initialReplay.events);
     let selectedIndex = replayEvents.length > 0 ? 0 : -1;
     let playing = false;
     let timer = null;
-    let selectedInterval = validInterval(intervalMs) ? Math.trunc(intervalMs) : DEFAULT_INTERVAL_MS;
+    let selectedInterval = initialReplay.recommendedIntervalMs;
 
     function validInterval(value) {
-      return Number.isFinite(Number(value)) && Number(value) > 0;
+      return Number.isSafeInteger(value) && value >= 1;
     }
 
     function snapshot() {
@@ -140,17 +146,23 @@
     }
 
     function setSpeed(nextIntervalMs) {
-      if (!validInterval(nextIntervalMs)) throw new TypeError('intervalMs must be a positive number');
-      selectedInterval = Math.trunc(Number(nextIntervalMs));
+      if (!validInterval(nextIntervalMs)) throw new TypeError('intervalMs must be a positive integer');
+      selectedInterval = nextIntervalMs;
       if (playing) schedule();
       notifyState();
       return snapshot();
     }
 
     function setEvents(nextEvents) {
+      const nextReplay = normalizeReplay({
+        events: nextEvents,
+        lastContributionAt: null,
+        isLive: false,
+        recommendedIntervalMs: selectedInterval,
+      });
       clearTimer();
       playing = false;
-      replayEvents = cloneEvents(nextEvents);
+      replayEvents = cloneEvents(nextReplay.events);
       selectedIndex = replayEvents.length > 0 ? 0 : -1;
       notifyState();
       return snapshot();
@@ -196,7 +208,7 @@
       throw new TypeError('stats.lastContributionAt must be null or a timestamp');
     }
     if (typeof stats.isLive !== 'boolean') throw new TypeError('stats.isLive must be boolean');
-    return { ...stats };
+    return Object.fromEntries(REQUIRED_STATS.map(field => [field, stats[field]]));
   }
 
   function stringArray(value) {
@@ -254,12 +266,31 @@
       throw new TypeError('replay must be an object');
     }
     if (!Array.isArray(replay.events)) throw new TypeError('replay.events must be an array');
-    const interval = Number(replay.recommendedIntervalMs);
+    if (replay.events.length > 50) throw new TypeError('replay.events must contain at most 50 public events');
+    if (replay.lastContributionAt !== null && !validTimestamp(replay.lastContributionAt)) {
+      throw new TypeError('replay.lastContributionAt must be null or a timestamp');
+    }
+    if (typeof replay.isLive !== 'boolean') throw new TypeError('replay.isLive must be boolean');
+    if (!Number.isSafeInteger(replay.recommendedIntervalMs) || replay.recommendedIntervalMs < 1) {
+      throw new TypeError('replay.recommendedIntervalMs must be a positive integer');
+    }
     return {
-      events: replay.events.slice(0, 50).map(normalizeReplayEvent),
-      lastContributionAt: validTimestamp(replay.lastContributionAt) ? replay.lastContributionAt : null,
-      isLive: replay.isLive === true,
-      recommendedIntervalMs: Number.isFinite(interval) && interval > 0 ? Math.trunc(interval) : DEFAULT_INTERVAL_MS,
+      events: replay.events.map(normalizeReplayEvent),
+      lastContributionAt: replay.lastContributionAt,
+      isLive: replay.isLive,
+      recommendedIntervalMs: replay.recommendedIntervalMs,
+    };
+  }
+
+  function sanitizeReplayPayload(replay) {
+    return normalizeReplay(replay);
+  }
+
+  function sanitizeDashboardPayload({ stats, season, replay } = {}) {
+    return {
+      stats: validateStats(stats),
+      season: normalizeSeason(season),
+      replay: sanitizeReplayPayload(replay),
     };
   }
 
@@ -322,11 +353,13 @@
       return emptyView('error', 'Activity unavailable', `Activity could not be loaded.${detail}`);
     }
 
-    const safeStats = validateStats(stats);
-    const safeSeason = normalizeSeason(season);
-    const safeReplay = normalizeReplay(replay);
+    const safePayload = sanitizeDashboardPayload({ stats, season, replay });
+    const safeStats = safePayload.stats;
+    const safeSeason = safePayload.season;
+    const safeReplay = safePayload.replay;
     const isEmpty = safeReplay.events.length === 0;
     const mode = offline ? 'offline' : safeStats.isLive ? 'live' : isEmpty ? 'empty' : 'replay';
+    const replayEligible = safeStats.isLive === false;
     const freshness = formatRelative(safeStats.lastContributionAt, now, locale);
     const prefix = mode === 'live' ? 'Live' : mode === 'offline' ? 'Offline' : mode === 'replay' ? 'Replay' : 'Idle';
 
@@ -369,7 +402,7 @@
       },
       replay: {
         panelVisible: mode !== 'live',
-        controlsVisible: mode !== 'live' && safeReplay.events.length > 0,
+        controlsVisible: replayEligible && safeReplay.events.length > 0,
         events: cloneEvents(safeReplay.events),
         intervalMs: safeReplay.recommendedIntervalMs,
         emptyText: safeReplay.events.length === 0 ? 'No public builds are available to replay yet.' : '',
@@ -426,7 +459,7 @@
   }
 
   function shouldAutoPlayReplay({ isLive, eventCount, documentHidden, reducedMotion }) {
-    return isLive !== true && Number(eventCount) > 0 && documentHidden !== true && reducedMotion !== true;
+    return isLive === false && Number(eventCount) > 0 && documentHidden !== true && reducedMotion !== true;
   }
 
   function millisecondsUntilLiveBoundary(stats, now = new Date()) {
@@ -436,11 +469,118 @@
     return Math.max(0, Date.parse(stats.lastContributionAt) + LIVE_MAX_AGE_MS + 1 - nowMilliseconds);
   }
 
+  function createLandingFreshnessController({
+    onRender = function() {},
+    now = function() { return Date.now(); },
+    scheduler = typeof globalThis !== 'undefined' ? globalThis : null,
+    refreshIntervalMs = 60 * 1000,
+  } = {}) {
+    if (typeof onRender !== 'function' || typeof now !== 'function') {
+      throw new TypeError('onRender and now must be functions');
+    }
+    if (!scheduler || typeof scheduler.setTimeout !== 'function' || typeof scheduler.clearTimeout !== 'function' ||
+        typeof scheduler.setInterval !== 'function' || typeof scheduler.clearInterval !== 'function') {
+      throw new TypeError('scheduler must provide timeout and interval methods');
+    }
+    if (!Number.isSafeInteger(refreshIntervalMs) || refreshIntervalMs < 1) {
+      throw new TypeError('refreshIntervalMs must be a positive integer');
+    }
+
+    let currentStats = null;
+    let hidden = false;
+    let destroyed = false;
+    let boundaryTimer = null;
+    let refreshTimer = null;
+
+    function currentMilliseconds() {
+      const value = now();
+      const milliseconds = value instanceof Date ? value.getTime() : Number(value);
+      if (!Number.isFinite(milliseconds)) throw new TypeError('now must return a valid time');
+      return milliseconds;
+    }
+
+    function isCurrentlyLive(milliseconds) {
+      return currentStats?.isLive === true && validTimestamp(currentStats.lastContributionAt) &&
+        milliseconds <= Date.parse(currentStats.lastContributionAt) + LIVE_MAX_AGE_MS;
+    }
+
+    function snapshot(milliseconds = currentMilliseconds()) {
+      if (!currentStats) return null;
+      return Object.freeze({
+        ...currentStats,
+        isLive: isCurrentlyLive(milliseconds),
+      });
+    }
+
+    function render() {
+      const milliseconds = currentMilliseconds();
+      const state = snapshot(milliseconds);
+      if (state) onRender(state, new Date(milliseconds));
+      return state;
+    }
+
+    function clearTimers() {
+      if (boundaryTimer !== null) scheduler.clearTimeout(boundaryTimer);
+      if (refreshTimer !== null) scheduler.clearInterval(refreshTimer);
+      boundaryTimer = null;
+      refreshTimer = null;
+    }
+
+    function schedule() {
+      if (destroyed || hidden || !currentStats) return;
+      const nowMilliseconds = currentMilliseconds();
+      if (isCurrentlyLive(nowMilliseconds)) {
+        const delay = millisecondsUntilLiveBoundary(currentStats, new Date(nowMilliseconds));
+        boundaryTimer = scheduler.setTimeout(() => {
+          boundaryTimer = null;
+          render();
+        }, delay);
+      }
+      refreshTimer = scheduler.setInterval(render, refreshIntervalMs);
+    }
+
+    function setStats(stats) {
+      if (destroyed) return null;
+      clearTimers();
+      currentStats = validateStats(stats);
+      const state = render();
+      schedule();
+      return state;
+    }
+
+    function setHidden(nextHidden) {
+      if (destroyed) return null;
+      const wasHidden = hidden;
+      hidden = nextHidden === true;
+      if (hidden) {
+        clearTimers();
+        return snapshot();
+      }
+      if (wasHidden) {
+        const state = render();
+        schedule();
+        return state;
+      }
+      return snapshot();
+    }
+
+    function destroy() {
+      clearTimers();
+      destroyed = true;
+      currentStats = null;
+    }
+
+    return Object.freeze({ setStats, setHidden, destroy });
+  }
+
   return Object.freeze({
     DEFAULT_INTERVAL_MS,
     QUARANTINE_NOTICE,
     createReplayController,
+    createLandingFreshnessController,
     createDashboardViewModel,
+    sanitizeDashboardPayload,
+    sanitizeReplayPayload,
     renderDashboardView,
     shouldAutoPlayReplay,
     millisecondsUntilLiveBoundary,
