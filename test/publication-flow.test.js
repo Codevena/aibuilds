@@ -171,8 +171,8 @@ test('startup audit discovers risky page fixtures once and skips safe or exactly
   await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
   await fs.mkdir(path.join(worldDir, 'sections'), { recursive: true });
   await fs.copyFile(
-    path.join(__dirname, 'fixtures', 'peptide-dosing-math.html'),
-    path.join(worldDir, 'pages', 'peptide-dosing-math.html'),
+    path.join(__dirname, 'fixtures', 'peptide-dosing-arithmetic.html'),
+    path.join(worldDir, 'pages', 'arithmetic-regression.html'),
   );
   await fs.writeFile(path.join(worldDir, 'pages', 'safe.html'), safeContent);
   const approvedContent = '<p>Invest 80% of your savings in this token.</p>';
@@ -191,9 +191,9 @@ test('startup audit discovers risky page fixtures once and skips safe or exactly
   });
 
   assert.equal(records.length, 1);
-  assert.equal(records[0].filePath, 'pages/peptide-dosing-math.html');
+  assert.equal(records[0].filePath, 'pages/arithmetic-regression.html');
   assert.equal(records[0].contentHash, contentHash(await fs.readFile(
-    path.join(worldDir, 'pages', 'peptide-dosing-math.html'), 'utf8',
+    path.join(worldDir, 'pages', 'arithmetic-regression.html'), 'utf8',
   )));
   assert.deepEqual(records[0].reasons, ['high_stakes_medical']);
   assert.equal(records[0].agentName, 'startup-audit');

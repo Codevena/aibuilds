@@ -15,6 +15,10 @@ const peptideFixture = fs.readFileSync(
   path.join(__dirname, 'fixtures', 'peptide-dosing-math.html'),
   'utf8',
 );
+const dosingArithmeticFixture = fs.readFileSync(
+  path.join(__dirname, 'fixtures', 'peptide-dosing-arithmetic.html'),
+  'utf8',
+);
 
 test('clean snake-game fragment publishes', () => {
   // Mutation caught: treating ordinary page text as high-stakes content would quarantine harmless World work.
@@ -35,6 +39,89 @@ test('medical dosing instructions are quarantined', () => {
 
   assert.equal(result.status, 'quarantined');
   assert.deepEqual(result.reasons, ['high_stakes_medical']);
+});
+
+test('medical dosing arithmetic is quarantined even with a disclaimer', () => {
+  // Mutation caught: removing the arithmetic branch would republish reconstitution and syringe guidance.
+  const result = evaluatePublication({
+    filePath: 'pages/neutral-health-reference.html',
+    content: dosingArithmeticFixture,
+  });
+
+  assert.equal(result.status, 'quarantined');
+  assert.deepEqual(result.reasons, ['high_stakes_medical']);
+});
+
+test('non-instructional laboratory measurements remain publishable', () => {
+  // Mutation caught: quarantining any mg/mL co-occurrence would hide benign analytical measurements.
+  const result = evaluatePublication({
+    filePath: 'pages/laboratory-results.html',
+    content: '<p>The spectroscopy dataset records a 5 mg reference sample and 2 mL solvent aliquot. Results are archived without human dosing or administration instructions.</p>',
+  });
+
+  assert.equal(result.status, 'published');
+  assert.deepEqual(result.reasons, []);
+});
+
+test('reconstitution instructions quarantine volume-before-mass conversions', () => {
+  // Mutation caught: direction-sensitive mass-to-volume matching would publish this reversed mapping.
+  const result = evaluatePublication({
+    filePath: 'pages/reconstitution-reference.html',
+    content: '<p>For reconstitution, add 2 mL of bacteriostatic water to a 5 mg preparation.</p>',
+  });
+
+  assert.equal(result.status, 'quarantined');
+  assert.deepEqual(result.reasons, ['high_stakes_medical']);
+});
+
+test('reconstitution instructions quarantine units-before-volume conversions', () => {
+  // Mutation caught: direction-sensitive volume-to-units matching would publish this reversed mapping.
+  const result = evaluatePublication({
+    filePath: 'pages/syringe-reference.html',
+    content: '<p>After reconstitution, 10 syringe units delivers 0.1 mL of the dose.</p>',
+  });
+
+  assert.equal(result.status, 'quarantined');
+  assert.deepEqual(result.reasons, ['high_stakes_medical']);
+});
+
+test('laboratory vial measurements are not treated as dosing arithmetic', () => {
+  // Mutation caught: raw mg/mL proximity plus a vial or dose-response word would over-quarantine assays.
+  const result = evaluatePublication({
+    filePath: 'pages/assay-results.html',
+    content: '<p>A vial contained a 5 mg reference sample in a 2 mL solvent aliquot for a dose-response assay.</p>',
+  });
+
+  assert.equal(result.status, 'published');
+  assert.deepEqual(result.reasons, []);
+});
+
+test('laboratory syringe calibration is not treated as dosing arithmetic', () => {
+  // Mutation caught: raw mL/units proximity plus a syringe word would over-quarantine calibration data.
+  const result = evaluatePublication({
+    filePath: 'pages/calibration-results.html',
+    content: '<p>A laboratory syringe calibration recorded 0.1 mL before 10 units on the instrument scale.</p>',
+  });
+
+  assert.equal(result.status, 'published');
+  assert.deepEqual(result.reasons, []);
+});
+
+test('relation-rich dose-response assay measurements remain publishable', () => {
+  // Mutations caught: treating dose-response as a human dose or generic leading copulas as conversions.
+  const contents = [
+    '<p>This dose-response assay is documented. A 5 mg sample and 2 mL aliquot were recorded independently.</p>',
+    '<p>For a dose-response assay, a 5 mg reference is dissolved in 2 mL solvent; no administration guidance is provided.</p>',
+    '<p>Technicians mixed a 5 mg reference with 2 mL solvent for a dose-response assay.</p>',
+    '<p>For a dose–response assay, a 5 mg reference is dissolved in 2 mL solvent.</p>',
+    '<p>For a dose—response assay, technicians mixed a 5 mg reference with 2 mL solvent.</p>',
+  ];
+  const statuses = contents.map((content, index) => evaluatePublication({
+    filePath: `pages/assay-${index}.html`,
+    content,
+  }).status);
+
+  assert.deepEqual(statuses, ['published', 'published', 'published', 'published', 'published']);
 });
 
 test('concrete investment advice is quarantined', () => {

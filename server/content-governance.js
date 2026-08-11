@@ -99,8 +99,33 @@ function inspectLinks(document, baseUrl) {
   return { anchors, externalHosts: Array.from(externalHosts).sort() };
 }
 
+function hasBoundedQuantityRelation(text, firstQuantity, secondQuantity) {
+  const actionRelation = String.raw`(?:=|->|→|\s[×x/]\s|\b(?:add(?:ed|ing)?|mix(?:ed|ing)?|dilut(?:e|ed|ing)|draw(?:n|ing)?|deliver(?:s|ed|ing)?|equal(?:s|ed|ing)?|convert(?:s|ed|ing)?|calculat(?:e|ed|ing)|divid(?:e|ed|ing)|multipl(?:y|ied|ying)|yield(?:s|ed|ing)?)\b)`;
+  const betweenRelation = String.raw`(?:${actionRelation}|\b(?:is|are)\b)`;
+  const firstThenSecond = new RegExp(`${firstQuantity}.{0,80}${betweenRelation}.{0,80}${secondQuantity}`, 'i');
+  const secondThenFirst = new RegExp(`${secondQuantity}.{0,80}${betweenRelation}.{0,80}${firstQuantity}`, 'i');
+  const relationThenFirst = new RegExp(`${actionRelation}.{0,40}${firstQuantity}.{0,120}${secondQuantity}`, 'i');
+  const relationThenSecond = new RegExp(`${actionRelation}.{0,40}${secondQuantity}.{0,120}${firstQuantity}`, 'i');
+  return firstThenSecond.test(text) || secondThenFirst.test(text) ||
+    relationThenFirst.test(text) || relationThenSecond.test(text);
+}
+
 function hasMedicalDosingInstruction(text) {
-  return /\binject(?:ion)?\b[^.]{0,80}\b\d+(?:\.\d+)?\s*(?:mg|mcg|ml|units?)\b[^.]{0,80}\b(?:daily|weekly|once\s+(?:a|per)?\s*week)\b/i.test(text);
+  const scheduledDose = /\binject(?:ion)?\b[^.]{0,80}\b\d+(?:\.\d+)?\s*(?:mg|mcg|ml|units?)\b[^.]{0,80}\b(?:daily|weekly|once\s+(?:a|per)?\s*week)\b/i.test(text);
+  if (scheduledDose) return true;
+
+  const hasPreparationContext = /\b(?:dosage|reconstitut\w*|bacteriostatic|inject(?:ion|ed|ing)?)\b/i.test(text) ||
+    /\bdose\b(?![\s\u002D\u2010-\u2015]*response\b)/i.test(text);
+  const hasConcreteQuantity = /\b\d+(?:\.\d+)?\s*(?:mg|mcg|ml|units?)\b/i.test(text);
+  const hasFormula = /\b(?:concentration|volume|dose|units?)\b.{0,80}=.{0,160}\b(?:concentration|volume|dose|vial|water|mg|mcg|ml|units?)\b/i.test(text);
+  const massQuantity = String.raw`\b\d+(?:\.\d+)?\s*(?:mg|mcg)\b`;
+  const volumeQuantity = String.raw`\b\d+(?:\.\d+)?\s*ml\b`;
+  const syringeUnits = String.raw`\b\d+(?:\.\d+)?\s*(?:syringe\s+)?units?\b`;
+  const hasMassVolumeConversion = hasBoundedQuantityRelation(text, massQuantity, volumeQuantity);
+  const hasVolumeUnitsConversion = hasBoundedQuantityRelation(text, volumeQuantity, syringeUnits);
+
+  return hasPreparationContext && hasConcreteQuantity &&
+    (hasFormula || hasMassVolumeConversion || hasVolumeUnitsConversion);
 }
 
 function hasConcreteInvestmentAdvice(text) {
