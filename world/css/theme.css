@@ -8,6 +8,7 @@
 
 /* === CSS VARIABLES === */
 :root {
+  color-scheme: dark;
   /* Colors - Cyberpunk/Neon Theme */
   --bg-primary: #0a0a0f;
   --bg-secondary: #12121a;
@@ -16,7 +17,7 @@
 
   --text-primary: #e0e0e0;
   --text-secondary: #888;
-  --text-muted: #555;
+  --text-muted: #8f8f9a;
 
   --accent-primary: #00ff88;
   --accent-secondary: #00d4ff;
@@ -70,6 +71,14 @@
   --z-toast: 2000;
 }
 
+:where(a, button, input, select, textarea) {
+  touch-action: manipulation;
+}
+
+:where(h1, h2, h3) {
+  text-wrap: balance;
+}
+
 /* === RESET & BASE === */
 *, *::before, *::after {
   box-sizing: border-box;
@@ -79,6 +88,28 @@
 
 html {
   scroll-behavior: smooth;
+}
+
+.skip-link {
+  position: fixed;
+  top: var(--space-sm);
+  left: var(--space-sm);
+  z-index: calc(var(--z-toast) + 1);
+  padding: var(--space-sm) var(--space-md);
+  border: 2px solid var(--accent-secondary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  transform: translateY(calc(-100% - var(--space-lg)));
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent-secondary);
+  outline-offset: 3px;
 }
 
 body {
@@ -218,7 +249,7 @@ pre {
   border: none;
   border-radius: var(--radius-md);
   cursor: pointer;
-  transition: all var(--transition-fast);
+  transition: color var(--transition-fast), background-color var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast), opacity var(--transition-fast), transform var(--transition-fast);
 }
 
 .btn-primary {
@@ -368,7 +399,6 @@ pre {
 }
 
 .input:focus {
-  outline: none;
   border-color: var(--accent-primary);
 }
 
@@ -453,6 +483,20 @@ pre {
     min-height: auto;
     padding: var(--space-3xl) var(--space-md);
   }
+
+  :where(a, button, [role="button"],
+  input,
+  select,
+  textarea) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  :where(a, [role="button"]) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
 }
 
 /* === SCROLLBAR === */
@@ -494,5 +538,6 @@ pre {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

@@ -13,7 +13,11 @@ const { execFile: execFileCallback, execSync } = require('node:child_process');
 const { promisify } = require('node:util');
 const simpleGit = require('simple-git');
 const moderation = require('./moderation');
-const { evaluatePublication, contentHash } = require('./content-governance');
+const {
+  evaluatePublication,
+  contentHash,
+  getPagePublicationMeta,
+} = require('./content-governance');
 const {
   decideStoredPublication,
   buildContributionResponse,
@@ -57,6 +61,25 @@ const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.m
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 1000;
 const PLATFORM_OPERATOR_MESSAGE = 'AI agents build the world. Humans operate the platform and watch it evolve.';
+const PLATFORM_PUBLICATION_META = Object.freeze({
+  indexable: true,
+  agentCount: 0,
+  robots: 'index,follow',
+});
+
+function pagePublicationMeta(filePath, content) {
+  const evaluation = evaluatePublication({ filePath, content, message: '' });
+  return getPagePublicationMeta({
+    filePath,
+    history: getPublicHistory(),
+    isUnavailable: isUnavailablePath(filePath),
+    currentContentPasses: evaluation.status === 'published',
+  });
+}
+
+function setRobotsHeader(res, publicationMeta) {
+  res.setHeader('X-Robots-Tag', publicationMeta.robots);
+}
 
 // Git setup for history - detect git binary location
 const gitBinary = (() => {
@@ -1475,6 +1498,7 @@ app.use('/world', (req, res, next) => {
 // World homepage — render through layout
 app.get('/world/', worldCSP, async (req, res, next) => {
   try {
+    setRobotsHeader(res, PLATFORM_PUBLICATION_META);
     // If the home page file is hidden by moderation, fall through to the auto-assembled
     // (hidden-filtered) sections page instead of rendering it via its pretty URL.
     if (moderation.isHidden('pages/home.html') || moderation.isQuarantined('pages/home.html')) {
@@ -1503,7 +1527,7 @@ app.get('/world/', worldCSP, async (req, res, next) => {
       }
     }
 
-    const html = await renderPage(content, title, description, 'home');
+    const html = await renderPage(content, title, description, 'home', PLATFORM_PUBLICATION_META);
     res.send(html);
   } catch (e) {
     if (e instanceof WorldPathError) return res.status(404).json({ error: 'File not found' });
@@ -1535,7 +1559,9 @@ app.get('/world/:page', worldCSP, async (req, res, next) => {
     const title = (tag.match(/data-page-title="([^"]*)"/i) || [])[1] || page.replace(/-/g, ' ');
     const description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || '';
 
-    const html = await renderPage(content, title, description, page);
+    const publicationMeta = pagePublicationMeta(`pages/${page}.html`, content);
+    const html = await renderPage(content, title, description, page, publicationMeta);
+    setRobotsHeader(res, publicationMeta);
     res.send(html);
   } catch (e) {
     if (e instanceof WorldPathError) return res.status(404).send('Not found');
@@ -1865,10 +1891,12 @@ app.get('/sitemap.xml', async (req, res) => {
     <priority>0.8</priority>
     <lastmod>${now}</lastmod>
   </url>`;
-    for (const page of pages) {
+    for (const page of pages.filter(candidate =>
+      candidate.slug !== 'home' && candidate.publicationMeta.indexable)) {
+      const pageUrl = escapeXmlServer(`https://aibuilds.dev/world/${encodeURIComponent(page.slug)}`);
       xml += `
   <url>
-    <loc>https://aibuilds.dev/world/${page.slug}</loc>
+    <loc>${pageUrl}</loc>
     <changefreq>daily</changefreq>
     <priority>0.7</priority>
     <lastmod>${now}</lastmod>
@@ -1891,11 +1919,13 @@ app.get('/sitemap.xml', async (req, res) => {
 
 // Routes — Landing page
 app.get('/', (req, res) => {
+  setRobotsHeader(res, PLATFORM_PUBLICATION_META);
   res.sendFile(path.join(__dirname, '../public/landing.html'));
 });
 
 // Dashboard route
 app.get('/live', (req, res) => {
+  setRobotsHeader(res, PLATFORM_PUBLICATION_META);
   res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
@@ -3922,6 +3952,9 @@ async function getPages() {
     const navOrder = parseInt((tag.match(/data-page-nav-order="([^"]*)"/i) || [])[1] || '50', 10);
     const author = (tag.match(/data-page-author="([^"]*)"/i) || [])[1] || 'unknown';
     const description = (tag.match(/data-page-description="([^"]*)"/i) || [])[1] || '';
+    const publicationMeta = slug === 'home'
+      ? PLATFORM_PUBLICATION_META
+      : pagePublicationMeta(file.path, content);
 
     pages.push({
       slug,
@@ -3931,6 +3964,7 @@ async function getPages() {
       author,
       description,
       route: slug === 'home' ? '/world/' : `/world/${slug}`,
+      publicationMeta,
     });
   }
 
@@ -3962,7 +3996,7 @@ function generateNav(pages, currentSlug) {
           <li><a href="/" class="nav-link">Live</a></li>
         </ul>
         <button class="btn btn-ghost mobile-menu-btn" aria-label="Menu">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <line x1="3" y1="12" x2="21" y2="12"></line>
             <line x1="3" y1="6" x2="21" y2="6"></line>
             <line x1="3" y1="18" x2="21" y2="18"></line>
@@ -3997,7 +4031,13 @@ async function renderSectionsPage(req, res) {
     // Try to use layout.html if it exists, otherwise generate a minimal page
     let html;
     try {
-      html = await renderPage(sectionsHtml, 'AI BUILDS', PLATFORM_OPERATOR_MESSAGE, 'home');
+      html = await renderPage(
+        sectionsHtml,
+        'AI BUILDS',
+        PLATFORM_OPERATOR_MESSAGE,
+        'home',
+        PLATFORM_PUBLICATION_META,
+      );
     } catch (e) {
       // Load theme CSS if available
       let themeLink = '';
@@ -4027,6 +4067,7 @@ async function renderSectionsPage(req, res) {
 </html>`;
     }
 
+    setRobotsHeader(res, PLATFORM_PUBLICATION_META);
     res.send(html);
   } catch (e) {
     if (e instanceof WorldPathError) return res.status(404).send('Not found');
@@ -4036,20 +4077,24 @@ async function renderSectionsPage(req, res) {
 }
 
 // Helper: Render a page through the layout template
-async function renderPage(content, title, description, slug) {
-  let layout;
+async function renderPage(
+  content,
+  title,
+  description,
+  slug,
+  publicationMeta = PLATFORM_PUBLICATION_META,
+) {
+  let layout = null;
   try {
-    if (moderation.isHidden('layout.html') || moderation.isQuarantined('layout.html')) return content;
-    layout = await readPublicWorldFile('layout.html', 'utf8');
+    if (!moderation.isHidden('layout.html') && !moderation.isQuarantined('layout.html')) {
+      layout = await readPublicWorldFile('layout.html', 'utf8');
+    }
   } catch (e) {
     if (e instanceof WorldPathError) throw e;
     if (e.code !== 'ENOENT') throw e;
-    // If no layout, return content as-is (fallback)
-    return content;
   }
 
-  const pages = await getPages();
-  const nav = generateNav(pages, slug);
+  const nav = layout ? generateNav(await getPages(), slug) : '';
 
   // Per-page SEO block. title/description originate from agent-authored page meta, so they are
   // HTML-escaped for attribute context and the JSON-LD is JSON-encoded with '<' neutralized to
@@ -4070,6 +4115,7 @@ async function renderPage(content, title, description, slug) {
     isPartOf: { '@type': 'WebSite', name: 'AI BUILDS', url: BASE_URL },
   }).replace(/</g, '\\u003c');
   const headSeo = [
+    `<meta name="robots" content="${publicationMeta.robots}">`,
     `<link rel="canonical" href="${e(canonicalUrl)}">`,
     `<meta property="og:type" content="website">`,
     `<meta property="og:site_name" content="AI BUILDS">`,
@@ -4084,18 +4130,36 @@ async function renderPage(content, title, description, slug) {
     `<meta name="twitter:title" content="${e(ogTitle)}">`,
     `<meta name="twitter:description" content="${e(description)}">`,
     `<meta name="twitter:image" content="${ogImage}">`,
-    `<script type="application/ld+json">${jsonLd}</script>`,
+    publicationMeta.indexable ? `<script type="application/ld+json">${jsonLd}</script>` : '',
   ].join('\n  ');
+
+  if (!layout) {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${e(ogTitle)}</title>
+  <meta name="description" content="${e(description)}">
+  ${headSeo}
+</head>
+<body>
+  <a href="#main-content">Skip to main content</a>
+  <main id="main-content">${content}</main>
+</body>
+</html>`;
+  }
 
   const replacements = {
     '{{TITLE}}': escapeHtmlServer(title),
     '{{DESCRIPTION}}': escapeHtmlServer(description),
     '{{HEAD_SEO}}': headSeo,
     '{{NAV}}': nav,
+    '{{MAIN_CLASS}}': slug === 'home' ? 'world-main-home' : 'world-main-page',
     '{{CONTENT}}': content,
   };
   return layout.replace(
-    /\{\{TITLE\}\}|\{\{DESCRIPTION\}\}|\{\{HEAD_SEO\}\}|\{\{NAV\}\}|\{\{CONTENT\}\}/g,
+    /\{\{TITLE\}\}|\{\{DESCRIPTION\}\}|\{\{HEAD_SEO\}\}|\{\{NAV\}\}|\{\{MAIN_CLASS\}\}|\{\{CONTENT\}\}/g,
     match => replacements[match] || match
   );
 }
@@ -4109,6 +4173,10 @@ function escapeHtmlServer(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function escapeXmlServer(str) {
+  return escapeHtmlServer(str);
 }
 
 // Helper: Sanitize string for git commit message (strip control chars and newlines)

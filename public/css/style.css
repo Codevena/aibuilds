@@ -21,10 +21,37 @@ button {
   font-size: inherit;
   color: var(--text);
   cursor: pointer;
-  outline: none;
+}
+
+.skip-link {
+  position: fixed;
+  top: 0.75rem;
+  left: 0.75rem;
+  z-index: 10000;
+  padding: 0.65rem 0.9rem;
+  border: 2px solid var(--accent);
+  border-radius: 4px;
+  background: var(--bg-dark);
+  color: var(--text);
+  text-decoration: none;
+  transform: translateY(calc(-100% - 1rem));
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent-alt);
+  outline-offset: 3px;
+}
+
+:where(h1, h2, h3, h4, h5, h6)[id] {
+  scroll-margin-top: 1rem;
 }
 
 :root {
+  color-scheme: dark;
   --bg-dark: #0a0a0f;
   --bg-card: #12121a;
   --bg-elevated: #1a1a25;
@@ -39,6 +66,14 @@ button {
   --gold: #ffd700;
   --silver: #c0c0c0;
   --bronze: #cd7f32;
+}
+
+:where(a, button, input, select, textarea) {
+  touch-action: manipulation;
+}
+
+:where(h1, h2, h3) {
+  text-wrap: balance;
 }
 
 /* Lucide Icons */
@@ -199,7 +234,7 @@ html, body {
   padding: 0.5rem;
   cursor: pointer;
   font-size: 1.2rem;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   color: var(--text);
   display: flex;
   align-items: center;
@@ -223,7 +258,7 @@ html, body {
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text-muted);
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   text-decoration: none;
 }
 
@@ -277,7 +312,7 @@ html, body {
   text-decoration: none;
   font-size: 0.75rem;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   font-family: inherit;
 }
 
@@ -892,7 +927,7 @@ html, body {
   border-left: 2px solid transparent;
   color: var(--text-muted);
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   font-family: inherit;
   padding: 0;
 }
@@ -962,7 +997,7 @@ html, body {
   background: var(--bg-elevated);
   border-radius: 6px;
   border: 1px solid var(--border);
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
 }
 
 .leaderboard-item:hover {
@@ -1044,7 +1079,7 @@ html, body {
   background: var(--bg-elevated);
   border-radius: 4px;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   font-family: 'JetBrains Mono', monospace;
   font-size: 0.75rem;
 }
@@ -1170,7 +1205,7 @@ html, body {
   font-size: 0.65rem;
   font-family: 'JetBrains Mono', monospace;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   z-index: 1;
   opacity: 0.6;
 }
@@ -1297,7 +1332,7 @@ html, body {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.75rem;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
 }
 
 .guestbook-entry:hover {
@@ -1360,7 +1395,8 @@ html, body {
   justify-content: center;
   opacity: 0;
   visibility: hidden;
-  transition: all 0.3s;
+  transition: color 0.3s, background-color 0.3s, border-color 0.3s, box-shadow 0.3s, opacity 0.3s, transform 0.3s;
+  overscroll-behavior: contain;
   z-index: 1000;
 }
 
@@ -1514,7 +1550,7 @@ html, body {
   border-radius: 2px;
   background: var(--bg-elevated);
   cursor: pointer;
-  transition: all 0.1s;
+  transition: color 0.1s, background-color 0.1s, border-color 0.1s, box-shadow 0.1s, opacity 0.1s, transform 0.1s;
 }
 
 .heatmap-day:hover {
@@ -1591,9 +1627,8 @@ html, body {
   color: var(--text-muted);
   font-size: 0.7rem;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   font-family: inherit;
-  outline: none;
   box-shadow: none;
 }
 
@@ -1611,7 +1646,7 @@ html, body {
 /* Agent clickable name */
 .agent-name-link {
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
 }
 
 .agent-name-link:hover {
@@ -1797,7 +1832,7 @@ html, body {
   z-index: 2000;
   opacity: 0;
   transform: translateX(100%);
-  transition: all 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+  transition: color 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55), background-color 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55), border-color 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55), box-shadow 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55), opacity 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55), transform 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
   pointer-events: none;
 }
 
@@ -1870,7 +1905,7 @@ html, body {
   border-radius: 12px;
   font-size: 0.7rem;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   color: var(--text-muted);
 }
 
@@ -1966,7 +2001,7 @@ html, body {
   font-size: 0.65rem;
   color: var(--text-muted);
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   font-family: inherit;
 }
 
@@ -2023,7 +2058,7 @@ html, body {
   stroke: var(--bg-dark);
   stroke-width: 2px;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
 }
 
 .network-graph .node circle:hover {
@@ -2223,7 +2258,7 @@ html, body {
   border-radius: 4px;
   font-size: 0.65rem;
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2271,7 +2306,6 @@ html, body {
 }
 
 .search-input:focus {
-  outline: none;
   border-color: var(--accent);
 }
 
@@ -2456,7 +2490,7 @@ html, body {
   font-size: 0.65rem;
   color: var(--text-muted);
   cursor: pointer;
-  transition: all 0.2s;
+  transition: color 0.2s, background-color 0.2s, border-color 0.2s, box-shadow 0.2s, opacity 0.2s, transform 0.2s;
 }
 
 .diff-btn:hover {
@@ -2798,6 +2832,25 @@ html, body {
   .replay-speed select {
     min-width: 44px;
     min-height: 44px;
+  }
+
+  :where(a, button, input:not([type="checkbox"]), select, textarea, [role="button"]),
+  .checkbox-label {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  a,
+  .agent-name-link,
+  .feed-file,
+  .feed-comments-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .checkbox-label {
+    padding-block: 0.5rem;
   }
 
   .feed-section {

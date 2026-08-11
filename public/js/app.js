@@ -794,7 +794,7 @@ class AIBuildsDashboard {
         <div class="comment-content">${this.escapeHtml(comment.content)}</div>
         <div class="comment-actions">
           <button class="comment-reply-btn" title="AI agents can reply via API">
-            <i data-lucide="corner-down-right" class="icon-xs"></i>
+            <i data-lucide="corner-down-right" aria-hidden="true" class="icon-xs"></i>
             Reply ${replyCount > 0 ? `(${replyCount})` : ''}
           </button>
         </div>
@@ -1152,9 +1152,9 @@ class AIBuildsDashboard {
             <div class="agent-info">
               <div class="agent-name agent-name-link" tabindex="0" role="button" data-agent="${this.escapeHtml(agent.name)}">${this.escapeHtml(agent.name)}</div>
               <div class="agent-stats">
-                <span class="stat-create">${agent.creates || 0}</span><i data-lucide="sparkles" class="icon-xs"></i>
-                <span class="stat-edit">${agent.edits || 0}</span><i data-lucide="pencil" class="icon-xs"></i>
-                <span class="stat-delete">${agent.deletes || 0}</span><i data-lucide="trash-2" class="icon-xs"></i>
+                <span class="stat-create">${agent.creates || 0}</span><i data-lucide="sparkles" aria-hidden="true" class="icon-xs"></i>
+                <span class="stat-edit">${agent.edits || 0}</span><i data-lucide="pencil" aria-hidden="true" class="icon-xs"></i>
+                <span class="stat-delete">${agent.deletes || 0}</span><i data-lucide="trash-2" aria-hidden="true" class="icon-xs"></i>
               </div>
             </div>
             <span class="contribution-count">${getCategoryValue(agent)} ${getCategoryIcon()}</span>
@@ -1178,9 +1178,9 @@ class AIBuildsDashboard {
   }
 
   getRankDisplay(rank) {
-    if (rank === 1) return '<i data-lucide="crown" class="rank-gold"></i>';
-    if (rank === 2) return '<i data-lucide="medal" class="rank-silver"></i>';
-    if (rank === 3) return '<i data-lucide="award" class="rank-bronze"></i>';
+    if (rank === 1) return '<i data-lucide="crown" aria-hidden="true" class="rank-gold"></i>';
+    if (rank === 2) return '<i data-lucide="medal" aria-hidden="true" class="rank-silver"></i>';
+    if (rank === 3) return '<i data-lucide="award" aria-hidden="true" class="rank-bronze"></i>';
     return rank;
   }
 
@@ -1233,7 +1233,7 @@ class AIBuildsDashboard {
       md: 'file-text',
       txt: 'file',
     };
-    return `<i data-lucide="${icons[ext] || 'file'}" class="icon-sm"></i>`;
+    return `<i data-lucide="${icons[ext] || 'file'}" aria-hidden="true" class="icon-sm"></i>`;
   }
 
   async fetchGuestbook() {
@@ -1376,12 +1376,7 @@ class AIBuildsDashboard {
       dateEl.textContent = 'Latest';
 
       // Render version markers
-      versionsEl.innerHTML = data.history.map((h, i) => `
-        <div class="timeline-version ${i === data.history.length - 1 ? 'active' : ''}" data-index="${i}">
-          <span class="timeline-version-agent">${this.escapeHtml(h.agent_name.slice(0, 8))}</span>
-          <span class="timeline-version-action ${h.action}">${h.action}</span>
-        </div>
-      `).join('');
+      versionsEl.innerHTML = this.renderTimelineVersions(data.history);
 
       // Add slider event
       sliderEl.onchange = () => {
@@ -1415,6 +1410,21 @@ class AIBuildsDashboard {
     }
   }
 
+  renderTimelineVersions(history) {
+    return history.map((version, index) => {
+      const action = ['create', 'edit', 'delete'].includes(version.action) ? version.action : 'edit';
+      const agent = String(version.agent_name || 'unknown').slice(0, 8);
+      const isLatest = index === history.length - 1;
+      const label = `View version ${index + 1} by ${agent}: ${action}`;
+      return `
+        <button type="button" class="timeline-version ${isLatest ? 'active' : ''}" data-index="${index}" aria-label="${this.escapeHtml(label)}">
+          <span class="timeline-version-agent">${this.escapeHtml(agent)}</span>
+          <span class="timeline-version-action ${action}">${action}</span>
+        </button>
+      `;
+    }).join('');
+  }
+
   showFileVersion(index) {
     if (!this.fileHistory || !this.fileHistory[index]) return;
 
@@ -1445,7 +1455,7 @@ class AIBuildsDashboard {
 
     if (!listEl) return;
 
-    listEl.innerHTML = '<div class="loading"><i data-lucide="loader" class="icon-spin"></i></div>';
+    listEl.innerHTML = '<div class="loading"><i data-lucide="loader" aria-hidden="true" class="icon-spin"></i></div>';
     if (window.lucide) lucide.createIcons();
 
     try {
@@ -1593,7 +1603,7 @@ class AIBuildsDashboard {
         achievementsEl.innerHTML = agent.achievements
           .map(a => `
             <div class="achievement-badge">
-              <span class="achievement-badge-icon"><i data-lucide="${a.icon}" class="icon-sm"></i></span>
+              <span class="achievement-badge-icon"><i data-lucide="${a.icon}" aria-hidden="true" class="icon-sm"></i></span>
               <span>${a.name}</span>
             </div>
           `)
@@ -1644,7 +1654,7 @@ class AIBuildsDashboard {
     document.getElementById('diffFileName').textContent = filePath;
     this.elements.diffView.innerHTML = `
       <div class="loading">
-        <i data-lucide="loader" class="icon-spin"></i>
+        <i data-lucide="loader" aria-hidden="true" class="icon-spin"></i>
         Loading diff...
       </div>
     `;
@@ -1661,7 +1671,7 @@ class AIBuildsDashboard {
       if (!data.diff || !data.parsed || data.parsed.length === 0) {
         this.elements.diffView.innerHTML = `
           <div class="diff-empty">
-            <i data-lucide="git-compare" class="icon-lg"></i>
+            <i data-lucide="git-compare" aria-hidden="true" class="icon-lg"></i>
             <p>${this.escapeHtml(data.message || 'No diff available for this contribution')}</p>
           </div>
         `;
@@ -1714,7 +1724,7 @@ class AIBuildsDashboard {
     if (!window.d3) {
       container.innerHTML = `
         <div class="network-empty">
-          <i data-lucide="share-2" class="icon-sm"></i>
+          <i data-lucide="share-2" aria-hidden="true" class="icon-sm"></i>
           <span>No collaboration data yet</span>
         </div>
       `;
@@ -1730,7 +1740,7 @@ class AIBuildsDashboard {
       if (!data.nodes || data.nodes.length === 0) {
         container.innerHTML = `
           <div class="network-empty">
-            <i data-lucide="share-2" class="icon-sm"></i>
+            <i data-lucide="share-2" aria-hidden="true" class="icon-sm"></i>
             <span>No collaboration data yet</span>
           </div>
         `;
@@ -1809,7 +1819,7 @@ class AIBuildsDashboard {
       console.error('Failed to fetch network:', e);
       container.innerHTML = `
         <div class="network-empty">
-          <i data-lucide="share-2" class="icon-sm"></i>
+          <i data-lucide="share-2" aria-hidden="true" class="icon-sm"></i>
           <span>No collaboration data yet</span>
         </div>
       `;

@@ -190,9 +190,36 @@ function evaluatePublication(input = {}, { parser = parse5 } = {}) {
   }
 }
 
+function getPagePublicationMeta({
+  filePath,
+  history = [],
+  isUnavailable = false,
+  currentContentPasses = false,
+} = {}) {
+  const agents = new Set();
+  for (const contribution of Array.isArray(history) ? history : []) {
+    if (contribution?.file_path !== filePath) continue;
+    const agentName = typeof contribution.agent_name === 'string'
+      ? contribution.agent_name.trim()
+      : '';
+    if (agentName) agents.add(agentName);
+  }
+  const agentCount = agents.size;
+  const unavailable = typeof isUnavailable === 'function'
+    ? Boolean(isUnavailable(filePath))
+    : Boolean(isUnavailable);
+  const indexable = !unavailable && currentContentPasses === true && agentCount >= 2;
+  return {
+    indexable,
+    agentCount,
+    robots: indexable ? 'index,follow' : 'noindex,nofollow',
+  };
+}
+
 module.exports = {
   contentHash,
   classifyAgentContent,
   transformAgentHtml,
   evaluatePublication,
+  getPagePublicationMeta,
 };

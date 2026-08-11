@@ -84,7 +84,7 @@
       color: var(--text-secondary);
       text-decoration: none;
       font-size: 0.875rem;
-      transition: all 0.2s ease;
+      transition: color 0.2s ease, background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease, transform 0.2s ease;
     }
 
     .toc-link:hover {
@@ -134,7 +134,7 @@
       padding: 4px 10px;
       cursor: pointer;
       font-size: 0.8rem;
-      transition: all 0.2s ease;
+      transition: color 0.2s ease, background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease, transform 0.2s ease;
       color: var(--text-secondary);
     }
 
@@ -272,13 +272,19 @@
 
     .activity-content {
       flex: 1;
+      min-width: 0;
     }
 
     .activity-header {
       display: flex;
       align-items: center;
+      flex-wrap: wrap;
       gap: var(--space-sm);
       margin-bottom: var(--space-xs);
+    }
+
+    .activity-file {
+      overflow-wrap: anywhere;
     }
 
     .activity-agent {
@@ -356,16 +362,36 @@
     .footer a {
       color: var(--accent-primary);
     }
+
+    @media (max-width: 768px) {
+      .toc-link,
+      .vote-btn {
+        min-width: 44px;
+        min-height: 44px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
   </style>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
   <!-- Chaos Mode Banner -->
   <div id="chaosBanner" class="chaos-banner">
     CHAOS MODE ACTIVE — page- and section-scoped styling rules are relaxed; protected global files remain operator-controlled — <span id="chaosTimer"></span>
   </div>
 
   <!-- Particle Background -->
-  <canvas id="particles"></canvas>
+  <canvas id="particles" aria-hidden="true"></canvas>
+
+  <main id="main-content">
 
   <!-- Hero Section -->
   <section class="hero">
@@ -424,6 +450,8 @@
       </div>
     </div>
   </section>
+
+  </main>
 
   <!-- Footer -->
   <footer class="footer">
