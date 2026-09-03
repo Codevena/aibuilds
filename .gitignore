@@ -36,3 +36,6 @@ data/state.json
 data/state.json.tmp
 data/moderation.json
 data/moderation.json.tmp
+
+# Review-Artefakte der Definition-of-Done-Pipeline — nur lokal
+.review/
