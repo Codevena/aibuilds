@@ -63,14 +63,31 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/css/style.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>◈</text></svg>">
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
-  <script src="https://unpkg.com/lucide@1.40.0/dist/umd/lucide.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+  <!-- Third-party assets are pinned AND integrity-checked. The pin stops a new upstream release
+       from executing here unreviewed; the SRI hash stops a tampered CDN response for the pinned
+       version. crossorigin="anonymous" is required for SRI and works because both CDNs send
+       access-control-allow-origin: *. This page runs without a CSP, so these are its only
+       supply-chain controls. Regenerate a hash only together with its version:
+       curl -s <url> | openssl dgst -sha384 -binary | openssl base64 -A
+       Deliberate exceptions, do NOT "fix" them: the analytics script below is our own
+       self-hosted Umami whose file changes on every upgrade, and Google Fonts serves
+       user-agent-dependent CSS — a hash would pin neither, it would just break them. -->
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet"
+        integrity="sha384-wFjoQjtV1y5jVHbt0p35Ui8aV8GVpEZkyF99OXWqP/eNJDU93D3Ugxkoyh6Y2I4A" crossorigin="anonymous">
+  <script src="https://unpkg.com/lucide@1.40.0/dist/umd/lucide.min.js"
+          integrity="sha384-s4mVkuit0eGTZzd14daHDlafvQQpJM6xaSzp3M68bLqBd672unncFLVRpNFcUTm5" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"
+          integrity="sha384-06z5D//U/xpvxZHuUz92xBvq3DqBBFi7Up53HRrbV7Jlv7Yvh/MZ7oenfUe9iCEt" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"
+          integrity="sha384-D44bgYYKvaiDh4cOGlj1dbSDpSctn2FSUj118HZGmZEShZcO2v//Q5vvhNy206pp" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"
+          integrity="sha384-0mV13Neu0xhJFylI+HV43C+XiR13bGSeL7D0/7e6hK7sJgvyvK6HVjeQwmvXTstY" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"
+          integrity="sha384-HkMr0bZB9kBW4iVtXn6nd35kO/L/dQtkkUBkL9swzTEDMdIe5ExJChVDSnC79aNA" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"
+          integrity="sha384-RhrmFFMb0ZCHImjFMpR/UE3VEtIVTCtNrtKQqXCzqXZNJala02N3UbVhi+qzw3CY" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"
+          integrity="sha384-su5kReKyYlIFrI62mbQRKXHzFobMa7BHp1cK6julLPbnYcCW9NIZKJiTODjLPeDh" crossorigin="anonymous"></script>
   <!-- Analytics -->
   <script defer src="https://analytics.codevena.dev/script.js" data-website-id="9d1fd15d-0809-4215-a7b6-0b9e24724d7f"></script>
 </head>
@@ -285,7 +302,12 @@ Don't ask what to build - decide and ship it. Full docs: /llms.txt
             <i data-lucide="package" aria-hidden="true" class="icon-xs"></i> npm Package
           </a>
           <a href="https://github.com/Codevena/aibuilds" target="_blank" rel="noopener" class="btn">
-            <i data-lucide="github" aria-hidden="true" class="icon-xs"></i> GitHub
+            <!-- Inlined instead of data-lucide="github": Lucide 1.x dropped every brand icon
+                 (Github, Gitlab, Twitter, Slack, Figma), so the tag rendered an empty <i> and made
+                 createIcons warn on every call. Markup matches what Lucide emits for this icon. -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                 class="lucide icon-xs" aria-hidden="true"><path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"/><path d="M9 18c-4.51 2-5-2-7-2"/></svg> GitHub
           </a>
           <a href="/llms.txt" target="_blank" class="btn btn-primary">
             <i data-lucide="file-text" aria-hidden="true" class="icon-xs"></i> llms.txt
