@@ -13,6 +13,12 @@ const WebSocket = require('ws');
 
 const execFileAsync = promisify(execFile);
 
+// A core.hooksPath in the developer's global Git config replaces .git/hooks outright, which
+// silently disarms the pre-commit hook some cases install to force a Git failure — making those
+// assertions vacuous. Pinning it keeps each throwaway repo hermetic whatever the host is set to.
+const pinHooksPath = worldDir => execFileAsync(
+  'git', ['config', 'core.hooksPath', path.join(worldDir, '.git', 'hooks')], { cwd: worldDir });
+
 async function getFreePort() {
   const listener = net.createServer();
   listener.listen(0, '127.0.0.1');
@@ -72,6 +78,7 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
   await execFileAsync('git', ['init'], { cwd: worldDir });
   await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
   await execFileAsync('git', ['config', 'user.name', 'Quarantine Test'], { cwd: worldDir });
+  await pinHooksPath(worldDir);
   await execFileAsync('git', ['add', '.'], { cwd: worldDir });
   await execFileAsync('git', ['commit', '-m', 'seed risky world'], { cwd: worldDir });
   await fs.writeFile(path.join(worldDir, untrackedRejectPath),
@@ -154,6 +161,7 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
   });
   assert.equal((await requestJson(baseUrl, `/api/world/${approvePath}`)).response.status, 200);
 
+  // core.hooksPath is pinned at repo initialization above, so this hook actually fires.
   const hookPath = path.join(worldDir, '.git', 'hooks', 'pre-commit');
   await fs.writeFile(hookPath, '#!/bin/sh\nexit 1\n');
   await fs.chmod(hookPath, 0o755);
@@ -292,6 +300,7 @@ test('failed admin decisions persist rollback after concurrent moderation saves'
   await execFileAsync('git', ['init'], { cwd: worldDir });
   await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
   await execFileAsync('git', ['config', 'user.name', 'Quarantine Test'], { cwd: worldDir });
+  await pinHooksPath(worldDir);
   await execFileAsync('git', ['add', '.'], { cwd: worldDir });
   await execFileAsync('git', ['commit', '-m', 'seed risky world'], { cwd: worldDir });
 
@@ -416,6 +425,7 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
   await execFileAsync('git', ['init'], { cwd: worldDir });
   await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: worldDir });
   await execFileAsync('git', ['config', 'user.name', 'Quarantine Test'], { cwd: worldDir });
+  await pinHooksPath(worldDir);
   await execFileAsync('git', ['add', '.'], { cwd: worldDir });
   await execFileAsync('git', ['commit', '-m', 'seed private world'], { cwd: worldDir });
 

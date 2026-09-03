@@ -1109,6 +1109,10 @@ for (const failureKind of ['moderation', 'state', 'git']) {
     let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
     if (failureKind === 'git') {
       const hookPath = path.join(worldDir, '.git', 'hooks', 'pre-commit');
+      // A core.hooksPath in the developer's global Git config replaces .git/hooks outright, which
+      // silently disarms this hook and makes the forced-failure assertions below vacuous. Pin the
+      // path in the throwaway repo so the injection works regardless of the host configuration.
+      await execFileAsync('git', ['config', 'core.hooksPath', path.dirname(hookPath)], { cwd: worldDir });
       await fs.writeFile(hookPath, '#!/bin/sh\nexit 1\n');
       await fs.chmod(hookPath, 0o755);
     } else {
