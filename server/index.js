@@ -82,6 +82,27 @@ function setRobotsHeader(res, publicationMeta) {
 }
 
 // Git setup for history - detect git binary location
+// This server addresses exactly one repository — the World dir, and it names it by cwd. Git exports
+// GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE into hook environments, so a deploy hook that restarts
+// or reloads the server hands them straight down, and every git call would then quietly act on
+// whatever they name. All three break the index guard below, in different directions, all measured:
+// GIT_DIR without GIT_WORK_TREE makes git treat the cwd as the work-tree root, so
+// `rev-parse --show-prefix` returns "" while the index still reports repo-root paths — the guard
+// then read the repo-root `pages/b.html` as its own `pages/b.html` and let a pathspec-less commit
+// carry it. Fail-open.
+// GIT_INDEX_FILE points the index elsewhere for the check AND the commit alike, so it cannot split
+// the two; what it does is make `git diff --cached --name-only` report every file in HEAD as a
+// staged deletion, so the guard reads the World's own pages as foreign and refuses every guarded
+// commit from then on. Fail-closed, but permanently, and the log blames the World's own files.
+// GIT_WORK_TREE moves the work tree out from under the pathspecs: alone it flips `--show-prefix`
+// from "" to "world/" in the container layout while the index keeps reporting root-relative paths.
+// Fail-closed too — `git add` stops matching before the guard even rules.
+// Dropped once, here. Per-call GIT_INDEX_FILE overrides still work: runGitFile merges its extraEnv
+// on top of this, which is what compensateContributionGit relies on.
+delete process.env.GIT_DIR;
+delete process.env.GIT_WORK_TREE;
+delete process.env.GIT_INDEX_FILE;
+
 const gitBinary = (() => {
   try {
     return execSync('which git', { encoding: 'utf-8' }).trim();
@@ -520,14 +541,74 @@ async function failClosedRollbackPath(transaction, reason) {
   });
 }
 
-async function runGitFile(args, extraEnv = {}) {
+async function runGitFile(args, extraEnv = {}, encoding = 'utf8') {
   const { stdout } = await execGitFile(gitBinary, args, {
     cwd: WORLD_DIR,
     env: { ...process.env, ...extraEnv },
-    encoding: 'utf8',
+    encoding,
     maxBuffer: 10 * 1024 * 1024,
   });
   return stdout;
+}
+
+// Reads the paths the index holds against HEAD, reported relative to the REPOSITORY root.
+// Every flag here is load-bearing, measured:
+// -z keeps non-ASCII paths verbatim; without it git C-quotes them and the own path below never
+// compares equal, so a legitimate operation is refused.
+// --no-renames stops git pairing a staged add with a similar-content staged deletion into one
+// rename and printing only the new name — that shape hides the deletion from the guard entirely,
+// and a foreign page was measured vanishing from the HEAD tree through it.
+// --ignore-submodules=none keeps a staged gitlink visible under a diff.ignoreSubmodules config.
+// execFile rather than simple-git, because simple-git scores exit != 0 with EMPTY stderr as success
+// (isTaskError = !!(exitCode && stdErr.length)) — a failed check would return "" and read as a
+// clean index, which is the exact failure mode this guard exists to stop.
+// Returned as Buffers, not strings: git permits path bytes that are not valid UTF-8, and decoding
+// turns every such byte into U+FFFD — two different undecodable paths, and a path that literally
+// contains the replacement character, all collapse onto the same string. Comparing the raw bytes
+// keeps them distinct (measured: an index entry holding a raw 0xFF decoded to exactly the same
+// string as a request path spelled with U+FFFD, which the agent write policy admits).
+async function stagedIndexPaths() {
+  const output = await runGitFile(
+    ['diff', '--cached', '--name-only', '-z', '--no-renames', '--ignore-submodules=none'],
+    {}, 'buffer');
+  const paths = [];
+  let start = 0;
+  for (let index = 0; index <= output.length; index++) {
+    if (index === output.length || output[index] === 0) {
+      if (index > start) paths.push(output.subarray(start, index));
+      start = index + 1;
+    }
+  }
+  return paths;
+}
+
+// A commit without a pathspec commits the ENTIRE index, including whatever another code path left
+// staged there. The producers of a dirty index are barely enumerable (a missing reset, a crash
+// between add and commit, an operator staging by hand); the consumers in this file are, so each one
+// proves first that the index holds nothing but its own path.
+async function assertIndexConfinedTo(ownPath, context) {
+  // stagedIndexPaths reports relative to the git root, ownPath relative to WORLD_DIR. Those
+  // coincide only when the World dir IS the git root — true for the container, where world/ is its
+  // own volume and its own repo, and false for a plain clone, where world/ is tracked by the
+  // project repo and every own path comes back prefixed with "world/". --relative would line them
+  // up and break something worse: it hides every staged path OUTSIDE the World dir, a fail-open.
+  const prefix = (await runGitFile(['rev-parse', '--show-prefix'])).replace(/\n$/, '');
+  const own = Buffer.from(prefix + ownPath, 'utf8');
+  // Byte-exact on purpose. Folding Unicode forms (entry.normalize('NFC') === own.normalize('NFC'))
+  // and delegating to git (':(exclude,literal)' + own) were both measured, and both let a GENUINELY
+  // foreign path pass as "own": the first for an NFD/NFC twin pair, which the INDEX holds side by
+  // side even on a filesystem that cannot; the second for anything nested below the own path, since
+  // a pathspec naming a path also matches everything under it. The cost of byte equality is the
+  // reverse and deliberately accepted: an own path asked for in a spelling git does not echo back
+  // is refused rather than committed — fail-closed, and logged.
+  const foreign = (await stagedIndexPaths()).filter(entry => !entry.equals(own));
+  if (foreign.length === 0) return;
+  // Quoted: the write policy accepts newlines and commas inside a path, so a raw join would let a
+  // staged path forge its own log line.
+  console.error(`${context}: index holds unrelated staged paths: ${
+    foreign.map(entry => JSON.stringify(entry.toString('utf8'))).join(', ')}`);
+  throw new Error(
+    `${context}: refusing pathspec-less commit over ${foreign.length} unrelated staged path(s)`);
 }
 
 function literalGitPathspec(filePath) {
@@ -2238,9 +2319,27 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
       // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
       // `git add <deleted path>` stages the file's removal.
       try {
-        await git.add(['--', literalGitPathspec(relPath)]);
-        await git.commit(`moderation: remove ${relPath}`);
-      } catch (e) { /* best effort */ }
+        // Queued like every other index-mutating Git sequence in this file, so no other request can
+        // stage a path between the check and the commit. Holding CONTRIBUTION_STATE_LOCK already
+        // achieves that today because every queueGitOperation caller holds it too, but that is an
+        // invariant stated nowhere; the queue makes the guard's atomicity structural instead of
+        // incidental. One producer stays out of reach at EVERY commit in this file, guarded or
+        // not, and is accepted rather than closed: a pre-commit hook that stages paths itself runs
+        // INSIDE `git commit`, after this check has read the index. Measured: it reaches the
+        // `commit --only` siblings just as well, because git points the hook at the temporary index
+        // a partial commit builds — so the guard is not what leaves this open. The World repo ships
+        // no hooks, installing one is an operator action, and --no-verify would buy this at the
+        // price of every hook that vetoes a bad commit.
+        // The check runs BEFORE the add, so a refusal leaves nothing of ours behind: a guard that
+        // stages its own deletion and only then aborts would make every later pathspec-less commit
+        // refuse too. The unlink above is not undone either way — that is this branch's existing
+        // best-effort semantics, which a failing hook produces just the same.
+        await queueGitOperation(async () => {
+          await assertIndexConfinedTo(relPath, 'Moderation removal commit');
+          await git.add(['--', literalGitPathspec(relPath)]);
+          await git.commit(`moderation: remove ${relPath}`);
+        });
+      } catch (e) { console.warn(`Moderation removal commit skipped: ${e.message}`); }
       await saveState(); // delete also mutated history/contributions, which live in state.json
     }
 
@@ -2440,6 +2539,7 @@ app.post('/api/admin/quarantine/reject', adminLimiter, async (req, res) => {
         if (tracked || alreadyStaged) {
           await git.raw(['commit', '--only', '--allow-empty', '-m', subject, '--', pathspec]);
         } else {
+          await assertIndexConfinedTo(filePath, 'Quarantine rejection commit');
           await git.raw(['commit', '--allow-empty', '-m', subject]);
         }
       } catch (error) {
@@ -4229,6 +4329,7 @@ async function _gitCommitImpl(contribution, previousIndexState) {
     if (pathWasStaged) {
       await git.raw(['commit', '--only', '--allow-empty', '-m', commitMessage, '--', pathspec]);
     } else {
+      await assertIndexConfinedTo(contribution.file_path, 'Contribution commit');
       await git.raw(['commit', '--allow-empty', '-m', commitMessage]);
     }
     const latest = (await git.log({ maxCount: 1 })).latest;
@@ -4451,6 +4552,12 @@ async function init() {
         await git.init();
         await git.addConfig('user.email', 'ai@aibuilds.dev');
         await git.addConfig('user.name', 'AI BUILDS');
+        // No assertIndexConfinedTo here, unlike the three other pathspec-less commits: that guard
+        // permits exactly one path, and this commit deliberately has none — `git add '.'` below
+        // stages the whole worktree, so confining the index to a single path is meaningless rather
+        // than merely unreached. (An earlier version of this comment claimed no `git status`
+        // failure on a repo WITH history could reach the commit; that is false — deleting
+        // .git/HEAD gets there — and the reason above does not depend on it.)
         await git.add('.');
         await git.commit('Initial commit - AI BUILDS begins');
         console.log('Initialized new world git repo');
