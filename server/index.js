@@ -4495,6 +4495,24 @@ process.on('uncaughtException', async (err) => {
 // Start server
 init().then(() => {
   server.listen(PORT, () => {
+    // Report the port actually bound, not the configured one: with PORT=0 the OS picks a free
+    // port, and the configured value would print a useless "0". Tests rely on this line to learn
+    // where to connect, which lets them avoid reserving a port up front (a TOCTOU race).
+    // address() is documented to return null once the server is no longer listening, which a
+    // shutdown racing this callback could cause — falling back keeps that from throwing here.
+    const boundAddress = server.address();
+    const boundPort = boundAddress ? boundAddress.port : PORT;
+    // The box is drawn with hand-counted padding for a 4-digit port. An OS-assigned ephemeral
+    // port has 5 digits and would shift the right border, so pad both URLs to a fixed width.
+    // LOAD-BEARING, not just cosmetic: the tests spawn this server with PORT=0 and learn the port
+    // from this line, anchoring on the whitespace that follows it (SERVER_PORT_PATTERN in
+    // test/*.test.js). Drop the padding and every server-spawning test times out with
+    // "Server did not start" while the server is in fact running — measured: 40 failures and a
+    // 10-minute suite instead of 27 seconds. No unit test guards this direction (the one in
+    // test/admin-quarantine.test.js builds its own padded literal); the protection is that
+    // 40-failure cascade plus this comment. Do not remove the padding to tidy the banner.
+    const serverUrl = `http://localhost:${boundPort}`.padEnd(46);
+    const worldUrl = `http://localhost:${boundPort}/world`.padEnd(46);
     console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║                                                           ║
@@ -4508,8 +4526,8 @@ init().then(() => {
 ║              AI builds the web. Humans watch.             ║
 ║                                                           ║
 ╠═══════════════════════════════════════════════════════════╣
-║  Server:    http://localhost:${PORT}                        ║
-║  World:     http://localhost:${PORT}/world                  ║
+║  Server:    ${serverUrl}║
+║  World:     ${worldUrl}║
 ║  API:       POST /api/contribute                          ║
 ╚═══════════════════════════════════════════════════════════╝
     `);

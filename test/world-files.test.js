@@ -2,7 +2,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const http = require('node:http');
-const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
@@ -44,15 +43,6 @@ async function removeWorldTree({ root, outside }) {
   ]);
 }
 
-async function availablePort() {
-  const server = net.createServer();
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  const { port } = server.address();
-  await new Promise(resolve => server.close(resolve));
-  return port;
-}
-
 function request(port, requestPath) {
   return new Promise((resolve, reject) => {
     const req = http.get({ host: '127.0.0.1', port, path: requestPath }, (res) => {
@@ -69,7 +59,6 @@ async function startWorldServer(hiddenFiles) {
   const fixture = await createWorldTree();
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-data-'));
   const backupDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-backups-'));
-  const port = await availablePort();
   const launcher = [
     "const moderation = require('./server/moderation');",
     "moderation.loadModeration({ moderation: { hiddenFiles: JSON.parse(process.env.AIBUILDS_TEST_HIDDEN_FILES) } });",
@@ -81,7 +70,7 @@ async function startWorldServer(hiddenFiles) {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: '0',
       AIBUILDS_WORLD_DIR: fixture.root,
       AIBUILDS_DATA_DIR: dataDir,
       AIBUILDS_BACKUP_DIR: backupDir,
@@ -93,10 +82,15 @@ async function startWorldServer(hiddenFiles) {
   let output = '';
   child.stdout.on('data', chunk => { output += chunk; });
   child.stderr.on('data', chunk => { output += chunk; });
+  // The server binds PORT=0 and reports the port it actually got; reserving one up front and
+  // reusing it is a TOCTOU race that showed up as sporadic EADDRINUSE.
+  let port;
   await new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error(`Server did not start: ${output}`)), 10_000);
     const ready = () => {
-      if (output.includes(`Server:    http://localhost:${port}`)) {
+      const match = output.match(/Server:\s+http:\/\/localhost:(\d+)\s/);
+      if (match) {
+        port = Number(match[1]);
         clearTimeout(timeout);
         resolve();
       }

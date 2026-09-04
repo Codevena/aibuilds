@@ -5,7 +5,6 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const net = require('node:net');
 const { spawn, execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { once } = require('node:events');
@@ -23,15 +22,6 @@ const {
 const safeContent = '<main><h1>Snake game</h1><p>Collect apples with the arrow keys.</p></main>';
 const execFileAsync = promisify(execFile);
 
-async function getFreePort() {
-  const listener = net.createServer();
-  listener.listen(0, '127.0.0.1');
-  await once(listener, 'listening');
-  const port = listener.address().port;
-  await new Promise(resolve => listener.close(resolve));
-  return port;
-}
-
 async function waitFor(condition, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -45,13 +35,12 @@ async function waitFor(condition, timeoutMs = 5000) {
 async function startIsolatedServer(t, {
   worldDir, dataDir, backupDir, secret = 'test-secret', extraEnv = {},
 }) {
-  const port = await getFreePort();
   const logs = [];
   const child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: '0',
       POW_DIFFICULTY: '0',
       ADMIN_RESET_SECRET: secret,
       AIBUILDS_WORLD_DIR: worldDir,
@@ -70,10 +59,17 @@ async function startIsolatedServer(t, {
     if (exited) child.kill('SIGTERM');
     if (exited) await exited;
   });
-  const baseUrl = `http://127.0.0.1:${port}`;
+  // The server binds PORT=0 and reports the port it actually got; reserving one up front and
+  // reusing it is a TOCTOU race that showed up as sporadic EADDRINUSE.
+  let baseUrl;
   try {
     await waitFor(async () => {
       if (child.exitCode !== null) throw new Error(`Server exited early:\n${logs.join('')}`);
+      if (!baseUrl) {
+        const match = logs.join('').match(/Server:\s+http:\/\/localhost:(\d+)\s/);
+        if (!match) return false;
+        baseUrl = `http://127.0.0.1:${match[1]}`;
+      }
       try { return (await fetch(`${baseUrl}/api/stats`)).ok; } catch { return false; }
     }, 10000);
   } catch (error) {

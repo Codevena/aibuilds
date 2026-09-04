@@ -5,7 +5,6 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const net = require('node:net');
 const { spawn, execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { once } = require('node:events');
@@ -19,22 +18,52 @@ const execFileAsync = promisify(execFile);
 const pinHooksPath = worldDir => execFileAsync(
   'git', ['config', 'core.hooksPath', path.join(worldDir, '.git', 'hooks')], { cwd: worldDir });
 
-async function getFreePort() {
-  const listener = net.createServer();
-  listener.listen(0, '127.0.0.1');
-  await once(listener, 'listening');
-  const port = listener.address().port;
-  await new Promise(resolve => listener.close(resolve));
-  return port;
-}
+// Reads the bound port from the server's own startup banner instead of reserving one up front.
+// The trailing \s matters: without it a stdout chunk ending mid-number matches a TRUNCATED port,
+// and since the first match is cached that is terminal - the test then fails as a connection
+// timeout while the log shows the correct banner. Self-camouflaging, so anchor on the padding.
+// Pre-reserving (listen(0), close, reuse) is a TOCTOU race: between close and the child's bind the
+// port can be taken, which surfaced as sporadic EADDRINUSE and looked like a regression.
+const SERVER_PORT_PATTERN = /Server:\s+http:\/\/localhost:(\d+)\s/;
 
-async function waitForServer(baseUrl, child, logs) {
+test('startup banner keeps the port extractable', () => {
+  // Guards the trailing \s in SERVER_PORT_PATTERN. Without it a stdout chunk ending mid-number
+  // matches a TRUNCATED port ("5894" below) and, because the first match is cached, the test then
+  // fails as a connection timeout while the log shows the correct banner. Measured: stripping the
+  // anchor turns this test red.
+  //
+  // It does NOT guard the padEnd() in server/index.js, even though the third assertion describes
+  // that coupling: the padded string below is built from a local literal, so removing the padding
+  // in production leaves this test green. That direction is caught loudly instead — 40 integration
+  // tests fail — and documented at the padEnd() itself. Making it a real guard would mean exporting
+  // the banner builder, which is a bigger change than the risk warrants.
+  const abgeschnitten = '\u2551  Server:    http://localhost:5894';
+  assert.equal(abgeschnitten.match(SERVER_PORT_PATTERN), null,
+    'a chunk cut mid-number must not yield a truncated port');
+
+  const gepolstert = `\u2551  Server:    ${'http://localhost:58947'.padEnd(46)}\u2551`;
+  assert.equal(gepolstert.match(SERVER_PORT_PATTERN)[1], '58947',
+    'the padded banner line must still yield the full port');
+
+  const ungepolstert = '\u2551  Server:    http://localhost:58947\u2551';
+  assert.equal(ungepolstert.match(SERVER_PORT_PATTERN), null,
+    'without padding nothing matches — that is why the padding is load-bearing');
+});
+
+async function waitForServer(child, logs) {
   const deadline = Date.now() + 10000;
+  let baseUrl = null;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`Server exited early:\n${logs.join('')}`);
-    try {
-      if ((await fetch(`${baseUrl}/api/stats`)).ok) return;
-    } catch { /* retry */ }
+    if (!baseUrl) {
+      const match = logs.join('').match(SERVER_PORT_PATTERN);
+      if (match) baseUrl = `http://127.0.0.1:${match[1]}`;
+    }
+    if (baseUrl) {
+      try {
+        if ((await fetch(`${baseUrl}/api/stats`)).ok) return baseUrl;
+      } catch { /* retry */ }
+    }
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   throw new Error(`Server did not start:\n${logs.join('')}`);
@@ -84,13 +113,12 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
   await fs.writeFile(path.join(worldDir, untrackedRejectPath),
     '<p>File this lawsuit under statute 123 to win your case.</p>');
 
-  const port = await getFreePort();
   const logs = [];
   const child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: '0',
       POW_DIFFICULTY: '0',
       ADMIN_RESET_SECRET: 'operator-secret',
       AIBUILDS_WORLD_DIR: worldDir,
@@ -105,8 +133,7 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
     if (child.exitCode === null) child.kill('SIGTERM');
     if (child.exitCode === null) await once(child, 'exit');
   });
-  const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForServer(baseUrl, child, logs);
+  const baseUrl = await waitForServer(child, logs);
   let requestIp = 1;
   const adminRequest = (requestPath, options = {}) => requestJson(baseUrl, requestPath, {
     ...options,
@@ -304,13 +331,12 @@ test('failed admin decisions persist rollback after concurrent moderation saves'
   await execFileAsync('git', ['add', '.'], { cwd: worldDir });
   await execFileAsync('git', ['commit', '-m', 'seed risky world'], { cwd: worldDir });
 
-  const port = await getFreePort();
   const logs = [];
   const child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: '0',
       POW_DIFFICULTY: '0',
       ADMIN_RESET_SECRET: 'operator-secret',
       AIBUILDS_WORLD_DIR: worldDir,
@@ -329,8 +355,7 @@ test('failed admin decisions persist rollback after concurrent moderation saves'
     if (child.exitCode === null) child.kill('SIGTERM');
     if (child.exitCode === null) await once(child, 'exit');
   });
-  const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForServer(baseUrl, child, logs);
+  const baseUrl = await waitForServer(child, logs);
   const listed = await requestJson(baseUrl, '/api/admin/quarantine', {
     headers: { 'X-Admin-Secret': 'operator-secret' },
   });
@@ -429,13 +454,12 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
   await execFileAsync('git', ['add', '.'], { cwd: worldDir });
   await execFileAsync('git', ['commit', '-m', 'seed private world'], { cwd: worldDir });
 
-  const port = await getFreePort();
   const logs = [];
   const child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: '0',
       POW_DIFFICULTY: '0',
       ADMIN_RESET_SECRET: 'operator-secret',
       AIBUILDS_WORLD_DIR: worldDir,
@@ -450,8 +474,7 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
     if (child.exitCode === null) child.kill('SIGTERM');
     if (child.exitCode === null) await once(child, 'exit');
   });
-  const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForServer(baseUrl, child, logs);
+  const baseUrl = await waitForServer(child, logs);
   const frames = [];
   const socket = new WebSocket(baseUrl.replace('http:', 'ws:'));
   socket.on('message', data => frames.push(JSON.parse(data.toString())));
@@ -525,13 +548,12 @@ test('legacy moderate delete serializes its quarantine check and cleanup with co
       return result;
     };
   `);
-  const port = await getFreePort();
   const logs = [];
   const child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: '0',
       POW_DIFFICULTY: '0',
       ADMIN_RESET_SECRET: 'operator-secret',
       AIBUILDS_WORLD_DIR: worldDir,
@@ -555,8 +577,7 @@ test('legacy moderate delete serializes its quarantine check and cleanup with co
     if (child.exitCode === null) child.kill('SIGTERM');
     if (child.exitCode === null) await once(child, 'exit');
   });
-  const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForServer(baseUrl, child, logs);
+  const baseUrl = await waitForServer(child, logs);
   await fs.writeFile(armPath, 'armed');
 
   const legacyDelete = requestJson(baseUrl, '/api/admin/moderate', {

@@ -5,7 +5,6 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const net = require('node:net');
 const http = require('node:http');
 const { createRequire } = require('node:module');
 const { spawn } = require('node:child_process');
@@ -20,22 +19,30 @@ const requireFromMcp = createRequire(path.join(REPO_ROOT, 'mcp/package.json'));
 const { Client } = requireFromMcp('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = requireFromMcp('@modelcontextprotocol/sdk/client/stdio.js');
 
-async function getFreePort() {
-  const listener = net.createServer();
-  listener.listen(0, '127.0.0.1');
-  await once(listener, 'listening');
-  const port = listener.address().port;
-  await new Promise(resolve => listener.close(resolve));
-  return port;
-}
+// Reads the bound port from the server's own startup banner instead of reserving one up front.
+// The trailing \s matters: without it a stdout chunk ending mid-number matches a TRUNCATED port,
+// and since the first match is cached that is terminal - the test then fails as a connection
+// timeout while the log shows the correct banner. Self-camouflaging, so anchor on the padding.
+// Pre-reserving (listen(0), close, reuse) is a TOCTOU race: between close and the child's bind the
+// port can be taken, which surfaced as sporadic EADDRINUSE and looked like a regression.
+const SERVER_PORT_PATTERN = /Server:\s+http:\/\/localhost:(\d+)\s/;
 
-async function waitForServer(baseUrl, child, logs) {
+async function waitForServer(child, logs) {
+  // 12s rather than 10s: these harnesses start the server with a pre-populated state.json or git
+  // history, so loadState and auditWorldForQuarantine run during startup.
   const deadline = Date.now() + 12_000;
+  let baseUrl = null;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`Server exited early:\n${logs.join('')}`);
-    try {
-      if ((await fetch(`${baseUrl}/api/stats`)).ok) return;
-    } catch { /* retry */ }
+    if (!baseUrl) {
+      const match = logs.join('').match(SERVER_PORT_PATTERN);
+      if (match) baseUrl = `http://127.0.0.1:${match[1]}`;
+    }
+    if (baseUrl) {
+      try {
+        if ((await fetch(`${baseUrl}/api/stats`)).ok) return baseUrl;
+      } catch { /* retry */ }
+    }
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   throw new Error(`Server did not start:\n${logs.join('')}`);
@@ -182,13 +189,12 @@ test('real API publishes complete metrics and enforces the shared write contract
     fs.mkdir(backupDir, { recursive: true }),
   ]);
 
-  const port = await getFreePort();
   const logs = [];
   const child = spawn(process.execPath, ['server/index.js'], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
-      PORT: String(port),
+      PORT: '0',
       POW_DIFFICULTY: '0',
       AIBUILDS_WORLD_DIR: worldDir,
       AIBUILDS_DATA_DIR: dataDir,
@@ -204,8 +210,7 @@ test('real API publishes complete metrics and enforces the shared write contract
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForServer(baseUrl, child, logs);
+  const baseUrl = await waitForServer(child, logs);
 
   const [discovery, stats] = await Promise.all([
     requestJson(baseUrl, '/api'),
