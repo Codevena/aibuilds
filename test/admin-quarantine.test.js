@@ -69,8 +69,18 @@ async function waitForServer(child, logs) {
   throw new Error(`Server did not start:\n${logs.join('')}`);
 }
 
+// Every server in this file runs CLIENT_IP_MODE=cloudflare so the abuse-authz hardening's identity
+// resolver has real provenance; a request without CF-Connecting-IP would otherwise 503 as a
+// provenance failure. A single default IP is enough here - this file is not testing per-client
+// abuse budgets, and adminRequest (below) rotates its own IP per call regardless.
 async function requestJson(baseUrl, requestPath, options = {}) {
-  const response = await fetch(baseUrl + requestPath, options);
+  const response = await fetch(baseUrl + requestPath, {
+    ...options,
+    headers: {
+      'CF-Connecting-IP': '203.0.113.9',
+      ...(options.headers || {}),
+    },
+  });
   let body;
   try { body = await response.json(); } catch { body = null; }
   return { response, body };
@@ -124,6 +134,8 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
       AIBUILDS_WORLD_DIR: worldDir,
       AIBUILDS_DATA_DIR: dataDir,
       AIBUILDS_BACKUP_DIR: backupDir,
+      CLIENT_IP_MODE: 'cloudflare',
+      TRUSTED_PROXY_CIDRS: '127.0.0.1/32,::1/128',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -138,7 +150,7 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
   const adminRequest = (requestPath, options = {}) => requestJson(baseUrl, requestPath, {
     ...options,
     headers: {
-      'X-Forwarded-For': `198.51.100.${requestIp++}`,
+      'CF-Connecting-IP': `198.51.100.${requestIp++}`,
       ...(options.headers || {}),
     },
   });
@@ -342,6 +354,8 @@ test('failed admin decisions persist rollback after concurrent moderation saves'
       AIBUILDS_WORLD_DIR: worldDir,
       AIBUILDS_DATA_DIR: dataDir,
       AIBUILDS_BACKUP_DIR: backupDir,
+      CLIENT_IP_MODE: 'cloudflare',
+      TRUSTED_PROXY_CIDRS: '127.0.0.1/32,::1/128',
       NODE_OPTIONS: `--require=${preloadPath}`,
       AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
       AIBUILDS_MODERATION_ARM: armPath,
@@ -465,6 +479,8 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
       AIBUILDS_WORLD_DIR: worldDir,
       AIBUILDS_DATA_DIR: dataDir,
       AIBUILDS_BACKUP_DIR: backupDir,
+      CLIENT_IP_MODE: 'cloudflare',
+      TRUSTED_PROXY_CIDRS: '127.0.0.1/32,::1/128',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -476,7 +492,8 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
   });
   const baseUrl = await waitForServer(child, logs);
   const frames = [];
-  const socket = new WebSocket(baseUrl.replace('http:', 'ws:'));
+  const socket = new WebSocket(`${baseUrl.replace('http:', 'ws:')}/ws`,
+    { headers: { 'CF-Connecting-IP': '203.0.113.9' } });
   socket.on('message', data => frames.push(JSON.parse(data.toString())));
   await once(socket, 'open');
   t.after(() => socket.close());
@@ -559,6 +576,8 @@ test('legacy moderate delete serializes its quarantine check and cleanup with co
       AIBUILDS_WORLD_DIR: worldDir,
       AIBUILDS_DATA_DIR: dataDir,
       AIBUILDS_BACKUP_DIR: backupDir,
+      CLIENT_IP_MODE: 'cloudflare',
+      TRUSTED_PROXY_CIDRS: '127.0.0.1/32,::1/128',
       NODE_OPTIONS: `--require=${preloadPath}`,
       AIBUILDS_RACE_TARGET: fullPath,
       AIBUILDS_RACE_PATH: relativePath,

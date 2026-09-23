@@ -691,6 +691,52 @@ test('unban clears the stored agent IP (privacy promise)', () => {
   assert.equal(mod.isBanned('Temp', '198.51.100.9'), false);
 });
 
+// --- R1-W5: ban()/isBanned()/loadModeration() canonicalization, tested at the moderation.js
+// boundary directly (not through a server request) - server/index.js already canonicalizes every
+// client IP before it ever reaches these functions (server/client-ip.js), so a spawned-server test
+// alone cannot distinguish "ban()/isBanned() canonicalize" from "the caller already did". These
+// three exercise moderation.js's OWN canonicalization independent of that caller.
+
+test('R1-W5: ban() canonicalizes on write - an uppercase/expanded IPv6 ban matches the lowercase compressed form', () => {
+  mod.loadModeration({});
+  mod.ban({ ip: '2001:DB8::1' });
+  assert.equal(mod.isBanned(null, '2001:db8::1'), true, 'without ban() canonicalizing, the raw uppercase form would be stored and never match');
+});
+
+test('R1-W5: isBanned() canonicalizes its OWN ip argument, independent of what ban() stored', () => {
+  mod.loadModeration({});
+  mod.ban({ ip: '198.51.100.4' }); // stored canonically as plain IPv4
+  assert.equal(mod.isBanned(null, '::ffff:198.51.100.4'), true, 'without isBanned() canonicalizing its argument, the mapped form would not match the stored plain form');
+});
+
+test('R1-W5: loadModeration() canonicalizes a persisted ::ffff:-mapped bannedIps entry to match the plain IPv4 form', () => {
+  mod.loadModeration({ moderation: { bannedIps: ['::ffff:198.51.100.4'] } });
+  assert.equal(mod.isBanned(null, '198.51.100.4'), true);
+});
+
+test('R1-W5: persisted top-level agentIps with an invalid IP value still fails load()', async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-invalid-agent-ip-'));
+  try {
+    await fs.writeFile(
+      path.join(dataDir, 'moderation.json'),
+      JSON.stringify({ moderation: {}, agentIps: { RecoveryAgent: 'not-an-ip' }, gitRepairs: {} }),
+    );
+    const script = `
+      const moderation = require('./server/moderation');
+      moderation.load().then(
+        () => process.exit(42),
+        error => process.exit(error && error.message === 'Invalid persisted agent IP state' ? 0 : 43),
+      );
+    `;
+    await execFileAsync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, AIBUILDS_DATA_DIR: dataDir },
+    });
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('scanContent: clean content passes', () => {
   assert.equal(mod.scanContent({ content: '<h1>Hello world</h1>', agentName: 'Nice' }), null);
 });

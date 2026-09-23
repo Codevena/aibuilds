@@ -52,8 +52,18 @@ async function waitForServer(child, logs) {
   throw new Error(`Server did not start:\n${logs.join('')}`);
 }
 
+// Every server in this file runs CLIENT_IP_MODE=cloudflare (see startWorld) so the abuse-authz
+// hardening's identity resolver has real provenance to work with; a request with no CF-Connecting-IP
+// header would otherwise 503 as a provenance failure. This file is not testing multi-client abuse
+// budgets, so one default IP for every call (unless a caller supplies its own) is sufficient.
 async function requestJson(baseUrl, requestPath, options = {}) {
-  const response = await fetch(baseUrl + requestPath, options);
+  const response = await fetch(baseUrl + requestPath, {
+    ...options,
+    headers: {
+      'CF-Connecting-IP': '203.0.113.9',
+      ...(options.headers || {}),
+    },
+  });
   let body;
   try { body = await response.json(); } catch { body = null; }
   return { response, body };
@@ -118,6 +128,8 @@ async function startWorld(t, {
       AIBUILDS_WORLD_DIR: worldDir,
       AIBUILDS_DATA_DIR: dataDir,
       AIBUILDS_BACKUP_DIR: path.join(root, 'backups'),
+      CLIENT_IP_MODE: 'cloudflare',
+      TRUSTED_PROXY_CIDRS: '127.0.0.1/32,::1/128',
       ...extraEnv,
       ...seedEnv,
     },
@@ -185,7 +197,7 @@ async function contribute(baseUrl, payload) {
 function adminPost(baseUrl, requestPath, body) {
   return requestJson(baseUrl, requestPath, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.9' },
+    headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': '198.51.100.9' },
     body: JSON.stringify(body),
   });
 }

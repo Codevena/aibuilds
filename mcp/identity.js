@@ -154,4 +154,71 @@ async function resolveAgentName({
   }
 }
 
-module.exports = { resolveAgentName };
+// --- Profile capability token storage -------------------------------------------------------
+//
+// A profile token (format `abp_<43 base64url chars>`) is issued once by the server, in the
+// response of the contribution that creates an agent record (see server contract, T5). The MCP
+// client stores it locally so `aibuilds_update_profile` can send it back as a bearer credential
+// without the agent ever having to see or re-enter it.
+
+const PROFILE_TOKEN_PATTERN = /^abp_[A-Za-z0-9_-]{43}$/;
+
+function normalizeProfileToken(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  return PROFILE_TOKEN_PATTERN.test(trimmed) ? trimmed : '';
+}
+
+function profileTokenFileName(name) {
+  const hash = crypto.createHash('sha256').update(String(name), 'utf8').digest('hex');
+  return `profile-token-${hash.slice(0, 16)}`;
+}
+
+// `AIBUILDS_PROFILE_TOKEN` wins over the stored file, but only when it is well-formed; a
+// malformed env value falls through to the file the same as if it were unset. A missing file, an
+// unreadable file, or a file whose content does not match the token pattern are all treated the
+// same way: no token is available, never a thrown error — the caller (aibuilds_update_profile)
+// turns "no token" into one clear, actionable message instead of a storage-layer crash.
+async function readProfileToken(name, { env = process.env, homedir = os.homedir, fsImpl = fs } = {}) {
+  const fromEnv = normalizeProfileToken(env && env.AIBUILDS_PROFILE_TOKEN);
+  if (fromEnv) return fromEnv;
+
+  const tokenPath = path.join(homedir(), '.aibuilds', profileTokenFileName(name));
+  try {
+    const stored = await fsImpl.readFile(tokenPath, 'utf8');
+    return normalizeProfileToken(stored);
+  } catch {
+    return '';
+  }
+}
+
+// Atomic temp-file + rename, mode 0600 on the file and 0700 on the directory - the same
+// publication discipline as the agent-id identity file above, minus the multi-process race
+// handling (a profile token is written at most once per issuing contribution response).
+async function storeProfileToken(name, token, { homedir = os.homedir, fsImpl = fs } = {}) {
+  const normalized = normalizeProfileToken(token);
+  if (!normalized) {
+    const error = new Error('Refusing to store a malformed AI BUILDS profile token');
+    error.code = 'ERR_INVALID_PROFILE_TOKEN';
+    throw error;
+  }
+
+  const identityDirectory = path.join(homedir(), '.aibuilds');
+  const tokenPath = path.join(identityDirectory, profileTokenFileName(name));
+  await fsImpl.mkdir(identityDirectory, { recursive: true, mode: 0o700 });
+  await fsImpl.chmod(identityDirectory, 0o700);
+
+  const temporaryPath = `${tokenPath}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  try {
+    await fsImpl.writeFile(temporaryPath, `${normalized}\n`, { mode: 0o600 });
+    await fsImpl.chmod(temporaryPath, 0o600);
+    await fsImpl.rename(temporaryPath, tokenPath);
+  } catch (error) {
+    try { await fsImpl.unlink(temporaryPath); }
+    catch { /* best effort cleanup; the original error is what matters */ }
+    throw error;
+  }
+  await fsImpl.chmod(tokenPath, 0o600);
+}
+
+module.exports = { resolveAgentName, readProfileToken, storeProfileToken };

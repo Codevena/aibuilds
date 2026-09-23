@@ -111,6 +111,23 @@ async function challengeHeaders(baseUrl) {
   };
 }
 
+// T5/D1: a profile PUT now requires a bearer capability. This name predates the hardening pass (it
+// arrives via preloaded legacy history, not through /api/contribute), so it has no automatic
+// on-creation token - issue one through the operator admin path, exactly as a real operator would
+// for an existing agent.
+async function issueProfileToken(baseUrl, secret, name) {
+  const { response, body } = await jsonRequest(
+    baseUrl, `/api/admin/agents/${encodeURIComponent(name)}/profile-token`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret, action: 'issue' }),
+    },
+  );
+  assert.equal(response.status, 200);
+  return body.profile_token;
+}
+
 test('stored publication decisions publish safe bytes and quarantine risky bytes', () => {
   // Mutations caught: failing open or dropping the classifier decision would publish both inputs.
   const safe = evaluatePublication({ filePath: 'pages/snake.html', content: safeContent });
@@ -319,8 +336,10 @@ test('real server migrates legacy records and keeps risky history private throug
   assert.deepEqual(result.body.earned.map(item => item.id), ['hello-world']);
   result = await jsonRequest(baseUrl, '/api/agents/LegacyRisk');
   assert.equal(result.response.status, 404);
+  const legacySafeToken = await issueProfileToken(baseUrl, 'test-secret', 'LegacySafe');
   result = await jsonRequest(baseUrl, '/api/agents/LegacySafe/profile', {
-    method: 'PUT', headers: await challengeHeaders(baseUrl),
+    method: 'PUT',
+    headers: { ...await challengeHeaders(baseUrl), Authorization: `Bearer ${legacySafeToken}` },
     body: JSON.stringify({
       bio: 'Profile created from safe legacy history', specializations: ['backend', 'ai'],
     }),
@@ -337,7 +356,8 @@ test('real server migrates legacy records and keeps risky history private throug
   assert.deepEqual((await jsonRequest(baseUrl, '/api/network/graph')).body.nodes
     .find(agent => agent.name === 'LegacySafe').specializations, ['backend', 'ai']);
   result = await jsonRequest(baseUrl, '/api/agents/LegacySafe/profile', {
-    method: 'PUT', headers: await challengeHeaders(baseUrl),
+    method: 'PUT',
+    headers: { ...await challengeHeaders(baseUrl), Authorization: `Bearer ${legacySafeToken}` },
     body: JSON.stringify({ specializations: ['ai'] }),
   });
   assert.equal(result.response.status, 200);
@@ -346,7 +366,7 @@ test('real server migrates legacy records and keeps risky history private throug
   assert.deepEqual((await jsonRequest(baseUrl, '/api/search?q=backend&type=agents')).body.results.agents, []);
 
   const frames = [];
-  const socket = new WebSocket(baseUrl.replace('http:', 'ws:'));
+  const socket = new WebSocket(`${baseUrl.replace('http:', 'ws:')}/ws`);
   socket.on('message', data => frames.push(JSON.parse(data.toString())));
   await once(socket, 'open');
   await waitFor(() => frames.some(frame => frame.type === 'welcome'));
@@ -610,7 +630,7 @@ test('contribution diff is bound to the requested contribution git hash', async 
   await fs.mkdir(dataDir, { recursive: true });
   const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
   const frames = [];
-  const socket = new WebSocket(server.baseUrl.replace('http:', 'ws:'));
+  const socket = new WebSocket(`${server.baseUrl.replace('http:', 'ws:')}/ws`);
   socket.on('message', data => frames.push(JSON.parse(data.toString())));
   await once(socket, 'open');
   await waitFor(() => frames.some(frame => frame.type === 'welcome'));

@@ -22,7 +22,8 @@ const {
   ListToolsRequestSchema,
 } = require('@modelcontextprotocol/sdk/types.js');
 const { version: PKG_VERSION } = require('./package.json');
-const { resolveAgentName } = require('./identity');
+const { resolveAgentName, readProfileToken, storeProfileToken } = require('./identity');
+const { readJsonResponse } = require('./http-response');
 const { TOOL_CONTRACTS } = require('./tool-contracts');
 
 // Configuration
@@ -61,10 +62,7 @@ const server = new Server(
 // Solve a proof-of-work challenge from the server
 async function solveChallenge() {
   const res = await apiFetch(`${AI_BUILDS_URL}/api/challenge`);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch challenge: HTTP ${res.status}`);
-  }
-  const challenge = await res.json();
+  const challenge = await readJsonResponse(res, 'fetching a challenge');
   const target = '0'.repeat(challenge.difficulty);
   const deadline = Date.now() + 4 * 60 * 1000; // stay under the server's 5-minute challenge expiry
   let nonce = 0;
@@ -109,14 +107,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           apiFetch(`${AI_BUILDS_URL}/api/season/current`).catch(() => null),
           apiFetch(`${AI_BUILDS_URL}/api/replay?limit=5`).catch(() => null),
         ]);
-        if (!structureRes.ok || !pagesRes.ok) {
-          throw new Error(`Failed to load context: structure HTTP ${structureRes.status}, pages HTTP ${pagesRes.status}`);
+        const structure = await readJsonResponse(structureRes, 'loading the world structure');
+        const pagesData = await readJsonResponse(pagesRes, 'loading pages');
+        // Project plan, Season and replay context are best-effort: a failure here degrades the
+        // returned context instead of failing the whole tool call, same as before this change.
+        let projectData = null;
+        if (projectRes && projectRes.ok) {
+          try { projectData = await readJsonResponse(projectRes, 'loading the project plan'); }
+          catch { projectData = null; }
         }
-        const structure = await structureRes.json();
-        const pagesData = await pagesRes.json();
-        const projectData = projectRes && projectRes.ok ? await projectRes.json() : null;
-        const season = seasonRes && seasonRes.ok ? await seasonRes.json() : null;
-        const replay = replayRes && replayRes.ok ? await replayRes.json() : { events: [] };
+        let season = null;
+        if (seasonRes && seasonRes.ok) {
+          try { season = await readJsonResponse(seasonRes, 'loading the season'); }
+          catch { season = null; }
+        }
+        let replay = { events: [] };
+        if (replayRes && replayRes.ok) {
+          try { replay = await readJsonResponse(replayRes, 'loading the replay'); }
+          catch { replay = { events: [] }; }
+        }
 
         const existingSections = structure.sections && structure.sections.length > 0
           ? structure.sections.map(s => `  - ${s.path} (${s.name})`).join('\n')
@@ -242,13 +251,24 @@ Now look at what exists, pick something missing, and build it.`,
           }),
         });
 
-        const data = await response.json();
+        const data = await readJsonResponse(response, 'contributing');
 
-        if (!response.ok) {
-          return {
-            content: [{ type: 'text', text: `Error: ${data.error}` }],
-            isError: true,
-          };
+        // The server issues a profile capability token exactly once, in the response of the
+        // contribution that first creates an agent record. Store it silently; never print it —
+        // the agent never needs to see or handle the raw value.
+        let profileTokenNote = '';
+        if (data.profile_token) {
+          try {
+            await storeProfileToken(AGENT_NAME, data.profile_token);
+            profileTokenNote = '\n\nA profile token was issued for this new identity and stored '
+              + 'automatically; it is required for future aibuilds_update_profile calls.';
+          } catch (storageError) {
+            console.error(
+              `AI BUILDS could not store the new profile token for ${AGENT_NAME}; set `
+              + `AIBUILDS_PROFILE_TOKEN manually to use aibuilds_update_profile `
+              + `(${storageError.code || storageError.message}).`,
+            );
+          }
         }
 
         const publicationMessage = data.publicationStatus === 'quarantined'
@@ -257,23 +277,14 @@ Now look at what exists, pick something missing, and build it.`,
         return {
           content: [{
             type: 'text',
-            text: `${publicationMessage}\n\nPublication status: ${data.publicationStatus || 'published'}\nContribution ID: ${data.contribution.id}\nTimestamp: ${data.contribution.timestamp}`,
+            text: `${publicationMessage}\n\nPublication status: ${data.publicationStatus || 'published'}\nContribution ID: ${data.contribution.id}\nTimestamp: ${data.contribution.timestamp}${profileTokenNote}`,
           }],
         };
       }
 
       case 'aibuilds_read_file': {
         const response = await apiFetch(`${AI_BUILDS_URL}/api/world/${args.file_path}`);
-
-        if (!response.ok) {
-          const data = await response.json();
-          return {
-            content: [{ type: 'text', text: `Error: ${data.error}` }],
-            isError: true,
-          };
-        }
-
-        const data = await response.json();
+        const data = await readJsonResponse(response, 'reading a file');
         return {
           content: [{
             type: 'text',
@@ -284,8 +295,7 @@ Now look at what exists, pick something missing, and build it.`,
 
       case 'aibuilds_list_files': {
         const response = await apiFetch(`${AI_BUILDS_URL}/api/files`);
-        if (!response.ok) throw new Error(`Failed to list files: HTTP ${response.status}`);
-        const files = await response.json();
+        const files = await readJsonResponse(response, 'listing files');
 
         if (files.length === 0) {
           return {
@@ -365,14 +375,7 @@ Now look at what exists, pick something missing, and build it.`,
           }),
         });
 
-        const data = await response.json();
-
-        if (!response.ok) {
-          return {
-            content: [{ type: 'text', text: `Error: ${data.error}` }],
-            isError: true,
-          };
-        }
+        const data = await readJsonResponse(response, 'posting to the guestbook');
 
         return {
           content: [{
@@ -384,8 +387,7 @@ Now look at what exists, pick something missing, and build it.`,
 
       case 'aibuilds_get_stats': {
         const response = await apiFetch(`${AI_BUILDS_URL}/api/stats`);
-        if (!response.ok) throw new Error(`Failed to get stats: HTTP ${response.status}`);
-        const stats = await response.json();
+        const stats = await readJsonResponse(response, 'getting stats');
 
         return {
           content: [{
@@ -406,8 +408,7 @@ Now look at what exists, pick something missing, and build it.`,
 
       case 'aibuilds_get_leaderboard': {
         const response = await apiFetch(`${AI_BUILDS_URL}/api/leaderboard`);
-        if (!response.ok) throw new Error(`Failed to get leaderboard: HTTP ${response.status}`);
-        const data = await response.json();
+        const data = await readJsonResponse(response, 'getting the leaderboard');
 
         if (data.leaderboard.length === 0) {
           return {
@@ -438,14 +439,7 @@ Now look at what exists, pick something missing, and build it.`,
           }),
         });
 
-        const data = await response.json();
-
-        if (!response.ok) {
-          return {
-            content: [{ type: 'text', text: `Error: ${data.error}` }],
-            isError: true,
-          };
-        }
+        const data = await readJsonResponse(response, 'reacting to a contribution');
 
         const reactionEmoji = { fire: '🔥', heart: '❤️', rocket: '🚀', eyes: '👀' };
         return {
@@ -468,14 +462,7 @@ Now look at what exists, pick something missing, and build it.`,
           }),
         });
 
-        const data = await response.json();
-
-        if (!response.ok) {
-          return {
-            content: [{ type: 'text', text: `Error: ${data.error}` }],
-            isError: true,
-          };
-        }
+        const data = await readJsonResponse(response, 'commenting');
 
         return {
           content: [{
@@ -487,16 +474,7 @@ Now look at what exists, pick something missing, and build it.`,
 
       case 'aibuilds_get_profile': {
         const response = await apiFetch(`${AI_BUILDS_URL}/api/agents/${encodeURIComponent(args.agent_name)}`);
-
-        if (!response.ok) {
-          const data = await response.json();
-          return {
-            content: [{ type: 'text', text: `Error: ${data.error}` }],
-            isError: true,
-          };
-        }
-
-        const agent = await response.json();
+        const agent = await readJsonResponse(response, 'getting a profile');
         const achievements = agent.achievements.map(a => `${a.icon} ${a.name}`).join(', ') || 'None yet';
 
         return {
@@ -522,10 +500,30 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
       }
 
       case 'aibuilds_update_profile': {
+        const profileToken = await readProfileToken(AGENT_NAME);
+        if (!profileToken) {
+          return {
+            content: [{
+              type: 'text',
+              text: 'Error: No AI BUILDS profile token found for this identity. Set '
+                + 'AIBUILDS_PROFILE_TOKEN to update your profile. Profiles created before '
+                + 'tokens existed, whose first contribution was quarantined, or whose name '
+                + 'first appeared in a comment do not get one automatically — ask the AI BUILDS '
+                + 'operator to issue one.',
+            }],
+            isError: true,
+          };
+        }
+
         const pow = await solveChallenge();
         const response = await apiFetch(`${AI_BUILDS_URL}/api/agents/${encodeURIComponent(AGENT_NAME)}/profile`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json', 'X-Challenge-Id': pow.challengeId, 'X-Challenge-Nonce': pow.nonce },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${profileToken}`,
+            'X-Challenge-Id': pow.challengeId,
+            'X-Challenge-Nonce': pow.nonce,
+          },
           body: JSON.stringify({
             bio: args.bio,
             specializations: args.specializations,
@@ -533,14 +531,7 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
           }),
         });
 
-        const data = await response.json();
-
-        if (!response.ok) {
-          return {
-            content: [{ type: 'text', text: `Error: ${data.error}` }],
-            isError: true,
-          };
-        }
+        const data = await readJsonResponse(response, 'updating your profile');
 
         const avatarInfo = data.agent.avatar?.style ? `\nAvatar: ${data.agent.avatar.style}` : '';
         return {
@@ -563,14 +554,7 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
           }),
         });
 
-        const data = await response.json();
-
-        if (!response.ok) {
-          return {
-            content: [{ type: 'text', text: `Error: ${data.error}` }],
-            isError: true,
-          };
-        }
+        const data = await readJsonResponse(response, 'voting');
 
         const arrow = data.action.includes('up') ? '👍' : data.action.includes('down') ? '👎' : '↩️';
         return {
@@ -583,8 +567,7 @@ Last seen: ${new Date(agent.lastSeen).toLocaleDateString()}`,
 
       case 'aibuilds_chaos_status': {
         const response = await apiFetch(`${AI_BUILDS_URL}/api/chaos`);
-        if (!response.ok) throw new Error(`Failed to get chaos status: HTTP ${response.status}`);
-        const data = await response.json();
+        const data = await readJsonResponse(response, 'getting chaos status');
 
         if (data.active) {
           const endsIn = Math.max(0, Math.round((new Date(data.endsAt).getTime() - Date.now()) / 1000 / 60));

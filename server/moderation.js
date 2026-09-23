@@ -5,6 +5,7 @@ const fs = require('fs').promises;
 const crypto = require('node:crypto');
 const net = require('node:net');
 const { normalizeWorldPath } = require('./world-files');
+const { canonicalIp } = require('./client-ip');
 
 // Moderation state lives in its OWN server-only file (gitignored) so agent IPs / banned IPs are
 // never written into the shared/tracked state.json or its backups.
@@ -268,12 +269,24 @@ function loadModeration(state) {
   const m = (state && state.moderation) || {};
   for (const p of m.hiddenFiles || []) nextHiddenFiles.add(normalizePath(p));
   for (const a of m.bannedAgents || []) nextBannedAgents.add(a);
-  for (const ip of m.bannedIps || []) nextBannedIps.add(ip);
+  // bannedIps were persisted without validation historically (Gate R2-1): canonicalize what parses
+  // as an IP and drop the rest with a count-only log, never failing startup over a stored ban.
+  let droppedBannedIps = 0;
+  for (const ip of m.bannedIps || []) {
+    const canonical = canonicalIp(ip);
+    if (canonical) nextBannedIps.add(canonical);
+    else droppedBannedIps += 1;
+  }
+  if (droppedBannedIps > 0) {
+    console.warn(`Dropped ${droppedBannedIps} invalid bannedIps entries while loading moderation state`);
+  }
+  // Top-level agentIps keep today's strict validation (Gate R2-1): an invalid entry still fails
+  // startup. Only values that already passed that validation are then canonicalized.
   const ips = (state && state.agentIps) || {};
   if (!isPlainObject(ips)) throw new Error('Invalid persisted agent IP state');
   const normalizedAgentIps = normalizeGitRepairAgentIps(Object.entries(ips));
   if (!normalizedAgentIps) throw new Error('Invalid persisted agent IP state');
-  for (const [name, ip] of normalizedAgentIps) nextAgentIps.set(name, ip);
+  for (const [name, ip] of normalizedAgentIps) nextAgentIps.set(name, canonicalIp(ip) || ip);
   for (const [filePath, record] of Object.entries(m.quarantinedFiles || {})) {
     const normalized = normalizePublicationPath(record?.filePath || filePath);
     if (!normalized || !record || typeof record !== 'object' || typeof record.contentHash !== 'string') continue;
@@ -489,32 +502,39 @@ function getGitRepair(filePath) {
 }
 function listGitRepairs() { return Array.from(gitRepairs.values(), cloneGitRepair); }
 
+// All six IP-bearing functions below canonicalize through client-ip.js's canonicalIp() (Gate R1
+// F9/T3), so a ban or a recorded IP compares equal however it arrived (e.g. an IPv4-mapped IPv6
+// socket address or an upper-case IPv6 literal) — see docs/superpowers/plans/2026-09-23-abuse-authz-hardening.md.
 function isBanned(agentName, ip) {
+  const canonical = canonicalIp(ip);
   return (typeof agentName === 'string' && bannedAgents.has(agentName)) ||
-         (typeof ip === 'string' && bannedIps.has(ip));
+         (canonical !== null && bannedIps.has(canonical));
 }
 function recordAgentIp(agentName, ip) {
-  if (isBoundedString(agentName, MAX_AGENT_NAME_BYTES) &&
-      isBoundedString(ip, MAX_IP_BYTES) && net.isIP(ip) !== 0) {
+  const canonical = canonicalIp(ip);
+  if (isBoundedString(agentName, MAX_AGENT_NAME_BYTES) && canonical !== null) {
     if (agentIps.has(agentName)) agentIps.delete(agentName); // refresh insertion order (LRU)
-    agentIps.set(agentName, ip);
+    agentIps.set(agentName, canonical);
     if (agentIps.size > MAX_AGENT_IPS) agentIps.delete(agentIps.keys().next().value);
   }
 }
 function resolveAgentIp(agentName) { return agentIps.get(agentName) || null; }
 function snapshotAgentIps() { return Array.from(agentIps.entries()); }
 function restoreAgentIps(snapshot) {
+  // normalizeGitRepairAgentIps is NOT loosened (Gate R2-1): every entry must already be a
+  // syntactically valid IP before canonicalization ever runs.
   const normalized = normalizeGitRepairAgentIps(snapshot);
   if (!normalized) return false;
   agentIps.clear();
-  for (const [agentName, ip] of normalized) agentIps.set(agentName, ip);
+  for (const [agentName, ip] of normalized) agentIps.set(agentName, canonicalIp(ip) || ip);
   return true;
 }
 function restoreAgentIp(agentName, ip) {
   if (!isBoundedString(agentName, MAX_AGENT_NAME_BYTES)) return false;
-  if (isBoundedString(ip, MAX_IP_BYTES) && net.isIP(ip) !== 0) {
+  const canonical = canonicalIp(ip);
+  if (isBoundedString(ip, MAX_IP_BYTES) && canonical !== null) {
     agentIps.delete(agentName);
-    agentIps.set(agentName, ip);
+    agentIps.set(agentName, canonical);
     return true;
   }
   return agentIps.delete(agentName);
@@ -523,7 +543,10 @@ function restoreAgentIp(agentName, ip) {
 // so "ban by name only" is always possible). See /api/admin/ban for the default-ban-IP behavior.
 function ban({ agentName, ip } = {}) {
   if (agentName) bannedAgents.add(agentName);
-  if (ip) bannedIps.add(ip);
+  if (ip) {
+    const canonical = canonicalIp(ip);
+    if (canonical) bannedIps.add(canonical);
+  }
   return listBans();
 }
 // Unban also drops the stored IP for that agent (honors the privacy promise: IPs removed on unban).
@@ -533,7 +556,10 @@ function unban({ agentName, ip } = {}) {
     if (bannedAgents.delete(agentName)) removed = true;
     if (agentIps.delete(agentName)) removed = true;
   }
-  if (ip && bannedIps.delete(ip)) removed = true;
+  if (ip) {
+    const canonical = canonicalIp(ip);
+    if (canonical && bannedIps.delete(canonical)) removed = true;
+  }
   return removed;
 }
 function listBans() {

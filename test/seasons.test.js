@@ -662,7 +662,7 @@ test('curation mutations hide provisional reads, roll back failures, and seriali
   const baseUrl = await waitForServer(child, logs);
 
   const frames = [];
-  const ws = new WebSocket(baseUrl.replace('http', 'ws'));
+  const ws = new WebSocket(`${baseUrl.replace('http', 'ws')}/ws`);
   t.after(() => ws.close());
   await once(ws, 'open');
   await once(ws, 'message');
@@ -735,7 +735,7 @@ test('curation mutations hide provisional reads, roll back failures, and seriali
     agent_name: 'Builder', content: 'This must roll back.',
   });
   await waitForFileValue(markerPath, 'contribution-comment-read');
-  const midFlightWs = new WebSocket(baseUrl.replace('http', 'ws'));
+  const midFlightWs = new WebSocket(`${baseUrl.replace('http', 'ws')}/ws`);
   const midFlightWsOpen = once(midFlightWs, 'open');
   const midFlightWelcomeObserver = observeSettlement(
     once(midFlightWs, 'message').then(([data]) => JSON.parse(data.toString())));

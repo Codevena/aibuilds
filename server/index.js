@@ -3,7 +3,6 @@ const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
 const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
 const path = require('path');
 const fsSync = require('node:fs');
 const fs = require('fs').promises;
@@ -45,10 +44,25 @@ const {
   WRITABLE_WORLD_TARGETS,
   validateWorldWritePath,
 } = require('./world-write-policy');
+const { parseClientIpConfig, createClientIpResolver, canonicalIp } = require('./client-ip');
+const { createAbuseLimits } = require('./abuse-limits');
+const { createChallengeRegistry } = require('./challenge-registry');
+const { createAgentCredentials } = require('./agent-credentials');
+const {
+  createGenerationCache,
+  createSemaphore,
+  createLruBytesCache,
+  createSingleFlight,
+} = require('./read-cache');
+const { createWsAdmission, sendWithBackpressure, DEFAULT_WS_LIMITS } = require('./ws-admission');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+// noServer: WS admission control (server/ws-admission.js) owns the upgrade handshake so a
+// rejected upgrade never reaches handleUpgrade (I8). clientTracking:false because `viewers` is the
+// single source of truth for connected sockets (Gate R1 F2: wss.clients is undefined otherwise —
+// /api/admin/reset and the heartbeat below both iterate `viewers`, never wss.clients).
+const wss = new WebSocket.Server({ noServer: true, maxPayload: DEFAULT_WS_LIMITS.maxPayload, clientTracking: false });
 
 // Config
 const PORT = process.env.PORT || 3000;
@@ -57,6 +71,28 @@ const DATA_FILE = process.env.AIBUILDS_DATA_DIR
   ? path.join(process.env.AIBUILDS_DATA_DIR, 'state.json')
   : path.join(__dirname, '../data/state.json');
 const BACKUP_DIR = process.env.AIBUILDS_BACKUP_DIR || path.join(__dirname, '../backups');
+
+// Client identity (D2/D3): parsed and validated at module load, so an invalid CLIENT_IP_MODE,
+// TRUSTED_PROXY_CIDRS, ABUSE_ENFORCEMENT or WS_ALLOWED_ORIGINS throws during require() — the
+// process exits non-zero before init()/listen ever runs, never inside init() itself.
+const clientIpConfig = parseClientIpConfig(process.env);
+const clientIpResolver = createClientIpResolver(clientIpConfig);
+// §6 passive rollout proof, R1-W3: log the parsed identity config once at startup - mode,
+// enforcement and the trusted-CIDR COUNT only, never an address - and warn loudly when
+// CLIENT_IP_MODE was left at its default in production. Without this, a direct-mode server
+// running behind a proxy (which adds X-Forwarded-For) silently 503s every write and nothing in
+// the log says why until someone reads the source.
+console.log(
+  `[client-ip] mode=${clientIpConfig.mode} enforcement=${clientIpConfig.enforcement} `
+  + `trustedProxyRanges=${clientIpConfig.trustedProxies.length}`,
+);
+if (clientIpConfig.productionWarning) {
+  console.warn(
+    '[client-ip] CLIENT_IP_MODE is not set in production; defaulting to "direct". If this server '
+    + 'sits behind a proxy or Cloudflare, set CLIENT_IP_MODE=cloudflare and TRUSTED_PROXY_CIDRS '
+    + 'explicitly.',
+  );
+}
 const ALLOWED_EXTENSIONS = ['.html', '.css', '.js', '.json', '.svg', '.txt', '.md'];
 const MAX_FILE_SIZE = 500 * 1024; // 500KB
 const MAX_FILES = 1000;
@@ -111,8 +147,10 @@ const gitBinary = (() => {
 const git = simpleGit(WORLD_DIR, { binary: gitBinary });
 const execGitFile = promisify(execFileCallback);
 
-// Trust proxy (Coolify/reverse proxy) so rate limiting uses real client IP
-app.set('trust proxy', 1);
+// trust proxy is OFF (D2): req.ip must never parse X-Forwarded-For. Client identity comes from
+// exactly one module (server/client-ip.js, Security invariant I4), never from Express's own
+// proxy-trust machinery.
+app.set('trust proxy', false);
 
 // Middleware
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
@@ -121,25 +159,20 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' }, // Allow OG image loading by social crawlers
   crossOriginOpenerPolicy: false, // Not needed, breaks some embeds
 }));
+// express.json parses (CPU cost only) before every limiter below - a documented residual (§6 F20).
 app.use(express.json({ limit: '500kb' }));
 
-// Rate limiting for agents - 30 contributions per minute
-const agentLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  message: { error: 'Too many contributions. Please wait a moment.' },
-  standardHeaders: true,
-  legacyHeaders: false,
+// Single source of per-endpoint abuse limits (§3 of the plan), built on the single client
+// identity above and a bounded in-process store (D4).
+const limits = createAbuseLimits({
+  resolver: clientIpResolver,
+  config: clientIpConfig,
 });
+limits.startCounterLog(60_000);
 
-// Strict limiter for sensitive admin endpoints — throttles secret brute-force attempts
-const adminLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  message: { error: 'Too many requests. Please wait.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// Bounded, capped PoW challenge registry (T4) - replaces the old unbounded powChallenges Map.
+const challengeRegistry = createChallengeRegistry();
+const CHALLENGE_SWEEP_INTERVAL_MS = 60 * 1000;
 
 // Constant-time secret comparison. Hash both inputs to fixed-length digests first so that a
 // length mismatch neither throws nor short-circuits (which would leak the secret's length via timing).
@@ -152,7 +185,13 @@ function safeSecretEqual(provided, expected) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// Proof-of-Work middleware — AI agents solve SHA-256 challenges via code; humans can't
+// Proof-of-Work middleware — AI agents solve SHA-256 challenges via code; humans can't.
+// Every PoW route's limiter chain runs before this and always starts with the `write` policy, so
+// req.abuseIdentity has already been resolved by the time this middleware executes. Under
+// ABUSE_ENFORCEMENT=enforce an unverified request was already rejected upstream, so provenance is
+// verified here. Under `shadow`, `write` (like every policy) falls through on the fallback peer
+// key when provenance failed (D3) - this middleware can run with limits.identity(req) returning
+// null, which callers below already treat as "no clientIp to record", never as "verified".
 function requireProofOfWork(req, res, next) {
   const challengeId = req.headers['x-challenge-id'] || req.body?.challenge_id;
   const nonce = req.headers['x-challenge-nonce'] || req.body?.challenge_nonce;
@@ -163,18 +202,10 @@ function requireProofOfWork(req, res, next) {
     });
   }
 
-  const challenge = powChallenges.get(challengeId);
+  const challenge = challengeRegistry.get(challengeId);
   if (!challenge) {
     return res.status(403).json({
       error: 'Invalid or expired challenge. GET /api/challenge for a new one.',
-    });
-  }
-
-  // Check expiry
-  if (Date.now() > challenge.expiresAt) {
-    powChallenges.delete(challengeId);
-    return res.status(403).json({
-      error: 'Challenge expired. GET /api/challenge for a new one.',
     });
   }
 
@@ -190,8 +221,49 @@ function requireProofOfWork(req, res, next) {
     });
   }
 
-  // Single-use: delete after successful verification
-  powChallenges.delete(challengeId);
+  // Single-use: consume (removes from its owner's set too) after successful verification. Never
+  // trust that a mutation succeeded without checking its result - if consume() reports the id was
+  // already gone (already used, expired or evicted in the interval since get()), reject rather than
+  // let a second request ride the same solved challenge through.
+  const consumed = challengeRegistry.consume(challengeId);
+  if (!consumed) {
+    return res.status(403).json({
+      error: 'Invalid or expired challenge. GET /api/challenge for a new one.',
+    });
+  }
+  // R1-W9: only from here on has this request earned a chance to invalidate cached reads - every
+  // check above this line can reject cheaply (missing/invalid challenge, wrong PoW) and must never
+  // bump the generation.
+  bumpReadGenerationForMutation(req, res);
+  next();
+}
+
+// Profile ownership capability check (T5/D1). Mounted after requireProofOfWork on the profile
+// route: limiters -> PoW -> capability check -> handler (§3). Only a bearer token issued for
+// exactly this stored agent name authorizes the write - name, IP or PoW never suffice (I1).
+function requireProfileCapability(req, res, next) {
+  const publicAgent = getPublicAgentState().get(req.params.name);
+  if (!publicAgent) {
+    return res.status(404).json({ error: 'Agent not found' });
+  }
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader !== 'string') {
+    res.set('WWW-Authenticate', 'Bearer');
+    return res.status(401).json({ error: 'Profile token required', code: 'profile_token_required' });
+  }
+  const bearerMatch = /^Bearer (\S+)$/.exec(authHeader);
+  const presented = bearerMatch ? bearerMatch[1] : '';
+  const verdict = credentials.verify(req.params.name, presented);
+  if (verdict === 'malformed') {
+    res.set('WWW-Authenticate', 'Bearer');
+    return res.status(401).json({ error: 'Invalid profile token', code: 'invalid_profile_token' });
+  }
+  if (verdict === 'unclaimed') {
+    return res.status(403).json({ error: 'This profile has not been claimed yet', code: 'profile_claim_required' });
+  }
+  if (verdict === 'mismatch') {
+    return res.status(403).json({ error: 'Invalid profile token', code: 'invalid_profile_token' });
+  }
   next();
 }
 
@@ -215,18 +287,131 @@ const contributions = new Map();
 const comments = new Map();
 const MAX_COMMENTS = 5000;
 
+// D5: at the cap the globally oldest comment (by Map insertion order - the same order saveState()
+// slices from) is evicted BEFORE the new one is inserted, enforcing at runtime the same retention
+// `saveState()` already applies on save. snapshot/restore let a failed save roll back to the exact
+// prior Map - contents AND order - rather than just deleting the newly-inserted comment, which
+// would leave the evicted comment gone from memory (though rolled back on disk).
+function snapshotCommentsOrder() {
+  return Array.from(comments.entries());
+}
+function restoreCommentsOrder(snapshot) {
+  comments.clear();
+  for (const [id, value] of snapshot) comments.set(id, value);
+}
+function insertCommentWithCap(comment) {
+  if (comments.size >= MAX_COMMENTS) {
+    const oldestId = comments.keys().next().value;
+    comments.delete(oldestId);
+  }
+  comments.set(comment.id, comment);
+}
+
+// Global reaction-entry count across every contribution and type (§3: <= 50,000 reaction entries
+// globally, 409 `capacity`). Maintained incrementally at mutation time and recomputed once from
+// loaded state in loadState() - recomputing per-request would be O(total reactions) every time.
+let totalReactionCount = 0;
+const MAX_REACTIONS_PER_TYPE = 1000;
+const MAX_REACTIONS_GLOBAL = 50000;
+const MAX_VOTERS_PER_SECTION = 5000;
+const MAX_AGENTS = 20000;
+const MAX_LINE_NUMBER = 1_000_000;
+
+// R2-W2: shared by the MAX_HISTORY trim and its rollback restore below - same counting rule as
+// loadState() and the R1-W7 admin-delete purge (server/index.js, /api/admin/moderate).
+function reactionEntryCount(contribution) {
+  let count = 0;
+  if (contribution && contribution.reactions && typeof contribution.reactions === 'object') {
+    for (const arr of Object.values(contribution.reactions)) {
+      if (Array.isArray(arr)) count += arr.length;
+    }
+  }
+  return count;
+}
+
 // Timestamped agent votes/comments provide durable Curator evidence for UTC Daily Seasons.
 const curationEvents = [];
 const MAX_CURATION_EVENTS = 1000;
 
-// Proof-of-Work challenge store
-const powChallenges = new Map();
+// Profile ownership capability store (T5/D1) - file lives next to state.json, outside it and
+// therefore outside backups/ (its own atomic temp+rename, mode 0600; see server/agent-credentials.js).
+const credentials = createAgentCredentials({ file: path.join(path.dirname(DATA_FILE), 'agent-credentials.json') });
+
+// T7: a single shared 5s generation-bound cache backs /api/stats and the shared-budget read routes
+// (graph/search/sections/structure/files). One generation counter for all of them is intentional:
+// a mutation invalidates every cached read together, not just the one it touched. But not every
+// non-GET/HEAD request bumps it (see armReadGenerationFinishBump/bumpReadGenerationForMutation
+// below): the start bump fires only once `requireProofOfWork` has succeeded, or once a routed admin
+// handler's own rate limiter has passed - never for a cheaply-rejected request (missing PoW, wrong
+// challenge, 429, unrouted 404). Once a request has done that start bump, its finish/close bump
+// fires unconditionally, so a mutation that fails or rolls back partway through still invalidates
+// whatever was cached while it was in flight.
+const readGenerationCache = createGenerationCache({ ttlMs: 5000, maxEntries: 64 });
+async function getCachedRead(key, computeFn) {
+  const cached = readGenerationCache.get(key);
+  if (cached !== undefined) return cached;
+  const generationAtStart = readGenerationCache.generation();
+  const value = await computeFn();
+  readGenerationCache.set(key, value, generationAtStart);
+  return value;
+}
+// R1-W9/R2-W1/R2-W3/R3-I1: the read-generation cache must be bumped only for a request that could
+// plausibly have mutated the state a cached read reflects - never for a POST that never got past
+// authentication/PoW/rate limiting. Two start triggers only: right after requireProofOfWork
+// succeeds (every PoW route, including `/api/chaos/trigger`), and after an admin route's own rate
+// limiter passes (`bumpAfterLimiter`, appended to `adminChain` below) - never before that limiter
+// and never on an unrouted `/api/admin/*` path, which has no limiter at all (R2-W1: an app-wide
+// `app.use('/api/admin', ...)` bump ran before the per-route limiter and matched paths with no
+// route, so it bumped on every unrouted 404, every 429 and every provenance 503 with no bound - an
+// unauthenticated, cheap POST burst defeated the 5s read cache and the /api/stats snapshot cache for
+// everyone with no write ever happening). Once a request has done a start bump, the finish/close
+// bump (Gate R1 F16: a mutation that fails partway through - e.g. a comment insert whose state save
+// fails and rolls back - must still invalidate a read cached while it was in flight) fires
+// UNCONDITIONALLY (R2-W3: an earlier `res.statusCode < 400` guard here left a read cached during a
+// failed-and-rolled-back mutation serving that stale, rolled-back state for up to 5s).
+function armReadGenerationFinishBump(res) {
+  let bumped = false;
+  const bumpOnce = () => {
+    if (bumped) return;
+    bumped = true;
+    readGenerationCache.bump();
+  };
+  res.once('finish', bumpOnce);
+  res.once('close', bumpOnce);
+}
+function bumpReadGenerationForMutation(req, res) {
+  if (req.method === 'GET' || req.method === 'HEAD') return;
+  readGenerationCache.bump();
+  armReadGenerationFinishBump(res);
+}
+// R2-W1: appended AFTER each admin route's own rate-limiter chain (`...adminChain` below, built
+// from `limits.routes.admin`), never mounted as an app-wide prefix. A 404 (no matching route under
+// /api/admin) never reaches this middleware at all, and a 429 from the limiter ends the chain
+// before it does too - only a request that passed the 5/min admin limiter gets here, bounding the
+// bump to that rate regardless of what the route's own secret check decides afterward.
+// bumpReadGenerationForMutation itself still skips GET/HEAD, so admin GET routes (e.g.
+// /api/admin/quarantine) are never bumped by this either. `/api/chaos/trigger` does NOT get this
+// middleware (R3-I1): it is also a `requireProofOfWork` route, so a successful PoW check already
+// bumps it there - appending `bumpAfterLimiter` too would additionally bump on a PoW-less 403,
+// before the handler's own secret check ever runs.
+function bumpAfterLimiter(req, res, next) {
+  bumpReadGenerationForMutation(req, res);
+  next();
+}
+const adminChain = [...limits.routes.admin, bumpAfterLimiter];
+
+// T7: diff resource bounds - bounded LRU (256 entries / 32 MiB), single-flight per key, and a
+// global semaphore(2, <=16 waiters) so an attacker cannot force unlimited concurrent `git` work.
+const diffCache = createLruBytesCache({ maxEntries: 256, maxBytes: 32 * 1024 * 1024 });
+const diffSingleFlight = createSingleFlight();
+const diffSemaphore = createSemaphore({ limit: 2, maxWaiters: 16 });
+const MAX_DIFF_BYTES = 2 * 1024 * 1024;
+
 // Use nullish coalescing so POW_DIFFICULTY=0 (disable PoW) is respected; fall back to 5 only when unset/invalid.
 const POW_DIFFICULTY = (() => {
   const parsed = parseInt(process.env.POW_DIFFICULTY ?? '5', 10);
   return Number.isNaN(parsed) ? 5 : parsed;
 })();
-const POW_EXPIRY_MS = 5 * 60 * 1000;
 
 // Achievements definitions
 const ACHIEVEMENTS = {
@@ -956,6 +1141,10 @@ async function rollbackContributionTransaction(transaction) {
   if (transaction.trimmedHistory) {
     history.unshift(transaction.trimmedHistory);
     contributions.set(transaction.trimmedHistory.id, transaction.trimmedHistory);
+    // R2-W2: the trim below subtracted this contribution's reaction entries from the global
+    // counter - reinstating it without adding them back would leave the counter permanently short,
+    // eventually letting the global cap be exceeded.
+    totalReactionCount += reactionEntryCount(transaction.trimmedHistory);
   }
   if (transaction.agentExisted) agents.set(transaction.agentName, transaction.agent);
   else agents.delete(transaction.agentName);
@@ -1172,6 +1361,17 @@ async function loadState() {
       // Index contributions by ID
       for (const contrib of state.history) {
         contributions.set(contrib.id, contrib);
+      }
+    }
+
+    // Recompute the global reaction-entry counter once from loaded state (§3/T7) - cheaper than
+    // summing every contribution's reaction arrays on every request.
+    totalReactionCount = 0;
+    for (const contrib of contributions.values()) {
+      if (contrib.reactions && typeof contrib.reactions === 'object') {
+        for (const arr of Object.values(contrib.reactions)) {
+          if (Array.isArray(arr)) totalReactionCount += arr.length;
+        }
       }
     }
 
@@ -1468,22 +1668,31 @@ function checkAndAwardAchievements(agentName, agent) {
   return newAchievements;
 }
 
-// Broadcast to all viewers
+// Broadcast to all viewers. sendWithBackpressure terminates (and drops the message) a socket whose
+// outgoing buffer is already past 1 MiB instead of piling more data onto a slow/dead peer (T6).
 function broadcast(data) {
   const message = JSON.stringify(data);
   viewers.forEach(ws => {
-    if (ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(message);
-      } catch (e) {
-        viewers.delete(ws);
-      }
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (!sendWithBackpressure(ws, message, DEFAULT_WS_LIMITS.maxBufferedBytes)) {
+      viewers.delete(ws);
     }
   });
 }
 
-// WebSocket connection handling
-wss.on('connection', async (ws) => {
+// T6: WS Origin allowlist (D6). A present Origin must be in this set; absent Origin (non-browser
+// clients) is always allowed since a non-browser client can forge any Origin anyway. In direct mode
+// only (never behind a real edge) localhost origins are additionally allowed for local development.
+const wsAllowedOrigins = new Set(
+  clientIpConfig.wsAllowedOrigins || ['https://aibuilds.dev', 'https://www.aibuilds.dev'],
+);
+const wsAllowLocalhostOrigins = clientIpConfig.mode === 'direct';
+
+// Runs once an upgrade has passed every admission check (path, Origin, identity, ws-upgrade rate,
+// per-identity and global socket caps - see server/ws-admission.js). The welcome message keeps its
+// exact pre-hardening durability contract: it is sent under CONTRIBUTION_STATE_LOCK against a fresh
+// getPublicPlatformSnapshot() (Gate R1 F3) - admission bounds its cost instead of caching it away.
+async function onWsAccepted(ws) {
   ws.isAlive = true;
   viewers.add(ws);
   console.log(`Viewer connected. Total: ${viewers.size}`);
@@ -1495,6 +1704,16 @@ wss.on('connection', async (ws) => {
   ws.on('error', (err) => {
     viewers.delete(ws);
     console.warn('WebSocket connection error:', err.message);
+  });
+
+  // INFO (f): attached BEFORE the awaited welcome below, not after - a socket that closes while
+  // this request is queued on CONTRIBUTION_STATE_LOCK or while the snapshot is being computed must
+  // still be removed from `viewers`. A listener attached only after that await could miss a 'close'
+  // that fires during the wait (measured: closed probe sockets stayed counted until the next
+  // heartbeat sweep).
+  ws.on('close', () => {
+    viewers.delete(ws);
+    broadcast({ type: 'viewerCount', count: viewers.size });
   });
 
   // Send current stats
@@ -1513,12 +1732,22 @@ wss.on('connection', async (ws) => {
   } finally {
     releaseContributionState?.();
   }
+}
 
-  ws.on('close', () => {
-    viewers.delete(ws);
-    broadcast({ type: 'viewerCount', count: viewers.size });
-  });
+// T6: admission control owns the raw HTTP upgrade - path/Origin/identity/rate/cap checks all run
+// BEFORE wss.handleUpgrade, so a rejected upgrade never reaches it, never enters `viewers`, and
+// never computes a snapshot (I8).
+const wsAdmission = createWsAdmission({
+  wss,
+  resolveIdentity: (req) => clientIpResolver.resolve(req),
+  consume: limits.consume,
+  enforcement: clientIpConfig.enforcement,
+  allowedOrigins: wsAllowedOrigins,
+  allowLocalhostOrigins: wsAllowLocalhostOrigins,
+  limits: DEFAULT_WS_LIMITS,
+  onAccepted: (ws) => { onWsAccepted(ws); },
 });
+server.on('upgrade', wsAdmission.handleUpgrade);
 
 // Heartbeat: detect and remove dead WebSocket connections every 30s
 const WS_HEARTBEAT_INTERVAL = 30 * 1000;
@@ -1535,6 +1764,18 @@ setInterval(() => {
   // Broadcast accurate count after cleanup
   broadcast({ type: 'viewerCount', count: viewers.size });
 }, WS_HEARTBEAT_INTERVAL);
+
+// §3: the shared `read` policy applies to exactly `GET /api/world/sections`, never to
+// `/api/world/sections/<file>` (served by the generic `/api/world/*` file route further below,
+// e.g. the MCP `aibuilds_read_file` path) - `app.use('/api/world/sections', ...)` path-matches as
+// a PREFIX, so it used to also count every sections file read against this same 60/min shared
+// budget (Gate R1-W2, measured: 61 requests to one file -> 60x200, 1x429). `app.get` with this
+// exact literal path matches only that path, not its sub-paths. Mounted here, BEFORE
+// serializeContributionStateRead, so a rejected (429/503) request never queues on
+// CONTRIBUTION_STATE_LOCK (Gate R1 F8); calls next() on success so control reaches the real
+// handler further below. That handler itself carries no second `read` call (Gate R2-6) - mounting
+// it in both places would silently halve the effective shared budget.
+app.get('/api/world/sections', limits.limit('read'), (req, res, next) => next());
 
 // Vote/comment mutations update shared in-memory state before their durable save resolves.
 // Affected public reads must cross the same barrier so they observe either the prior durable
@@ -2013,7 +2254,9 @@ app.get('/live', (req, res) => {
 // API: Get current stats
 app.get('/api/stats', async (req, res) => {
   try {
-    const snapshot = await getPublicPlatformSnapshot();
+    // 5s generation-bound snapshot cache (§3/T7); viewerCount stays live (never cached) since it
+    // reflects the current WS connection count, not derived platform state.
+    const snapshot = await getCachedRead('stats', () => getPublicPlatformSnapshot());
     res.json({
       viewerCount: viewers.size,
       ...snapshot.metrics,
@@ -2126,22 +2369,16 @@ app.get('/api/leaderboard', (req, res) => {
   });
 });
 
-// Rate limiter for challenge endpoint — prevent memory exhaustion
-const challengeLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  message: { error: 'Too many challenge requests. Please wait.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-// API: Get a proof-of-work challenge (solve before calling mutation endpoints)
-app.get('/api/challenge', challengeLimiter, (req, res) => {
-  const id = randomUUID();
-  const prefix = crypto.randomBytes(16).toString('hex');
-  const expiresAt = Date.now() + POW_EXPIRY_MS;
-
-  powChallenges.set(id, { prefix, expiresAt });
+// API: Get a proof-of-work challenge (solve before calling mutation endpoints).
+// §3: the `challenge` policy (60/min) plus a per-owner open-challenge cap (owner = the limiter
+// identity key, T4); the response shape is unchanged from before this hardening pass.
+app.get('/api/challenge', ...limits.routes.challenge, (req, res) => {
+  const owner = req.abuseIdentity.key;
+  const issued = challengeRegistry.issue(owner);
+  if (issued.error) {
+    return res.status(429).json({ error: 'Too many open challenges. Solve or let existing ones expire.' });
+  }
+  const { id, prefix, expiresAt } = issued;
 
   res.json({
     id,
@@ -2163,7 +2400,7 @@ app.get('/api/guestbook', (req, res) => {
 });
 
 // API: Post to guestbook
-app.post('/api/guestbook', agentLimiter, requireProofOfWork, async (req, res) => {
+app.post('/api/guestbook', ...limits.routes.guestbook, requireProofOfWork, async (req, res) => {
   try {
     const { agent_name, message } = req.body;
 
@@ -2181,13 +2418,16 @@ app.post('/api/guestbook', agentLimiter, requireProofOfWork, async (req, res) =>
       return res.status(400).json({ error: 'message must be 1-1000 characters' });
     }
 
-    if (moderation.isBanned(agent_name, req.ip)) {
+    const clientIp = limits.identity(req);
+    if (moderation.isBanned(agent_name, clientIp)) {
       return res.status(403).json({ error: 'This agent is banned.' });
     }
     if (moderation.scanContent({ message: trimmedMessage, agentName: agent_name })) {
       return res.status(403).json({ error: 'Entry rejected by content policy.' });
     }
-    await recordAgentIpDurably(agent_name, req.ip);
+    // clientIp is null only when provenance could not be verified in shadow mode (the route would
+    // already have returned 503 in enforce mode) - never record a peer address as an agent IP.
+    if (clientIp !== null) await recordAgentIpDurably(agent_name, clientIp);
 
     const entry = {
       id: randomUUID(),
@@ -2225,7 +2465,7 @@ app.post('/api/guestbook', agentLimiter, requireProofOfWork, async (req, res) =>
 });
 
 // API: Reset all data (admin only - uses secret key)
-app.post('/api/admin/reset', adminLimiter, async (req, res) => {
+app.post('/api/admin/reset', ...adminChain, async (req, res) => {
   const { secret } = req.body;
 
   if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
@@ -2236,6 +2476,8 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
   try {
     // Clear all in-memory data. NOTE: moderation state (bans, hidden files, agentIps in
     // moderation.json) is intentionally NOT cleared — bans/hidden survive a content reset.
+    // Profile credentials (data/agent-credentials.json) are ALSO intentionally not cleared (D8): a
+    // returning owner keeps their profile and nobody else can claim that name's token afterward.
     history.length = 0;
     contributions.clear();
     agents.clear();
@@ -2244,6 +2486,7 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
     agentAchievements.clear();
     guestbook.length = 0;
     sectionVotes.clear();
+    totalReactionCount = 0;
     chaosMode = { active: false, endsAt: null, nextAt: null };
     // Cancel any pending chaos auto-deactivation timer so it can't fire against the reset state
     if (chaosTimer) {
@@ -2256,8 +2499,9 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
 
     console.log('Platform reset by admin');
 
-    // Broadcast reset to all connected clients
-    wss.clients.forEach(client => {
+    // Broadcast reset to all connected clients (Gate R1 F2: wss.clients is undefined with
+    // clientTracking:false - `viewers` is the single source of truth for connected sockets).
+    viewers.forEach(client => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(JSON.stringify({ type: 'reset', message: 'Platform has been reset' }));
       }
@@ -2273,7 +2517,7 @@ app.post('/api/admin/reset', adminLimiter, async (req, res) => {
 });
 
 // Admin: moderate a single contribution/file — hide (reversible), unhide, or delete (hard)
-app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
+app.post('/api/admin/moderate', ...adminChain, async (req, res) => {
   const { secret, action, target } = req.body || {};
   if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -2310,6 +2554,16 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
       // Purge from in-memory history + index
       for (let i = history.length - 1; i >= 0; i--) {
         if (history[i].file_path === relPath) {
+          // R1-W7: the global reaction counter is maintained incrementally (§3) - a purge that
+          // removes the contribution without also subtracting its reaction entries leaves the
+          // counter drifting upward forever, which can produce a false 409 `capacity` long after
+          // the reactions it counted are gone.
+          const purged = contributions.get(history[i].id);
+          if (purged && purged.reactions && typeof purged.reactions === 'object') {
+            for (const arr of Object.values(purged.reactions)) {
+              if (Array.isArray(arr)) totalReactionCount = Math.max(0, totalReactionCount - arr.length);
+            }
+          }
           contributions.delete(history[i].id);
           history.splice(i, 1);
         }
@@ -2356,7 +2610,7 @@ app.post('/api/admin/moderate', adminLimiter, async (req, res) => {
 });
 
 // Admin: ban/unban an agent name and/or IP
-app.post('/api/admin/ban', adminLimiter, async (req, res) => {
+app.post('/api/admin/ban', ...adminChain, async (req, res) => {
   const { secret, action, agent_name, ip, hideContent, banIp } = req.body || {};
   if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -2366,6 +2620,12 @@ app.post('/api/admin/ban', adminLimiter, async (req, res) => {
   }
   if (!agent_name && !ip) {
     return res.status(400).json({ error: 'agent_name or ip is required' });
+  }
+  // INFO (e): before this check, an `ip` that failed to parse was silently accepted and stored/
+  // matched nowhere (moderation.ban()/isBanned() both canonicalize and drop what doesn't parse) -
+  // `success: true` while banning nothing. Reject it instead of pretending it worked.
+  if (ip !== undefined && ip !== null && ip !== '' && canonicalIp(String(ip)) === null) {
+    return res.status(400).json({ error: 'ip must be a valid IPv4 or IPv6 address' });
   }
 
   const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
@@ -2402,9 +2662,75 @@ app.post('/api/admin/ban', adminLimiter, async (req, res) => {
   }
 });
 
+// Admin: issue or revoke an agent's profile capability (D1/T5). Operator path for existing agents
+// that predate this hardening pass, or whose first contribution was quarantined / whose name first
+// appeared only in a comment (never eligible for the automatic on-creation token, §6 residuals).
+app.post('/api/admin/agents/:name/profile-token', ...adminChain, async (req, res) => {
+  const { secret, action } = req.body || {};
+  if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  if (!['issue', 'revoke'].includes(action)) {
+    return res.status(400).json({ error: 'action must be issue or revoke' });
+  }
+  const name = req.params.name;
+  res.set('Cache-Control', 'no-store');
+  // R2-W4: issue/revoke + save + snapshot/restore run under the SAME lock the on-creation profile
+  // token issuance in /api/contribute already holds (CONTRIBUTION_STATE_LOCK) - both mutate the
+  // same live `credentials` map via snapshot()/restore(), and without a shared lock a contribution
+  // that auto-issues a creation token for a new name could interleave between this route's
+  // snapshot() and restore(): its own save could land on disk while this route's restore() (on its
+  // own save failure) replaces the whole in-memory map with a pre-interleave snapshot, silently
+  // dropping the newcomer's just-persisted token from memory. Serializing both on the same lock
+  // removes the interleaving window entirely.
+  const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
+  try {
+    if (action === 'revoke') {
+      // INFO (b): snapshot before mutating, restore (not revoke()) on a save failure - revoke()
+      // unconditionally deletes the in-memory entry, which is wrong here specifically when there was
+      // nothing to restore (name already unclaimed) but is otherwise harmless for a plain revoke.
+      // Kept symmetric with the issue path below for the same reason: a shared bug class, one fix.
+      const previous = credentials.snapshot();
+      credentials.revoke(name);
+      try {
+        await credentials.save();
+      } catch (error) {
+        credentials.restore(previous);
+        console.error('Failed to persist profile-token revocation:', error.message);
+        return res.status(500).json({ error: 'Failed to persist revocation' });
+      }
+      console.log(`[admin] profile token revoked for ${name}`);
+      return res.json({ success: true });
+    }
+    // issue
+    const isKnownAgent = agents.has(name) || getPublicAgentState().has(name);
+    if (!isKnownAgent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+    // INFO (b): issue() REPLACES any existing credential for `name` (§4) - on a re-issue, the old
+    // token's hash is already overwritten in memory before save() ever runs. A save failure here must
+    // restore that PREVIOUS entry via snapshot()/restore(), not call revoke(name): revoke() deletes
+    // the credential entirely, so memory would say "unclaimed" while disk still holds the old,
+    // still-valid hash - the previous owner's token would appear to stop working until a restart.
+    const previous = credentials.snapshot();
+    const token = credentials.issue(name, 'operator');
+    try {
+      await credentials.save();
+    } catch (error) {
+      credentials.restore(previous);
+      console.error('Failed to persist issued profile token:', error.message);
+      return res.status(500).json({ error: 'Failed to persist issued token' });
+    }
+    console.log(`[admin] profile token issued for ${name}`);
+    res.json({ success: true, agent_name: name, profile_token: token });
+  } finally {
+    releaseContributionState();
+  }
+});
+
 // Admin: inspect current moderation state. Returns hidden/banned lists + an agent-IP COUNT only
 // (GDPR data minimization — no bulk IP dump). Pass agent_name to look up that single agent's IP.
-app.post('/api/admin/moderation', adminLimiter, (req, res) => {
+app.post('/api/admin/moderation', ...adminChain, (req, res) => {
   const { secret, agent_name } = req.body || {};
   if (!process.env.ADMIN_RESET_SECRET || !safeSecretEqual(secret, process.env.ADMIN_RESET_SECRET)) {
     return res.status(403).json({ error: 'Unauthorized' });
@@ -2424,7 +2750,7 @@ function authenticateQuarantineAdmin(req, res) {
   return true;
 }
 
-app.get('/api/admin/quarantine', adminLimiter, (req, res) => {
+app.get('/api/admin/quarantine', ...adminChain, (req, res) => {
   if (!authenticateQuarantineAdmin(req, res)) return;
   res.json({
     quarantined: moderation.listQuarantined().map(record => ({
@@ -2437,7 +2763,7 @@ app.get('/api/admin/quarantine', adminLimiter, (req, res) => {
   });
 });
 
-app.post('/api/admin/quarantine/approve', adminLimiter, async (req, res) => {
+app.post('/api/admin/quarantine/approve', ...adminChain, async (req, res) => {
   if (!authenticateQuarantineAdmin(req, res)) return;
   const { path: requestedPath, content_hash: requestedHash } = req.body || {};
   if (typeof requestedPath !== 'string' || !requestedPath || typeof requestedHash !== 'string' || !requestedHash) {
@@ -2496,7 +2822,7 @@ app.post('/api/admin/quarantine/approve', adminLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/admin/quarantine/reject', adminLimiter, async (req, res) => {
+app.post('/api/admin/quarantine/reject', ...adminChain, async (req, res) => {
   if (!authenticateQuarantineAdmin(req, res)) return;
   const { path: requestedPath } = req.body || {};
   if (typeof requestedPath !== 'string' || !requestedPath) {
@@ -2681,7 +3007,7 @@ app.get('/api/agents/:name/achievements', (req, res) => {
 });
 
 // API: Update agent profile
-app.put('/api/agents/:name/profile', agentLimiter, requireProofOfWork, (req, res) => {
+app.put('/api/agents/:name/profile', ...limits.routes.profile, requireProofOfWork, requireProfileCapability, (req, res) => {
   const publicAgent = getPublicAgentState().get(req.params.name);
   if (!publicAgent) {
     return res.status(404).json({ error: 'Agent not found' });
@@ -2747,7 +3073,7 @@ app.put('/api/agents/:name/profile', agentLimiter, requireProofOfWork, (req, res
 });
 
 // API: Vote on a section (up/down)
-app.post('/api/vote', agentLimiter, requireProofOfWork, async (req, res) => {
+app.post('/api/vote', ...limits.routes.vote, requireProofOfWork, async (req, res) => {
   const { agent_name, section_file, vote } = req.body;
 
   if (!agent_name || typeof agent_name !== 'string') {
@@ -2789,6 +3115,14 @@ app.post('/api/vote', agentLimiter, requireProofOfWork, async (req, res) => {
     }
 
     const votes = sectionVotes.get(sectionPath);
+
+    // §3: <= 5,000 distinct voter names per section across up+down. Only a genuinely NEW voter
+    // can trip this - toggling or switching an existing vote never grows the voter count.
+    const isNewVoter = !votes.up.has(trimmedName) && !votes.down.has(trimmedName);
+    if (isNewVoter && votes.up.size + votes.down.size >= MAX_VOTERS_PER_SECTION) {
+      return res.status(409).json({ error: 'This section has reached its maximum number of voters' });
+    }
+
     let action;
 
     if (vote === 'up') {
@@ -2887,7 +3221,7 @@ app.get('/api/chaos', (req, res) => {
 });
 
 // API: Trigger chaos mode (admin or scheduled)
-app.post('/api/chaos/trigger', agentLimiter, requireProofOfWork, (req, res) => {
+app.post('/api/chaos/trigger', ...limits.routes.chaos, requireProofOfWork, (req, res) => {
   const { secret } = req.body;
 
   // Allow admin trigger or check if enough agents have voted for chaos
@@ -2999,7 +3333,7 @@ app.get('/api/contributions/:id', (req, res) => {
 });
 
 // API: Add/remove reaction to contribution
-app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (req, res) => {
+app.post('/api/contributions/:id/reactions', ...limits.routes.reaction, requireProofOfWork, (req, res) => {
   const contribution = getPublicContribution(req.params.id);
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
@@ -3007,8 +3341,8 @@ app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (
 
   const { agent_name, type } = req.body;
 
-  if (!agent_name || typeof agent_name !== 'string') {
-    return res.status(400).json({ error: 'agent_name is required' });
+  if (!agent_name || typeof agent_name !== 'string' || agent_name.length > 100) {
+    return res.status(400).json({ error: 'agent_name must be 1-100 characters' });
   }
 
   if (!type || !REACTION_TYPES.includes(type)) {
@@ -3025,13 +3359,23 @@ app.post('/api/contributions/:id/reactions', agentLimiter, requireProofOfWork, (
   let action;
 
   if (index === -1) {
+    // §3 state caps: <= 1,000 names per contribution and type, <= 50,000 reaction entries
+    // globally. Removals (the else branch below) are always allowed regardless of either cap.
+    if (reactions.length >= MAX_REACTIONS_PER_TYPE) {
+      return res.status(409).json({ error: 'capacity', message: 'This reaction type is full for this contribution' });
+    }
+    if (totalReactionCount >= MAX_REACTIONS_GLOBAL) {
+      return res.status(409).json({ error: 'capacity', message: 'Reaction capacity reached' });
+    }
     // Add reaction
     reactions.push(agent_name);
+    totalReactionCount += 1;
     action = 'added';
 
   } else {
     // Remove reaction
     reactions.splice(index, 1);
+    totalReactionCount = Math.max(0, totalReactionCount - 1);
     action = 'removed';
 
   }
@@ -3087,7 +3431,7 @@ app.get('/api/contributions/:id/comments', (req, res) => {
 });
 
 // API: Add comment to a contribution
-app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, async (req, res) => {
+app.post('/api/contributions/:id/comments', ...limits.routes.commentContribution, requireProofOfWork, async (req, res) => {
   const contribution = getPublicContribution(req.params.id);
   if (!contribution) {
     return res.status(404).json({ error: 'Contribution not found' });
@@ -3108,14 +3452,17 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, as
     return res.status(400).json({ error: 'content must be 1-1000 characters' });
   }
 
-  if (moderation.isBanned(agent_name, req.ip)) {
+  const clientIp = limits.identity(req);
+  if (moderation.isBanned(agent_name, clientIp)) {
     return res.status(403).json({ error: 'This agent is banned.' });
   }
   if (moderation.scanContent({ content: trimmedContent, agentName: agent_name })) {
     return res.status(403).json({ error: 'Comment rejected by content policy.' });
   }
-  try { await recordAgentIpDurably(agent_name, req.ip); }
-  catch { return res.status(500).json({ error: 'Failed to persist comment moderation state' }); }
+  if (clientIp !== null) {
+    try { await recordAgentIpDurably(agent_name, clientIp); }
+    catch { return res.status(500).json({ error: 'Failed to persist comment moderation state' }); }
+  }
 
   const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
   try {
@@ -3141,8 +3488,9 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, as
     const hadCommentCount = Object.hasOwn(lockedContribution, 'commentCount');
     const previousCommentCount = lockedContribution.commentCount;
     const previousCurationEvents = curationEvents.slice();
+    const previousCommentsOrder = snapshotCommentsOrder();
 
-    comments.set(comment.id, comment);
+    insertCommentWithCap(comment);
     lockedContribution.commentCount = (lockedContribution.commentCount || 0) + 1;
     appendCurationEvent({
       type: 'comment',
@@ -3154,7 +3502,7 @@ app.post('/api/contributions/:id/comments', agentLimiter, requireProofOfWork, as
     try {
       await saveState();
     } catch (error) {
-      comments.delete(comment.id);
+      restoreCommentsOrder(previousCommentsOrder);
       if (hadCommentCount) lockedContribution.commentCount = previousCommentCount;
       else delete lockedContribution.commentCount;
       restoreCurationEvents(previousCurationEvents);
@@ -3209,7 +3557,7 @@ app.get('/api/files/:path(*)/comments', async (req, res) => {
 });
 
 // API: Add comment to a file
-app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, async (req, res) => {
+app.post('/api/files/:path(*)/comments', ...limits.routes.commentFile, requireProofOfWork, async (req, res) => {
   let filePath;
   try { filePath = normalizeWorldPath(req.params.path); }
   catch { return res.status(404).json({ error: 'File not found' }); }
@@ -3231,14 +3579,22 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, async
     return res.status(400).json({ error: 'content must be 1-1000 characters' });
   }
 
-  if (moderation.isBanned(agent_name, req.ip)) {
+  if (line_number !== undefined && line_number !== null &&
+      (!Number.isInteger(line_number) || line_number < 1 || line_number > MAX_LINE_NUMBER)) {
+    return res.status(400).json({ error: `line_number must be null or an integer between 1 and ${MAX_LINE_NUMBER}` });
+  }
+
+  const clientIp = limits.identity(req);
+  if (moderation.isBanned(agent_name, clientIp)) {
     return res.status(403).json({ error: 'This agent is banned.' });
   }
   if (moderation.scanContent({ content: trimmedContent, agentName: agent_name })) {
     return res.status(403).json({ error: 'Comment rejected by content policy.' });
   }
-  try { await recordAgentIpDurably(agent_name, req.ip); }
-  catch { return res.status(500).json({ error: 'Failed to persist comment moderation state' }); }
+  if (clientIp !== null) {
+    try { await recordAgentIpDurably(agent_name, clientIp); }
+    catch { return res.status(500).json({ error: 'Failed to persist comment moderation state' }); }
+  }
 
   const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
   try {
@@ -3262,8 +3618,9 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, async
       timestamp: new Date().toISOString(),
     };
     const previousCurationEvents = curationEvents.slice();
+    const previousCommentsOrder = snapshotCommentsOrder();
 
-    comments.set(comment.id, comment);
+    insertCommentWithCap(comment);
     appendCurationEvent({
       type: 'comment',
       agentName: comment.agentName,
@@ -3274,7 +3631,7 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, async
     try {
       await saveState();
     } catch (error) {
-      comments.delete(comment.id);
+      restoreCommentsOrder(previousCommentsOrder);
       restoreCurationEvents(previousCurationEvents);
       try { await saveState(); }
       catch (rollbackError) {
@@ -3295,18 +3652,12 @@ app.post('/api/files/:path(*)/comments', agentLimiter, requireProofOfWork, async
 });
 
 // API: Get diff for a contribution
-app.get('/api/contributions/:id/diff', async (req, res) => {
-  const contribution = getPublicContribution(req.params.id);
-  if (!contribution) {
-    return res.status(404).json({ error: 'Contribution not found' });
-  }
-
+// Pure computation, cached and single-flighted by the caller below - never called directly by a
+// route so its result is always shared across concurrent requests for the same key.
+async function computeContributionDiff(contribution) {
   try {
     if (typeof contribution.gitHash !== 'string' || !/^[0-9a-f]{40}$/i.test(contribution.gitHash)) {
-      return res.json({
-        diff: null,
-        message: 'No git diff available for this contribution',
-      });
+      return { diff: null, message: 'No git diff available for this contribution' };
     }
 
     const log = await git.log({
@@ -3316,13 +3667,18 @@ app.get('/api/contributions/:id/diff', async (req, res) => {
     });
     const commit = log.latest;
     if (!commit || commit.hash !== contribution.gitHash) {
-      return res.json({ diff: null, message: 'No git diff available for this contribution' });
+      return { diff: null, message: 'No git diff available for this contribution' };
     }
 
     // Get diff for the specific commit
     const diff = await git.diff([
       `${commit.hash}^`, commit.hash, '--', literalGitPathspec(contribution.file_path),
     ]);
+
+    // §3: diffs over 2 MiB are answered (and cached) as too-large rather than shipped whole.
+    if (Buffer.byteLength(diff, 'utf8') > MAX_DIFF_BYTES) {
+      return { diff: null, message: 'Diff too large' };
+    }
 
     // Parse diff to get additions/deletions
     const lines = diff.split('\n');
@@ -3342,7 +3698,7 @@ app.get('/api/contributions/:id/diff', async (req, res) => {
       }
     }
 
-    res.json({
+    return {
       diff: diff,
       parsed: diffLines,
       stats: { additions, deletions },
@@ -3351,66 +3707,143 @@ app.get('/api/contributions/:id/diff', async (req, res) => {
         date: commit.date,
         message: commit.message,
       },
-    });
+    };
   } catch (e) {
-    res.json({
+    return {
       diff: null,
       message: 'Failed to get diff: ' + e.message,
+      // R1-W1: a caught error here is a TRANSIENT failure (e.g. a `git` process error), unlike the
+      // deterministic results above (no matching commit, diff too large) - it must never be pinned
+      // in the LRU, or every later request for the same contribution keeps replaying today's
+      // failure even after whatever caused it (measured: chmod 000 on .git/objects, then restored -
+      // the cached failure was still served). `cacheable` is an internal marker only, stripped
+      // before the response is sent.
+      cacheable: false,
+    };
+  }
+}
+
+app.get('/api/contributions/:id/diff', ...limits.routes.diff, async (req, res) => {
+  const contribution = getPublicContribution(req.params.id);
+  if (!contribution) {
+    return res.status(404).json({ error: 'Contribution not found' });
+  }
+
+  const cacheKey = `${contribution.gitHash}:${contribution.file_path}`;
+  const cached = diffCache.get(cacheKey);
+  if (cached !== undefined) {
+    return res.json(cached);
+  }
+
+  try {
+    // INFO (c): single-flight sits OUTSIDE the semaphore. A follower joining an already in-flight
+    // key must never consume a semaphore slot or waiter of its own - only the leader that actually
+    // calls computeContributionDiff() acquires one. Before this change, EVERY concurrent request
+    // (leader or follower) queued on the semaphore first, so N requests over a handful of distinct
+    // keys could exhaust the semaphore's 2+16 capacity even though only a few real git executions
+    // were needed (measured: 25 requests over 3 keys -> 18x200, 7x503).
+    const result = await diffSingleFlight.run(cacheKey, async () => {
+      // Another waiter may have completed and cached this key while we were queued for the
+      // single-flight slot.
+      const already = diffCache.get(cacheKey);
+      if (already !== undefined) return already;
+
+      let release;
+      try {
+        release = await diffSemaphore.acquire();
+      } catch (err) {
+        if (err.code === 'SEMAPHORE_FULL') {
+          const busy = new Error('Diff service busy, try again shortly');
+          busy.code = 'DIFF_SEMAPHORE_FULL';
+          throw busy;
+        }
+        throw err;
+      }
+      try {
+        const computed = await computeContributionDiff(contribution);
+        if (computed.cacheable !== false) diffCache.set(cacheKey, computed);
+        return computed;
+      } finally {
+        release();
+      }
     });
+    const { cacheable, ...responseBody } = result;
+    res.json(responseBody);
+  } catch (err) {
+    if (err.code === 'DIFF_SEMAPHORE_FULL') {
+      return res.status(503).set('Retry-After', '5').json({ error: 'Diff service busy, try again shortly' });
+    }
+    throw err;
   }
 });
 
 // API: Get agent network graph data
-app.get('/api/network/graph', (req, res) => {
-  const publicHistory = getPublicHistory();
-  const nodes = Array.from(getPublicAgentState(publicHistory).values()).map(agent => ({
-    id: agent.name,
-    name: agent.name,
-    contributions: agent.contributions,
-    avatar: agent.avatar,
-    specializations: agent.specializations,
-  }));
+const MAX_GRAPH_EDGES = 5000;
 
-  // Build edges from file collaborations
-  const edgeMap = new Map();
+app.get('/api/network/graph', ...limits.routes.read, async (req, res) => {
+  // INFO (a): Express 4 does not catch a rejected promise from an async handler - without this
+  // try/catch, a throw here left the request hanging (only logged by the process-wide
+  // unhandledRejection handler) instead of a normal 500 JSON response.
+  try {
+    const graph = await getCachedRead('network-graph', async () => {
+      const publicHistory = getPublicHistory();
+      const nodes = Array.from(getPublicAgentState(publicHistory).values()).map(agent => ({
+        id: agent.name,
+        name: agent.name,
+        contributions: agent.contributions,
+        avatar: agent.avatar,
+        specializations: agent.specializations,
+      }));
 
-  // Group contributions by file to find collaborators
-  const fileContributors = new Map();
-  for (const contrib of publicHistory) {
-    if (!fileContributors.has(contrib.file_path)) {
-      fileContributors.set(contrib.file_path, new Set());
-    }
-    fileContributors.get(contrib.file_path).add(contrib.agent_name);
-  }
+      // Build edges from file collaborations
+      const edgeMap = new Map();
 
-  // Create edges between agents who worked on the same files
-  for (const [filePath, contributors] of fileContributors) {
-    const contribArray = Array.from(contributors);
-    for (let i = 0; i < contribArray.length; i++) {
-      for (let j = i + 1; j < contribArray.length; j++) {
-        const key = [contribArray[i], contribArray[j]].sort().join('::');
-        if (!edgeMap.has(key)) {
-          edgeMap.set(key, { source: contribArray[i], target: contribArray[j], weight: 0, files: [] });
+      // Group contributions by file to find collaborators
+      const fileContributors = new Map();
+      for (const contrib of publicHistory) {
+        if (!fileContributors.has(contrib.file_path)) {
+          fileContributors.set(contrib.file_path, new Set());
         }
-        edgeMap.get(key).weight++;
-        if (!edgeMap.get(key).files.includes(filePath)) {
-          edgeMap.get(key).files.push(filePath);
+        fileContributors.get(contrib.file_path).add(contrib.agent_name);
+      }
+
+      // Create edges between agents who worked on the same files
+      for (const [filePath, contributors] of fileContributors) {
+        const contribArray = Array.from(contributors);
+        for (let i = 0; i < contribArray.length; i++) {
+          for (let j = i + 1; j < contribArray.length; j++) {
+            const key = [contribArray[i], contribArray[j]].sort().join('::');
+            if (!edgeMap.has(key)) {
+              edgeMap.set(key, { source: contribArray[i], target: contribArray[j], weight: 0, files: [] });
+            }
+            edgeMap.get(key).weight++;
+            if (!edgeMap.get(key).files.includes(filePath)) {
+              edgeMap.get(key).files.push(filePath);
+            }
+          }
         }
       }
-    }
+
+      const allEdges = Array.from(edgeMap.values());
+      const truncated = allEdges.length > MAX_GRAPH_EDGES;
+      const edges = truncated ? allEdges.slice(0, MAX_GRAPH_EDGES) : allEdges;
+
+      return {
+        nodes,
+        edges,
+        truncated,
+        stats: {
+          totalAgents: nodes.length,
+          totalConnections: allEdges.length,
+          totalCollaborativeFiles: fileContributors.size,
+        },
+      };
+    });
+    res.set('Cache-Control', 'public, max-age=5');
+    res.json(graph);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to build network graph' });
   }
-
-  const edges = Array.from(edgeMap.values());
-
-  res.json({
-    nodes,
-    edges,
-    stats: {
-      totalAgents: nodes.length,
-      totalConnections: edges.length,
-      totalCollaborativeFiles: fileContributors.size,
-    },
-  });
 });
 
 // API: Get trends (popular files, active agents)
@@ -3561,14 +3994,25 @@ app.get('/api/timeline', async (req, res) => {
 });
 
 // API: Search files, agents, and contributions
-app.get('/api/search', (req, res) => {
-  const { q, type = 'all' } = req.query;
+app.get('/api/search', ...limits.routes.read, async (req, res) => {
+  const { type = 'all' } = req.query;
+  const q = req.query.q;
 
-  if (!q || q.length < 2) {
-    return res.status(400).json({ error: 'Query must be at least 2 characters' });
+  // q must be a plain string of 2-100 characters (§3/T7). Express turns `q[]=a&q[]=b` into an
+  // array and `q[a]=x` into an object; both used to reach `.toLowerCase()` below and 500.
+  if (typeof q !== 'string' || q.length < 2 || q.length > 100) {
+    return res.status(400).json({ error: 'Query must be a string of 2-100 characters' });
+  }
+  if (typeof type !== 'string') {
+    return res.status(400).json({ error: 'type must be a string' });
   }
 
-  const query = q.toLowerCase();
+  // INFO (a): Express 4 does not catch a rejected promise from an async handler - without this
+  // try/catch, a throw here left the request hanging instead of a normal 500 JSON response.
+  try {
+  const cacheKey = `search:${type}:${q}`;
+  const payload = await getCachedRead(cacheKey, async () => {
+    const query = q.toLowerCase();
   const results = { files: [], agents: [], contributions: [] };
 
   // Search files
@@ -3619,11 +4063,17 @@ app.get('/api/search', (req, res) => {
     }));
   }
 
-  res.json({
-    query: q,
-    results,
-    total: results.files.length + results.agents.length + results.contributions.length,
+    return {
+      query: q,
+      results,
+      total: results.files.length + results.agents.length + results.contributions.length,
+    };
   });
+  res.set('Cache-Control', 'public, max-age=5');
+  res.json(payload);
+  } catch (error) {
+    res.status(500).json({ error: 'Search failed' });
+  }
 });
 
 // API: Get all pages with metadata
@@ -3651,47 +4101,50 @@ app.get('/api/project', async (req, res) => {
 });
 
 // API: Get world structure for agents
-app.get('/api/world/structure', async (req, res) => {
+app.get('/api/world/structure', ...limits.routes.read, async (req, res) => {
   try {
-    const files = (await listWorldFiles(WORLD_DIR, {
-      isHidden: relativePath => isUnavailablePath(relativePath),
-    })).filter(file => !isUnavailablePath(file.path));
-    const pages = await getPages();
-    const currentFiles = files.filter(file => !isUnavailablePath(file.path));
+    const structure = await getCachedRead('world-structure', async () => {
+      const files = (await listWorldFiles(WORLD_DIR, {
+        isHidden: relativePath => isUnavailablePath(relativePath),
+      })).filter(file => !isUnavailablePath(file.path));
+      const pages = await getPages();
+      const currentFiles = files.filter(file => !isUnavailablePath(file.path));
 
-    // Categorize files
-    const structure = {
-      theme: '/world/css/theme.css',
-      coreJs: '/world/js/core.js',
-      guidelines: '/world/WORLD.md',
-      sections: currentFiles
-        .filter(f => f.path.startsWith('sections/') && f.path.endsWith('.html'))
-        .map(f => ({
-          path: f.path,
-          name: f.path.replace('sections/', '').replace('.html', '').replace(/-/g, ' '),
-          size: f.size,
-          modified: f.modified,
-        })),
-      pages,
-      components: currentFiles.filter(f => f.path.startsWith('components/')),
-      assets: currentFiles.filter(f => f.path.startsWith('assets/')),
-      rootFiles: currentFiles.filter(f => !f.path.includes('/')),
-      contributionPolicy: {
-        actor: 'AI agents',
-        writableTargets: [...WRITABLE_WORLD_TARGETS],
-        operatorBoundary: PLATFORM_OPERATOR_MESSAGE,
-      },
-      tips: [
-        'Use the shared theme.css for consistent styling',
-        'Create new sections in sections/ for the homepage',
-        'Create new pages in pages/ for standalone content (routed as /world/{slug})',
-        'Pages and sections are HTML fragments — no DOCTYPE needed',
-        'Read PROJECT.md (GET /api/project) for the roadmap and coordination',
-        'Edit PROJECT.md to coordinate roadmap changes; layout and global assets are operator-controlled',
-        'Build on others work - improve existing pages and sections!',
-      ],
-    };
+      // Categorize files
+      return {
+        theme: '/world/css/theme.css',
+        coreJs: '/world/js/core.js',
+        guidelines: '/world/WORLD.md',
+        sections: currentFiles
+          .filter(f => f.path.startsWith('sections/') && f.path.endsWith('.html'))
+          .map(f => ({
+            path: f.path,
+            name: f.path.replace('sections/', '').replace('.html', '').replace(/-/g, ' '),
+            size: f.size,
+            modified: f.modified,
+          })),
+        pages,
+        components: currentFiles.filter(f => f.path.startsWith('components/')),
+        assets: currentFiles.filter(f => f.path.startsWith('assets/')),
+        rootFiles: currentFiles.filter(f => !f.path.includes('/')),
+        contributionPolicy: {
+          actor: 'AI agents',
+          writableTargets: [...WRITABLE_WORLD_TARGETS],
+          operatorBoundary: PLATFORM_OPERATOR_MESSAGE,
+        },
+        tips: [
+          'Use the shared theme.css for consistent styling',
+          'Create new sections in sections/ for the homepage',
+          'Create new pages in pages/ for standalone content (routed as /world/{slug})',
+          'Pages and sections are HTML fragments — no DOCTYPE needed',
+          'Read PROJECT.md (GET /api/project) for the roadmap and coordination',
+          'Edit PROJECT.md to coordinate roadmap changes; layout and global assets are operator-controlled',
+          'Build on others work - improve existing pages and sections!',
+        ],
+      };
+    });
 
+    res.set('Cache-Control', 'public, max-age=5');
     res.json(structure);
   } catch (error) {
     res.status(500).json({ error: 'Failed to get structure' });
@@ -3712,56 +4165,76 @@ app.get('/api/world/guidelines', async (req, res) => {
   }
 });
 
+const MAX_SECTIONS_CONTENT_BUDGET_BYTES = 4 * 1024 * 1024;
+
 // API: Get all world sections (HTML fragments from sections/)
 app.get('/api/world/sections', async (req, res) => {
   try {
-    const sectionFiles = (await listWorldFiles(WORLD_DIR, {
-      isHidden: relativePath => isUnavailablePath(relativePath),
-    })).filter(file => file.path.startsWith('sections/') && !file.path.slice('sections/'.length).includes('/') && file.path.endsWith('.html'));
+    const payload = await getCachedRead('world-sections', async () => {
+      const sectionFiles = (await listWorldFiles(WORLD_DIR, {
+        isHidden: relativePath => isUnavailablePath(relativePath),
+      })).filter(file => file.path.startsWith('sections/') && !file.path.slice('sections/'.length).includes('/') && file.path.endsWith('.html'));
 
-    const sections = [];
-    for (const file of sectionFiles) {
-      const fileName = path.basename(file.path);
-      let content;
-      try { content = await readPublicWorldFile(file.path, 'utf8'); }
-      catch (error) { if (error instanceof WorldPathError) continue; throw error; }
+      const sections = [];
+      let contentBudgetRemaining = MAX_SECTIONS_CONTENT_BUDGET_BYTES;
+      let truncated = false;
+      for (const file of sectionFiles) {
+        const fileName = path.basename(file.path);
+        let content;
+        try { content = await readPublicWorldFile(file.path, 'utf8'); }
+        catch (error) { if (error instanceof WorldPathError) continue; throw error; }
 
-      // Extract data-* attributes from the <section> tag
-      const sectionMatch = content.match(/<section[^>]*>/i);
-      const tag = sectionMatch ? sectionMatch[0] : '';
+        // Extract data-* attributes from the <section> tag
+        const sectionMatch = content.match(/<section[^>]*>/i);
+        const tag = sectionMatch ? sectionMatch[0] : '';
 
-      const title = (tag.match(/data-section-title="([^"]*)"/i) || [])[1] || fileName.replace('.html', '').replace(/-/g, ' ');
-      const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
-      const author = (tag.match(/data-section-author="([^"]*)"/i) || [])[1] || 'unknown';
-      const note = (tag.match(/data-section-note="([^"]*)"/i) || [])[1] || null;
-      const requires = (tag.match(/data-section-requires="([^"]*)"/i) || [])[1] || null;
+        const title = (tag.match(/data-section-title="([^"]*)"/i) || [])[1] || fileName.replace('.html', '').replace(/-/g, ' ');
+        const order = parseInt((tag.match(/data-section-order="([^"]*)"/i) || [])[1] || '50', 10);
+        const author = (tag.match(/data-section-author="([^"]*)"/i) || [])[1] || 'unknown';
+        const note = (tag.match(/data-section-note="([^"]*)"/i) || [])[1] || null;
+        const requires = (tag.match(/data-section-requires="([^"]*)"/i) || [])[1] || null;
 
-      // Get vote score
-      const sectionPath = file.path;
-      const votes = sectionVotes.get(sectionPath);
-      const voteScore = votes ? votes.up.size - votes.down.size : 0;
-      const upvotes = votes ? votes.up.size : 0;
-      const downvotes = votes ? votes.down.size : 0;
+        // Get vote score
+        const sectionPath = file.path;
+        const votes = sectionVotes.get(sectionPath);
+        const voteScore = votes ? votes.up.size - votes.down.size : 0;
+        const upvotes = votes ? votes.up.size : 0;
+        const downvotes = votes ? votes.down.size : 0;
 
-      sections.push({
-        file: fileName,
-        path: sectionPath,
-        title,
-        order,
-        author,
-        note,
-        requires,
-        content,
-        size: file.size,
-        modified: file.modified,
-        votes: { score: voteScore, up: upvotes, down: downvotes },
-      });
-    }
+        // §3: include `content` until the 4 MiB total budget is exhausted, then omit it for the
+        // rest and set `truncated: true` (an `undefined` field is dropped by JSON.stringify).
+        const contentBytes = Buffer.byteLength(content, 'utf8');
+        let includedContent = content;
+        if (contentBytes > contentBudgetRemaining) {
+          includedContent = undefined;
+          truncated = true;
+        } else {
+          contentBudgetRemaining -= contentBytes;
+        }
 
-    // Sort by order first, then by vote score (higher = better), then by title
-    sections.sort((a, b) => a.order - b.order || b.votes.score - a.votes.score || a.title.localeCompare(b.title));
+        sections.push({
+          file: fileName,
+          path: sectionPath,
+          title,
+          order,
+          author,
+          note,
+          requires,
+          content: includedContent,
+          size: file.size,
+          modified: file.modified,
+          votes: { score: voteScore, up: upvotes, down: downvotes },
+        });
+      }
 
-    res.json({ sections, total: sections.length });
+      // Sort by order first, then by vote score (higher = better), then by title
+      sections.sort((a, b) => a.order - b.order || b.votes.score - a.votes.score || a.title.localeCompare(b.title));
+
+      return { sections, total: sections.length, truncated };
+    });
+
+    res.set('Cache-Control', 'public, max-age=5');
+    res.json(payload);
   } catch (error) {
     console.error('Sections error:', error);
     res.status(500).json({ error: 'Failed to load sections' });
@@ -3785,11 +4258,12 @@ app.get('/api/world/*', async (req, res) => {
 });
 
 // API: List all world files
-app.get('/api/files', async (req, res) => {
+app.get('/api/files', ...limits.routes.read, async (req, res) => {
   try {
-    const files = (await listWorldFiles(WORLD_DIR, {
+    const files = await getCachedRead('files-list', async () => (await listWorldFiles(WORLD_DIR, {
       isHidden: relativePath => isUnavailablePath(relativePath),
-    })).filter(file => !isUnavailablePath(file.path));
+    })).filter(file => !isUnavailablePath(file.path)));
+    res.set('Cache-Control', 'public, max-age=5');
     res.json(files);
   } catch (error) {
     res.status(500).json({ error: 'Failed to list files' });
@@ -3797,7 +4271,7 @@ app.get('/api/files', async (req, res) => {
 });
 
 // API: Agent contribution endpoint
-app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) => {
+app.post('/api/contribute', ...limits.routes.contribute, requireProofOfWork, async (req, res) => {
   try {
     const { agent_name, action, file_path, content, message } = req.body;
 
@@ -3840,9 +4314,17 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
     let releaseMutation;
     let transaction = null;
     try {
+    // §3: a contribution that would create a new agent record past the 20,000 cap is rejected
+    // before any Git work. Checked under the same lock trackAgentContribution() runs in, so no
+    // concurrent contribute can race past the cap between this check and that creation.
+    const contributorName = agent_name.slice(0, 100);
+    if (!agents.has(contributorName) && agents.size >= MAX_AGENTS) {
+      return res.status(503).json({ error: 'Agent capacity reached' });
+    }
     await repairAllRequiredGitPaths();
     releaseMutation = await acquireWorldMutation(canonicalPath);
-    if (moderation.isBanned(agent_name, req.ip)) {
+    const clientIp = limits.identity(req);
+    if (moderation.isBanned(agent_name, clientIp)) {
       return res.status(403).json({ error: 'This agent is banned.' });
     }
     const modHit = moderation.scanContent({ content, message, agentName: agent_name, filePath: canonicalPath });
@@ -3975,6 +4457,15 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
     // transition but before inserting this new immutable record, so old awards are not re-emitted.
     const achievementsBefore = getPublicAchievementSnapshot();
 
+    // T5/D1, Gate R1 F1: a name is "established" (never a fresh takeover target) the moment it
+    // appears ANYWHERE - the profile record, public agent state, ANY history entry (public or
+    // quarantined), or a comment. Computed here, inside the state lock and before the new record is
+    // pushed into `history`, so this contribution's own record can never make itself look established.
+    const createsAgent = !agents.has(contribution.agent_name) &&
+      !getPublicAgentState().has(contribution.agent_name) &&
+      !history.some(h => h.agent_name === contribution.agent_name) &&
+      !Array.from(comments.values()).some(c => c.agentName === contribution.agent_name);
+
     // Record in history and contributions index
     history.push(contribution);
     contributions.set(contribution.id, contribution);
@@ -3983,20 +4474,40 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
       const removed = history.shift();
       contributions.delete(removed.id);
       transaction.trimmedHistory = removed;
+      // R2-W2: same defect class as R1-W7 (the admin-delete purge) - a trim that evicts a
+      // contribution without also subtracting its reaction entries leaves the global counter
+      // drifting upward forever, eventually producing a permanent false 409 `capacity`.
+      totalReactionCount = Math.max(0, totalReactionCount - reactionEntryCount(removed));
     }
 
     if (getPublicContribution(contribution.id)) {
       trackAgentContribution(contribution.agent_name, action, canonicalPath, lastEditor);
     }
 
-    // Record agent IP for moderation
-    moderation.recordAgentIp(agent_name, req.ip);
+    // Record agent IP for moderation. clientIp is null only when provenance could not be verified
+    // in shadow mode (enforce mode would already have rejected this request in its limiter).
+    if (clientIp !== null) moderation.recordAgentIp(agent_name, clientIp);
     await moderation.save();
     await saveState();
     transaction.applicationStateDurable = true;
     // Clear the write-ahead marker only after both post-commit state files are durable. Until then,
     // a crash will sanitize the exact parent before this path can become public again.
     await clearContributionGitRepair(transaction);
+
+    // Issue a one-time profile capability exactly when this contribution durably established a
+    // brand-new agent record (D1). A save failure revokes in memory rather than leaving a token the
+    // caller never received but that still authorizes profile writes.
+    let issuedProfileToken = null;
+    if (createsAgent && agents.has(contribution.agent_name) && !credentials.has(contribution.agent_name)) {
+      issuedProfileToken = credentials.issue(contribution.agent_name, 'creation');
+      try {
+        await credentials.save();
+      } catch (saveError) {
+        credentials.revoke(contribution.agent_name);
+        console.error('Failed to persist issued profile token:', saveError.message);
+        issuedProfileToken = null;
+      }
+    }
 
     if (getPublicContribution(contribution.id)) {
       broadcastNewPublicAchievements(achievementsBefore, getPublicAchievementSnapshot());
@@ -4009,7 +4520,14 @@ app.post('/api/contribute', agentLimiter, requireProofOfWork, async (req, res) =
 
     console.log(`[${agent_name}] ${action} ${canonicalPath}`);
 
-    res.json(buildContributionResponse({ contribution, decision }));
+    const responseBody = buildContributionResponse({ contribution, decision });
+    if (issuedProfileToken) {
+      responseBody.profile_token = issuedProfileToken;
+      responseBody.profile_token_notice = 'Store this token now - it is shown exactly once and is '
+        + 'required to update this profile later (PUT /api/agents/:name/profile with '
+        + 'Authorization: Bearer <token>).';
+    }
+    res.json(responseBody);
     } catch (error) {
       if (transaction && !transaction.applicationStateDurable) {
         try {
@@ -4364,6 +4882,11 @@ async function retryRequiredGitRepairsAtStartup() {
 async function init() {
   await fs.mkdir(WORLD_DIR, { recursive: true });
 
+  // Load persisted profile capability tokens (T5/D1) before listen(). A malformed file throws here,
+  // which rejects the init() promise below and exits the process non-zero before it ever binds a
+  // port - fail-closed, same contract as a malformed moderation/state file.
+  await credentials.load();
+
   // Load persisted state
   await loadState();
 
@@ -4469,13 +4992,8 @@ async function init() {
   backupState().catch(console.error); // initial backup on startup
   setInterval(() => backupState().catch(console.error), BACKUP_INTERVAL_MS);
 
-  // Cleanup expired PoW challenges every 5 minutes
-  setInterval(() => {
-    const now = Date.now();
-    for (const [id, challenge] of powChallenges) {
-      if (now > challenge.expiresAt) powChallenges.delete(id);
-    }
-  }, POW_EXPIRY_MS);
+  // Sweep expired PoW challenges every 60s (T4) - also pruned lazily on access per owner.
+  setInterval(() => challengeRegistry.sweep(), CHALLENGE_SWEEP_INTERVAL_MS);
 
   // Create initial file if world is empty
   const files = await listWorldFiles(WORLD_DIR, { isHidden: relativePath => isUnavailablePath(relativePath) });

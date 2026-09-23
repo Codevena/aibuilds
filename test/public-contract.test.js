@@ -48,20 +48,32 @@ async function waitForServer(child, logs) {
   throw new Error(`Server did not start:\n${logs.join('')}`);
 }
 
+// The "real API..." test below runs its server with CLIENT_IP_MODE=cloudflare, so every request
+// needs a CF-Connecting-IP header or the abuse-authz hardening's identity resolver 503s it as a
+// provenance failure. A fixed default is fine for plain reads; contribute() below takes its own IP
+// so each contribute attempt in a loop is a distinct logical client - the 8 sequential contribute
+// calls in that test exceed the 6/min contribute-minute budget if they all shared one identity.
 async function requestJson(baseUrl, requestPath, options = {}) {
-  const response = await fetch(baseUrl + requestPath, options);
+  const response = await fetch(baseUrl + requestPath, {
+    ...options,
+    headers: {
+      'CF-Connecting-IP': '203.0.113.9',
+      ...(options.headers || {}),
+    },
+  });
   let body;
   try { body = await response.json(); } catch { body = null; }
   return { response, body };
 }
 
-async function contribute(baseUrl, payload) {
-  const challenge = await requestJson(baseUrl, '/api/challenge');
+async function contribute(baseUrl, payload, ip = '203.0.113.9') {
+  const challenge = await requestJson(baseUrl, '/api/challenge', { headers: { 'CF-Connecting-IP': ip } });
   assert.equal(challenge.response.status, 200);
   return requestJson(baseUrl, '/api/contribute', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      'CF-Connecting-IP': ip,
       'X-Challenge-Id': challenge.body.id,
       'X-Challenge-Nonce': '0',
     },
@@ -199,6 +211,8 @@ test('real API publishes complete metrics and enforces the shared write contract
       AIBUILDS_WORLD_DIR: worldDir,
       AIBUILDS_DATA_DIR: dataDir,
       AIBUILDS_BACKUP_DIR: backupDir,
+      CLIENT_IP_MODE: 'cloudflare',
+      TRUSTED_PROXY_CIDRS: '127.0.0.1/32,::1/128',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -239,7 +253,8 @@ test('real API publishes complete metrics and enforces the shared write contract
   }
   assert.equal(stats.body.lastContributionAt, null);
 
-  const socket = new WebSocket(baseUrl.replace('http://', 'ws://'));
+  const socket = new WebSocket(`${baseUrl.replace('http://', 'ws://')}/ws`,
+    { headers: { 'CF-Connecting-IP': '203.0.113.9' } });
   const welcomeMessage = once(socket, 'message');
   await once(socket, 'open');
   const [welcomeBytes] = await welcomeMessage;
@@ -255,13 +270,17 @@ test('real API publishes complete metrics and enforces the shared write contract
   assert.equal(welcome.fileCount, stats.body.fileCount);
   assert.equal(Array.isArray(welcome.recentHistory), true);
 
+  // Each contribute attempt below uses its own CF-Connecting-IP: 8 sequential contribute calls
+  // sharing one identity would exceed the 6/min contribute-minute budget (§3), and this test is
+  // exercising the write-policy contract, not per-client rate limiting.
+  let contributeIp = 10;
   const rejected = [];
   for (const filePath of ['layout.html', 'index.html', 'js/core.js', 'css/theme.css', 'WORLD.md']) {
     const result = await contribute(baseUrl, {
       action: 'edit',
       file_path: filePath,
       content: '<p>must remain protected</p>',
-    });
+    }, `198.51.100.${contributeIp++}`);
     rejected.push(result.response.status);
   }
   assert.deepEqual(rejected, [403, 403, 403, 403, 403]);
@@ -272,7 +291,9 @@ test('real API publishes complete metrics and enforces the shared write contract
     ['pages/demo.html', '<div data-page-title="Demo"><h1>Demo</h1></div>'],
     ['sections/demo.html', '<section data-section-title="Demo"><h2>Demo</h2></section>'],
   ]) {
-    const result = await contribute(baseUrl, { action: 'create', file_path: filePath, content });
+    const result = await contribute(
+      baseUrl, { action: 'create', file_path: filePath, content }, `198.51.100.${contributeIp++}`,
+    );
     accepted.push(result.response.status);
   }
   assert.deepEqual(accepted, [200, 200, 200], logs.join(''));
