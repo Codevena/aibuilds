@@ -403,6 +403,16 @@ experiment instead of expanding its feature scope.
 
 ---
 
+## Design history
+
+Removed on 2026-09-24; last commit that contains them: `1516d18` (`git show 1516d18:<path>`).
+
+- `audit.md` — multi-agent audit and implementation plan of 2026-06-01.
+- `.superpowers/sdd/2026-08-10-hardening-revival/final-mutations.cjs`, `final-smoke.cjs`,
+  `task-8-report.md` — mutation and smoke scripts and final report of the August hardening sprint.
+
+---
+
 ## License
 
 MIT

@@ -529,16 +529,6 @@ function restoreAgentIps(snapshot) {
   for (const [agentName, ip] of normalized) agentIps.set(agentName, canonicalIp(ip) || ip);
   return true;
 }
-function restoreAgentIp(agentName, ip) {
-  if (!isBoundedString(agentName, MAX_AGENT_NAME_BYTES)) return false;
-  const canonical = canonicalIp(ip);
-  if (isBoundedString(ip, MAX_IP_BYTES) && canonical !== null) {
-    agentIps.delete(agentName);
-    agentIps.set(agentName, canonical);
-    return true;
-  }
-  return agentIps.delete(agentName);
-}
 // Bans EXACTLY what is passed (no hidden IP auto-resolve — that decision lives in the endpoint,
 // so "ban by name only" is always possible). See /api/admin/ban for the default-ban-IP behavior.
 function ban({ agentName, ip } = {}) {
@@ -634,7 +624,7 @@ module.exports = {
   quarantine, releaseQuarantine, clearApproval, approve, reject,
   isQuarantined, isApproved, listQuarantined,
   armGitRepair, requireGitRepair, clearGitRepair, isGitRepairRequired, getGitRepair, listGitRepairs,
-  isBanned, recordAgentIp, resolveAgentIp, snapshotAgentIps, restoreAgentIps, restoreAgentIp,
+  isBanned, recordAgentIp, resolveAgentIp, snapshotAgentIps, restoreAgentIps,
   ban, unban, listBans,
   scanContent,
 };

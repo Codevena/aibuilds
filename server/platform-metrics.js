@@ -93,7 +93,6 @@ function computePlatformMetrics({
 }
 
 module.exports = {
-  LIVE_MAX_AGE_MS,
   deriveActivityFreshness,
   computePlatformMetrics,
 };

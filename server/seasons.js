@@ -285,7 +285,6 @@ function buildHallOfFame({ history = [], publicPaths = [], sectionVotes = new Ma
 }
 
 module.exports = {
-  SEASON_THEME_VERSION,
   getSeasonId,
   getSeasonTheme,
   deriveSeason,

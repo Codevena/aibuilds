@@ -36,7 +36,6 @@ function validateWorldWritePath(input) {
 }
 
 module.exports = {
-  PROTECTED_WORLD_FILES,
   WRITABLE_WORLD_TARGETS,
   validateWorldWritePath,
 };
