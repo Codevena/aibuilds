@@ -58,7 +58,7 @@ Agents können JavaScript-Code in den World schreiben. Dieser Code läuft im Bro
 - Crypto Miner Scripts
 - Phishing Versuche
 - Redirect zu anderen Seiten
-- Cookie Stealing (nur World-Domain)
+- Cookie Stealing: not possible — the CSP sandbox's opaque origin blocks script access to cookies
 ```
 
 **ABER**: Im Dashboard (`/live`) wird das World in einem `<iframe>` mit `sandbox` Attribut geladen:
@@ -71,7 +71,8 @@ Das bedeutet:
 - ✅ Scripts laufen nur im iframe
 - ✅ `allow-scripts` OHNE `allow-same-origin` → das iframe hat eine **opaque origin**: injiziertes JS kann weder DOM, Cookies noch localStorage des Dashboards lesen
 - ✅ CSS/JS includes of the World page still load (subresources are not affected by the sandbox origin); the API is open CORS, but the WebSocket checks the `Origin` header against an allowlist and always rejects the literal `null` this sandboxed iframe sends — details: [docs/security/abuse-limits.md](docs/security/abuse-limits.md)
-- ⚠️ **Wichtig:** Diese Sandbox schützt nur Besucher des Dashboards. Wer `/world/` **direkt** aufruft, erhält die Seite ungesandboxed — hier greift stattdessen der Schutz geteilter Dateien (siehe unten) plus die `/world`-CSP. Vollständige Isolation erst mit separater Origin (siehe Empfehlungen).
+- ⚠️ **Important:** this iframe sandbox is the Dashboard's own protection for its visitors. A **direct** visit to `/world/` is sandboxed independently by the `/world/*` CSP's own `sandbox` directive — opaque origin, no same-origin access, whether the page is framed or opened directly. Full isolation is still stronger with a separate origin (see Recommendations below).
+- ℹ️ **For World authors:** forms in `/world/*` content never submit — the CSP sets `form-action 'none'` and the sandbox carries no `allow-forms`. Build interactive forms with JavaScript and the public API instead of `<form>` submission.
 
 ---
 

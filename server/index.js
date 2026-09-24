@@ -1343,6 +1343,7 @@ const CHAOS_DURATION = 10 * 60 * 1000; // 10 minutes
 const CHAOS_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
 let chaosMode = { active: false, endsAt: null, nextAt: null };
 let chaosTimer = null; // handle for the auto-deactivation timeout (re-armed after restart)
+let chaosScheduleTimer = null; // handle for the pending activation armed by scheduleChaosMode()
 
 // Valid DiceBear avatar styles
 const AVATAR_STYLES = [
@@ -2503,6 +2504,11 @@ app.post('/api/admin/reset', ...adminChain, async (req, res) => {
       clearTimeout(chaosTimer);
       chaosTimer = null;
     }
+    // Re-arm the periodic chaos schedule against the reset platform's clock. Without this the
+    // pending activation from before the reset (still armed for the old nextAt) fires later,
+    // activates chaos on the reset platform and re-schedules from there. Called before the
+    // saveState() below so the fresh nextAt it sets is part of the snapshot that save persists.
+    scheduleChaosMode();
 
     // Save empty state
     await saveState();
@@ -3288,6 +3294,10 @@ app.post('/api/chaos/trigger', ...limits.routes.chaos, requireProofOfWork, (req,
   }
 
   activateChaosMode();
+  // Replace the activation pending for the old nextAt with one for the new nextAt that
+  // activateChaosMode() just set - otherwise the old one still fires on schedule, activating
+  // chaos a second time within 24h off a nextAt /api/chaos no longer reports.
+  scheduleChaosMode();
 
   res.json({
     success: true,
@@ -3351,15 +3361,22 @@ function rearmChaosTimer() {
   }
 }
 
-// Schedule periodic chaos mode
+// Schedule periodic chaos mode. Single owner of chaosScheduleTimer: clears any pending activation
+// before arming a new one, so a stale handle (e.g. from before an admin reset) can never fire
+// alongside the freshly-armed one.
 function scheduleChaosMode() {
   const now = Date.now();
+
+  if (chaosScheduleTimer) {
+    clearTimeout(chaosScheduleTimer);
+    chaosScheduleTimer = null;
+  }
 
   if (chaosMode.nextAt) {
     const nextTime = new Date(chaosMode.nextAt).getTime();
     if (nextTime > now) {
       // Schedule for the stored next time
-      setTimeout(() => {
+      chaosScheduleTimer = setTimeout(() => {
         activateChaosMode();
         scheduleChaosMode(); // Schedule next one
       }, nextTime - now);
@@ -3369,7 +3386,7 @@ function scheduleChaosMode() {
 
   // Schedule next chaos mode in 24h
   chaosMode.nextAt = new Date(now + CHAOS_INTERVAL).toISOString();
-  setTimeout(() => {
+  chaosScheduleTimer = setTimeout(() => {
     activateChaosMode();
     scheduleChaosMode();
   }, CHAOS_INTERVAL);
