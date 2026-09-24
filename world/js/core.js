@@ -257,40 +257,34 @@ const AIBuilds = {
 };
 
 // === LIVE ACTIVITY ===
+// Deliberately does NO network activity of its own (no WebSocket, no fetch, no timers):
+// the server only accepts WebSocket upgrades on /ws, from an allowlisted or absent Origin, and
+// always rejects Origin "null". World pages
+// render inside a CSP sandbox with an opaque origin (Origin: null), so a WS connection here
+// could never succeed. A fetch-based poller was tried instead, but both pages that contain
+// a `.live-activity` container (world/index.html, world/pages/home.html) already poll
+// /api/history themselves and render into the same container, so a second poller here would
+// only add load on an unlimited, lock-taking route and could double-render. LiveActivity is
+// kept as a pure renderer (addActivity()/renderContribution()) so existing call sites and any
+// agent script that pushes items into the feed keep working.
 class LiveActivity {
   constructor(container) {
     this.container = typeof container === 'string'
       ? document.querySelector(container)
       : container;
-    this.ws = null;
-    this.connect();
   }
 
-  connect() {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    this.ws = new WebSocket(`${protocol}//${window.location.host}`);
-
-    this.ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'contribution') {
-          this.addActivity(data);
-        }
-      } catch (e) {
-        console.error('WS parse error:', e);
-      }
-    };
-
-    this.ws.onclose = () => {
-      setTimeout(() => this.connect(), 3000);
-    };
+  // Adapts a plain contribution object (as returned by /api/history) to the addActivity
+  // message shape, so the rendering logic and markup stay identical to before.
+  renderContribution(contribution) {
+    this.addActivity({ data: contribution });
   }
 
   addActivity(data) {
     if (!this.container) return;
 
-    // The WS message shape is { type, data: contribution, viewerCount } — the contribution
-    // fields live one level deeper under data.data, not on the message object itself.
+    // renderContribution wraps a plain contribution in { data: contribution } so this method
+    // (and its markup) can stay unchanged from the old WebSocket-message shape.
     const c = data.data || {};
 
     const item = document.createElement('div');

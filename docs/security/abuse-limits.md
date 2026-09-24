@@ -236,11 +236,12 @@ eviction (Map insertion order), and an injectable clock.
   https://www.aibuilds.dev`); in `direct` mode, `http://localhost:<any>`,
   `http://127.0.0.1:<any>` and `http://[::1]:<any>` are additionally allowed. The literal string
   `"null"` is **always** rejected, even when localhost origins are otherwise allowed.
-  - **Known consequence:** the World widget (`world/js/core.js`, served from production's own
-    World volume, not this repo) connects from inside a sandboxed iframe, which sends
-    `Origin: null`. That connection will be rejected once this lands, and the widget loses its
-    own live-activity feed. This is accepted as a separate, already-approved production edit
-    outside this deploy — `world/js/core.js` is not touched here.
+  - **Consequence for the World:** the old `LiveActivity` in `world/js/core.js` opened a
+    WebSocket on `/` from inside the sandboxed World (`Origin: null`), which is now rejected.
+    The repo copy of `core.js` no longer does any network activity; the World pages keep their
+    own 30 s `/api/history` polling of `#activityFeed`, so only the instant update is lost.
+    Production serves the World from its own volume, so the repo change reaches production only
+    through a separate, owner-approved copy into that volume.
 - **Identity/rate:** same client-IP resolver as HTTP (§1); enforce-mode provenance failure → 503;
   `ws-upgrade` budget 20/min per identity (shadowable, §1); per-identity socket cap 5
   (shadowable); **global** socket cap 1,000 (always enforced, regardless of the shadow switch —
@@ -307,9 +308,10 @@ browser WebSocket connection to `/ws` work as read-only smoke tests.
    `ABUSE_ENFORCEMENT=enforce`, redeploy.
 6. The operator issues profile tokens for existing agents on request, via the endpoint in §4.
 
-**Rollback:** redeploy the previous image (production runs `d935107` today; the new code's
-parent is `ef96631`). The credentials file is additive and ignored by old code; the `state.json`
-format is unchanged, so rollback needs no data migration.
+**Rollback:** redeploy the previous image, `ef96631` (the image production ran before the
+2026-09-24 deploy of `1ebe4be`, measured from the container's image tag before the deploy). The
+credentials file is additive and ignored by old code; the `state.json` format is unchanged, so
+rollback needs no data migration.
 
 **Still missing, independent of code review:** the actual header set Express sees behind
 Cloudflare → tunnel → Traefik (is `CF-Connecting-IP` preserved, what is the socket peer),
