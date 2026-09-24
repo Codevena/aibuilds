@@ -89,7 +89,18 @@ async function requestJson(baseUrl, requestPath, options = {}) {
 test('admin quarantine decisions authenticate, bind approval to bytes, and reject with cleanup', async (t) => {
   // Mutations caught: missing auth, compare-free approval, metadata-only reject, and omitted Git await.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-admin-quarantine-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Single t.after hook, registered right here at mkdtemp, owns the whole root: it terminates the
+  // server child spawned for this root before removing the directory tree. node:test runs t.after
+  // hooks in FIFO registration order, so registering the combined hook this early keeps rm from
+  // ever running while the server is still alive and writing under the root (NEXT_SESSION.md #10).
+  let child = null;
+  t.after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -124,7 +135,7 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
     '<p>File this lawsuit under statute 123 to win your case.</p>');
 
   const logs = [];
-  const child = spawn(process.execPath, ['server/index.js'], {
+  child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
@@ -141,10 +152,6 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
   });
   child.stdout.on('data', chunk => logs.push(chunk.toString()));
   child.stderr.on('data', chunk => logs.push(chunk.toString()));
-  t.after(async () => {
-    if (child.exitCode === null) child.kill('SIGTERM');
-    if (child.exitCode === null) await once(child, 'exit');
-  });
   const baseUrl = await waitForServer(child, logs);
   let requestIp = 1;
   const adminRequest = (requestPath, options = {}) => requestJson(baseUrl, requestPath, {
@@ -297,7 +304,16 @@ test('admin quarantine decisions authenticate, bind approval to bytes, and rejec
 test('failed admin decisions persist rollback after concurrent moderation saves', async (t) => {
   // Mutations caught: restoring only memory lets queued call-time snapshots persist failed decisions.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-admin-approval-rollback-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill the server child spawned for this
+  // root, then remove it.
+  let child = null;
+  t.after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -344,7 +360,7 @@ test('failed admin decisions persist rollback after concurrent moderation saves'
   await execFileAsync('git', ['commit', '-m', 'seed risky world'], { cwd: worldDir });
 
   const logs = [];
-  const child = spawn(process.execPath, ['server/index.js'], {
+  child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
@@ -365,10 +381,6 @@ test('failed admin decisions persist rollback after concurrent moderation saves'
   });
   child.stdout.on('data', chunk => logs.push(chunk.toString()));
   child.stderr.on('data', chunk => logs.push(chunk.toString()));
-  t.after(async () => {
-    if (child.exitCode === null) child.kill('SIGTERM');
-    if (child.exitCode === null) await once(child, 'exit');
-  });
   const baseUrl = await waitForServer(child, logs);
   const listed = await requestJson(baseUrl, '/api/admin/quarantine', {
     headers: { 'X-Admin-Secret': 'operator-secret' },
@@ -446,7 +458,16 @@ test('failed admin decisions persist rollback after concurrent moderation saves'
 test('legacy moderate delete refuses quarantined paths without purging audit or broadcasting the target', async (t) => {
   // Mutation caught: the legacy delete branch unlinks bytes, deletes history, clears quarantine, and broadcasts.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-admin-legacy-private-delete-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill the server child spawned for this
+  // root, then remove it.
+  let child = null;
+  t.after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -469,7 +490,7 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
   await execFileAsync('git', ['commit', '-m', 'seed private world'], { cwd: worldDir });
 
   const logs = [];
-  const child = spawn(process.execPath, ['server/index.js'], {
+  child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
@@ -486,10 +507,6 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
   });
   child.stdout.on('data', chunk => logs.push(chunk.toString()));
   child.stderr.on('data', chunk => logs.push(chunk.toString()));
-  t.after(async () => {
-    if (child.exitCode === null) child.kill('SIGTERM');
-    if (child.exitCode === null) await once(child, 'exit');
-  });
   const baseUrl = await waitForServer(child, logs);
   const frames = [];
   const socket = new WebSocket(`${baseUrl.replace('http:', 'ws:')}/ws`,
@@ -519,7 +536,6 @@ test('legacy moderate delete refuses quarantined paths without purging audit or 
 test('legacy moderate delete serializes its quarantine check and cleanup with contribution writes', async (t) => {
   // Mutation caught: removing the shared path lock lets legacy cleanup clear a quarantine created mid-delete.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-admin-legacy-delete-race-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -528,6 +544,18 @@ test('legacy moderate delete serializes its quarantine check and cleanup with co
   const markerPath = path.join(root, 'legacy-unlink-started');
   const quarantineMarkerPath = path.join(root, 'contribution-quarantine-saved');
   const releasePath = path.join(root, 'release-legacy-unlink');
+  // Same root-owning hook as above (NEXT_SESSION.md #10): release the delayed unlink first
+  // (harmless if the test already released it), then kill the server child spawned for this root,
+  // then remove the directory tree.
+  let child = null;
+  t.after(async () => {
+    await fs.writeFile(releasePath, 'release').catch(() => {});
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const armPath = path.join(root, 'arm-legacy-unlink');
   const preloadPath = path.join(root, 'delay-legacy-unlink.cjs');
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
@@ -566,7 +594,7 @@ test('legacy moderate delete serializes its quarantine check and cleanup with co
     };
   `);
   const logs = [];
-  const child = spawn(process.execPath, ['server/index.js'], {
+  child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
@@ -591,11 +619,6 @@ test('legacy moderate delete serializes its quarantine check and cleanup with co
   });
   child.stdout.on('data', chunk => logs.push(chunk.toString()));
   child.stderr.on('data', chunk => logs.push(chunk.toString()));
-  t.after(async () => {
-    await fs.writeFile(releasePath, 'release').catch(() => {});
-    if (child.exitCode === null) child.kill('SIGTERM');
-    if (child.exitCode === null) await once(child, 'exit');
-  });
   const baseUrl = await waitForServer(child, logs);
   await fs.writeFile(armPath, 'armed');
 

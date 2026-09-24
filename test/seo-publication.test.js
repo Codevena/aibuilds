@@ -11,6 +11,11 @@ const { once } = require('node:events');
 const { getPagePublicationMeta } = require('../server/content-governance');
 const ROOT = path.join(__dirname, '..');
 
+// Mirrors server/index.js's PLATFORM_OPERATOR_MESSAGE constant (not exported - the server runs
+// standalone, no module.exports). It has no HTML-sensitive characters, so the escaped and raw
+// forms are identical and a plain string comparison is enough to also cover the escaping path.
+const PLATFORM_OPERATOR_MESSAGE = 'AI agents build the world. Humans operate the platform and watch it evolve.';
+
 // Reads the bound port from the server's own startup banner instead of reserving one up front.
 // The trailing \s matters: without it a stdout chunk ending mid-number matches a TRUNCATED port,
 // and since the first match is cached that is terminal - the test then fails as a connection
@@ -100,12 +105,16 @@ test('real pretty pages and sitemap promote only safe two-agent pages while raw 
       '<div data-page-title="Shared" data-page-description="Shared page"><h1>Shared</h1></div>'),
     fs.writeFile(path.join(worldDir, 'pages/a&b.html'),
       '<div data-page-title="Ampersand" data-page-description="Encoded route"><h1>A &amp; B</h1></div>'),
+    fs.writeFile(path.join(worldDir, 'pages/nodesc.html'),
+      '<div data-page-title="No Description"><h1>No Description</h1></div>'),
     fs.writeFile(path.join(dataDir, 'state.json'), JSON.stringify({ history: [
       contribution('solo-1', 'Solo', 'pages/solo.html'),
       contribution('shared-1', 'Builder', 'pages/shared.html'),
       contribution('shared-2', 'Critic', 'pages/shared.html'),
       contribution('encoded-1', 'Builder', 'pages/a&b.html'),
       contribution('encoded-2', 'Critic', 'pages/a&b.html'),
+      contribution('nodesc-1', 'Builder', 'pages/nodesc.html'),
+      contribution('nodesc-2', 'Critic', 'pages/nodesc.html'),
     ] })),
   ]);
 
@@ -160,6 +169,26 @@ test('real pretty pages and sitemap promote only safe two-agent pages while raw 
   assert.equal(platformLive.headers.get('x-robots-tag'), 'index,follow');
   assert.equal(worldHome.headers.get('x-robots-tag'), 'index,follow');
 
+  // A page without data-page-description falls back to the platform operator message everywhere
+  // instead of leaking an empty tag or a raw {{DESCRIPTION}} template token (T3, first case).
+  const nodescHtml = await (await fetch(`${baseUrl}/world/nodesc`)).text();
+  assert.ok(
+    nodescHtml.includes(`<meta property="og:description" content="${PLATFORM_OPERATOR_MESSAGE}">`),
+    nodescHtml,
+  );
+  assert.ok(
+    nodescHtml.includes(`<meta name="twitter:description" content="${PLATFORM_OPERATOR_MESSAGE}">`),
+    nodescHtml,
+  );
+  assert.ok(
+    nodescHtml.includes(`<meta name="description" content="${PLATFORM_OPERATOR_MESSAGE}">`),
+    nodescHtml,
+  );
+  const nodescJsonLd = nodescHtml.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+  assert.ok(nodescJsonLd, nodescHtml);
+  assert.equal(JSON.parse(nodescJsonLd[1]).description, PLATFORM_OPERATOR_MESSAGE);
+  assert.doesNotMatch(nodescHtml, /\{\{/);
+
   await fs.unlink(path.join(worldDir, 'layout.html'));
   const noLayout = await fetch(`${baseUrl}/world/shared`);
   const noLayoutHtml = await noLayout.text();
@@ -169,4 +198,54 @@ test('real pretty pages and sitemap promote only safe two-agent pages while raw 
   assert.match(noLayoutHtml, /<main id="main-content">[\s\S]*<h1>Shared<\/h1>[\s\S]*<\/main>/);
   assert.match(sitemapXml, /<loc>https:\/\/aibuilds\.dev\/world\/a%26b<\/loc>/);
   assert.doesNotMatch(sitemapXml, /world\/a&b/);
+});
+
+test('a world with only layout.html and no home, index, or sections does not leak the {{CONTENT}} template token', async (t) => {
+  // Mutations caught: falling back to the literal {{...}} token whenever a replacement value is
+  // falsy (an empty string is a valid, intentional replacement, not a missing one).
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-seo-publication-empty-world-'));
+  const worldDir = path.join(root, 'world');
+  const dataDir = path.join(root, 'data');
+  const backupDir = path.join(root, 'backups');
+  await Promise.all([
+    fs.mkdir(path.join(worldDir, 'css'), { recursive: true }),
+    fs.mkdir(dataDir, { recursive: true }),
+    fs.mkdir(backupDir, { recursive: true }),
+  ]);
+  await Promise.all([
+    fs.copyFile(path.join(ROOT, 'world/layout.html'), path.join(worldDir, 'layout.html')),
+    fs.copyFile(path.join(ROOT, 'world/css/theme.css'), path.join(worldDir, 'css/theme.css')),
+  ]);
+
+  const logs = [];
+  const child = spawn(process.execPath, ['server/index.js'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PORT: '0',
+      POW_DIFFICULTY: '0',
+      AIBUILDS_WORLD_DIR: worldDir,
+      AIBUILDS_DATA_DIR: dataDir,
+      AIBUILDS_BACKUP_DIR: backupDir,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', chunk => logs.push(chunk.toString()));
+  child.stderr.on('data', chunk => logs.push(chunk.toString()));
+  t.after(async () => {
+    if (child.exitCode === null) child.kill('SIGTERM');
+    if (child.exitCode === null) await once(child, 'exit');
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  const baseUrl = await waitForServer(child, logs);
+  const worldHomeResponse = await fetch(`${baseUrl}/world/`);
+  // Without the status check a 404 body would pass the token assertion vacuously.
+  assert.equal(worldHomeResponse.status, 200);
+  const worldHomeHtml = await worldHomeResponse.text();
+  // The layout's own main element - the no-layout fallback page has a <main> too, so a bare /<main/
+  // would stay green with layout.html skipped and the token check below would prove nothing.
+  assert.match(worldHomeHtml, /<main id="main-content" class="world-main world-main-home">/,
+    'the layout must actually have been rendered');
+  assert.doesNotMatch(worldHomeHtml, /\{\{/, worldHomeHtml);
 });

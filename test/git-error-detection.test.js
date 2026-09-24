@@ -15,6 +15,7 @@ const path = require('node:path');
 const { spawn, execFile, execFileSync } = require('node:child_process');
 const { promisify } = require('node:util');
 const { once } = require('node:events');
+const WebSocket = require('ws');
 
 const execFileAsync = promisify(execFile);
 const NUL = String.fromCharCode(0);
@@ -255,6 +256,48 @@ test('moderate delete reports a failed commit honestly after a passed guard', as
   assert.equal((await readHistoryIds()).includes(contributionId), false,
     'the contribution must still be purged from state.json even though the Git commit failed - ' +
     'saveState()/moderation.save()/broadcast all ran before the 500 was decided');
+});
+
+test('moderate delete saves moderation state and broadcasts before it answers the 500', async (t) => {
+  // D1/R1-F2 ordering: the 500 for a failed commit is decided only after moderation.save() and the
+  // broadcast ran. Both are observable as "happened at all", because an early 500 skips them for
+  // good: the hidden flag set below survives in moderation.json, and no moderation frame is sent.
+  // Lower case on purpose: moderation.json stores hidden paths normalized to lower case.
+  const target = 'pages/ordered.html';
+  const world = await startWorld(t, { files: {} });
+  const created = await contribute(world.baseUrl, {
+    action: 'create', file_path: target, content: SAFE_CONTENT(target),
+  });
+  assert.equal(created.response.status, 200, world.logs.join(''));
+  const hidden = await adminPost(world.baseUrl, '/api/admin/moderate',
+    { secret: 'operator-secret', action: 'hide', target });
+  assert.equal(hidden.response.status, 200, world.logs.join(''));
+  const readHidden = async () => JSON.parse(
+    await fs.readFile(path.join(world.dataDir, 'moderation.json'), 'utf8')).moderation.hiddenFiles;
+  assert.ok((await readHidden()).includes(target), 'setup: the hide must be persisted first');
+
+  const socket = new WebSocket(world.baseUrl.replace('http', 'ws') + '/ws',
+    { headers: { 'CF-Connecting-IP': '203.0.113.9' } });
+  t.after(() => socket.terminate());
+  const frames = [];
+  socket.on('message', data => frames.push(JSON.parse(data.toString())));
+  await once(socket, 'open');
+
+  await installHook(world, '#!/bin/sh\nexit 1\n');
+  const moderated = await adminPost(world.baseUrl, '/api/admin/moderate',
+    { secret: 'operator-secret', action: 'delete', target });
+  assert.equal(moderated.response.status, 500, world.logs.join(''));
+  assert.equal(moderated.body.code, 'git_commit_failed');
+
+  assert.equal((await readHidden()).includes(target), false,
+    'moderation.save() must run before the 500 - the delete unhides the path');
+  const deadline = Date.now() + 3000;
+  const isDeleteFrame = frame => frame.type === 'moderation' && frame.data
+    && frame.data.action === 'delete' && frame.data.target === target;
+  while (!frames.some(isDeleteFrame) && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.ok(frames.some(isDeleteFrame), 'the moderation broadcast must be sent before the 500');
 });
 
 test('moderate delete still answers 200 when a guard refusal blocks the commit', async (t) => {

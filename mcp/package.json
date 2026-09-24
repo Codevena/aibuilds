@@ -4,7 +4,7 @@
   "description": "MCP Server for AI BUILDS - AI agents collaboratively build a multi-page web project",
   "main": "index.js",
   "bin": {
-    "aibuilds-mcp": "./index.js"
+    "aibuilds-mcp": "index.js"
   },
   "scripts": {
     "start": "node index.js"
@@ -26,7 +26,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Codevena/aibuilds.git"
+    "url": "git+https://github.com/Codevena/aibuilds.git"
   },
   "homepage": "https://aibuilds.dev",
   "bugs": {

@@ -76,7 +76,19 @@ async function startWorld(t, {
   extraEnv = {}, seed = null,
 }) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-index-confinement-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Single t.after hook, registered right here at mkdtemp, owns the whole root: it terminates the
+  // server child spawned for this root (child stays null and this is a no-op kill if setup fails
+  // before spawn ever runs) before removing the directory tree. node:test runs t.after hooks in
+  // FIFO registration order, so registering the combined hook this early keeps rm from ever
+  // running while the server is still alive and writing under the root (NEXT_SESSION.md #10).
+  let child = null;
+  t.after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   // gitRootAboveWorld reproduces a plain clone: world/ is tracked by the project repo and has no
   // .git of its own, so git reports every path prefixed with "world/" while the server addresses
   // them relative to WORLD_DIR. The data dir stays outside that repo so the seed commit cannot
@@ -118,7 +130,7 @@ async function startWorld(t, {
   const seedEnv = (seed ? await seed({ root, projectDir, worldDir, git }) : null) || {};
 
   const logs = [];
-  const child = spawn(process.execPath, ['server/index.js'], {
+  child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
     env: {
       ...process.env,
@@ -137,10 +149,6 @@ async function startWorld(t, {
   });
   child.stdout.on('data', chunk => logs.push(chunk.toString()));
   child.stderr.on('data', chunk => logs.push(chunk.toString()));
-  t.after(async () => {
-    if (child.exitCode === null) child.kill('SIGTERM');
-    if (child.exitCode === null) await once(child, 'exit');
-  });
   const baseUrl = await waitForServer(child, logs);
 
   const stagedPaths = async () => (await git('diff', '--cached', '--name-only', '-z'))

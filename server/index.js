@@ -4770,7 +4770,9 @@ async function renderPage(
 
   // Per-page SEO block. title/description originate from agent-authored page meta, so they are
   // HTML-escaped for attribute context and the JSON-LD is JSON-encoded with '<' neutralized to
-  // prevent a </script> breakout.
+  // prevent a </script> breakout. Description is normalized once here so every emission point
+  // (JSON-LD, og:description, twitter:description, the no-layout meta description and
+  // {{DESCRIPTION}}) falls back to the same platform message instead of shipping an empty tag.
   const BASE_URL = 'https://aibuilds.dev';
   const canonicalUrl = slug === 'home'
     ? `${BASE_URL}/world/`
@@ -4778,11 +4780,12 @@ async function renderPage(
   const ogTitle = `${title} - AI BUILDS`;
   const ogImage = `${BASE_URL}/og-image.png`;
   const e = escapeHtmlServer;
+  const pageDescription = description || PLATFORM_OPERATOR_MESSAGE;
   const jsonLd = JSON.stringify({
     '@context': 'https://schema.org',
     '@type': 'WebPage',
     name: ogTitle,
-    description: description || PLATFORM_OPERATOR_MESSAGE,
+    description: pageDescription,
     url: canonicalUrl,
     isPartOf: { '@type': 'WebSite', name: 'AI BUILDS', url: BASE_URL },
   }).replace(/</g, '\\u003c');
@@ -4793,14 +4796,14 @@ async function renderPage(
     `<meta property="og:site_name" content="AI BUILDS">`,
     `<meta property="og:url" content="${e(canonicalUrl)}">`,
     `<meta property="og:title" content="${e(ogTitle)}">`,
-    `<meta property="og:description" content="${e(description)}">`,
+    `<meta property="og:description" content="${e(pageDescription)}">`,
     `<meta property="og:image" content="${ogImage}">`,
     `<meta property="og:image:width" content="1200">`,
     `<meta property="og:image:height" content="630">`,
     `<meta property="og:image:alt" content="AI BUILDS">`,
     `<meta name="twitter:card" content="summary_large_image">`,
     `<meta name="twitter:title" content="${e(ogTitle)}">`,
-    `<meta name="twitter:description" content="${e(description)}">`,
+    `<meta name="twitter:description" content="${e(pageDescription)}">`,
     `<meta name="twitter:image" content="${ogImage}">`,
     publicationMeta.indexable ? `<script type="application/ld+json">${jsonLd}</script>` : '',
   ].join('\n  ');
@@ -4812,7 +4815,7 @@ async function renderPage(
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${e(ogTitle)}</title>
-  <meta name="description" content="${e(description)}">
+  <meta name="description" content="${e(pageDescription)}">
   ${headSeo}
 </head>
 <body>
@@ -4824,15 +4827,18 @@ async function renderPage(
 
   const replacements = {
     '{{TITLE}}': escapeHtmlServer(title),
-    '{{DESCRIPTION}}': escapeHtmlServer(description),
+    '{{DESCRIPTION}}': escapeHtmlServer(pageDescription),
     '{{HEAD_SEO}}': headSeo,
     '{{NAV}}': nav,
     '{{MAIN_CLASS}}': slug === 'home' ? 'world-main-home' : 'world-main-page',
     '{{CONTENT}}': content,
   };
+  // Object.hasOwn (not `replacements[match] || match`) because an empty string is a valid,
+  // intentional replacement (e.g. {{CONTENT}} with no sections) and must not fall back to
+  // re-inserting the literal template token.
   return layout.replace(
     /\{\{TITLE\}\}|\{\{DESCRIPTION\}\}|\{\{HEAD_SEO\}\}|\{\{NAV\}\}|\{\{MAIN_CLASS\}\}|\{\{CONTENT\}\}/g,
-    match => replacements[match] || match
+    match => Object.hasOwn(replacements, match) ? replacements[match] : match
   );
 }
 

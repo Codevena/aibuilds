@@ -32,9 +32,12 @@ async function waitFor(condition, timeoutMs = 5000) {
   throw new Error('Timed out waiting for condition');
 }
 
+// `children` is a required parameter: the caller's root-owning t.after hook (see the mkdtemp sites
+// below) needs every server child spawned against that root so it can terminate them all before
+// removing the directory tree, including a second server a restart test starts on the same root.
 async function startIsolatedServer(t, {
   worldDir, dataDir, backupDir, secret = 'test-secret', extraEnv = {},
-}) {
+}, children) {
   const logs = [];
   const child = spawn(process.execPath, ['server/index.js'], {
     cwd: path.join(__dirname, '..'),
@@ -50,6 +53,9 @@ async function startIsolatedServer(t, {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // Recorded right after spawn, before readiness waiting, so an early exit or a start timeout is
+  // covered too - the root hook only needs the process handle, not a running server.
+  children.push(child);
   child.stdout.on('data', chunk => logs.push(chunk.toString()));
   child.stderr.on('data', chunk => logs.push(chunk.toString()));
   let stopped = false;
@@ -278,7 +284,22 @@ test('real server migrates legacy records and keeps risky history private throug
   // Mutations caught: no startup migration, hidden/quarantine conflation, path-only public records,
   // persisted public-agent counters, and quarantined contribution/achievement broadcasts.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-server-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Single t.after hook, registered right here at mkdtemp, owns the whole root: it terminates
+  // every server child spawned against this root (a restart test starts a second one on the
+  // same root) before removing the directory tree. node:test runs t.after hooks in FIFO
+  // registration order, so registering the combined hook this early guarantees it runs before
+  // any later, separately registered hook - keeping rm from ever running while a server is
+  // still alive and writing under the root (NEXT_SESSION.md #10).
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -321,7 +342,7 @@ test('real server migrates legacy records and keeps risky history private throug
     },
   }));
 
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   const { baseUrl } = server;
   const migratedState = JSON.parse(await fs.readFile(path.join(dataDir, 'state.json'), 'utf8'));
   assert.equal(migratedState.history.find(item => item.id === 'legacy-safe').publicationStatus, 'published');
@@ -550,7 +571,18 @@ test('real server migrates legacy records and keeps risky history private throug
 
 test('admin approval and corrective contribution serialize on the same World path', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-lock-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -587,7 +619,7 @@ test('admin approval and corrective contribution serialize on the same World pat
       AIBUILDS_DELAY_READ_MARKER: markerPath,
       AIBUILDS_DELAY_READ_ARM: armPath,
     },
-  });
+  }, children);
   const listed = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
     headers: { 'X-Admin-Secret': 'test-secret' },
   });
@@ -624,13 +656,24 @@ test('admin approval and corrective contribution serialize on the same World pat
 
 test('contribution diff is bound to the requested contribution git hash', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-diff-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
   await fs.mkdir(worldDir, { recursive: true });
   await fs.mkdir(dataDir, { recursive: true });
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   const frames = [];
   const socket = new WebSocket(`${server.baseUrl.replace('http:', 'ws:')}/ws`);
   socket.on('message', data => frames.push(JSON.parse(data.toString())));
@@ -680,7 +723,18 @@ test('contribution diff is bound to the requested contribution git hash', async 
 
 test('same-path mutation cannot change bytes staged for an earlier contribution hash', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-git-lock-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -703,7 +757,7 @@ exec "${gitPathOutput.trim()}" "$@"
   const server = await startIsolatedServer(t, {
     worldDir, dataDir, backupDir,
     extraEnv: { PATH: `${binDir}:${process.env.PATH}` },
-  });
+  }, children);
   await fs.writeFile(armPath, 'armed');
   const safeHeaders = await challengeHeaders(server.baseUrl);
   const riskyHeaders = await challengeHeaders(server.baseUrl);
@@ -752,7 +806,18 @@ exec "${gitPathOutput.trim()}" "$@"
 
 test('startup audit reconciles stale state and preserves unchanged quarantine provenance', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-reconcile-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -789,7 +854,7 @@ test('startup audit reconciles stale state and preserves unchanged quarantine pr
     agentIps: {},
   }));
 
-  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   let list = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
     headers: { 'X-Admin-Secret': 'test-secret' },
   });
@@ -806,7 +871,7 @@ test('startup audit reconciles stale state and preserves unchanged quarantine pr
   });
   await server.stop();
 
-  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   list = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
     headers: { 'X-Admin-Secret': 'test-secret' },
   });
@@ -817,7 +882,18 @@ test('startup audit reconciles stale state and preserves unchanged quarantine pr
 
 test('risky replacement becomes unavailable before its delayed atomic write starts', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-atomic-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -854,7 +930,7 @@ test('risky replacement becomes unavailable before its delayed atomic write star
       AIBUILDS_DELAY_WRITE_TARGET: targetPath,
       AIBUILDS_DELAY_WRITE_MARKER: markerPath,
     },
-  });
+  }, children);
   const pendingContribution = jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST',
     headers: await challengeHeaders(server.baseUrl),
@@ -877,7 +953,18 @@ test('risky replacement becomes unavailable before its delayed atomic write star
 
 test('contribution writes reject symlinked ancestors without touching outside bytes', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-write-path-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -885,7 +972,7 @@ test('contribution writes reject symlinked ancestors without touching outside by
   await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
   await fs.mkdir(dataDir, { recursive: true });
   await fs.mkdir(outsideDir, { recursive: true });
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   await fs.symlink(outsideDir, path.join(worldDir, 'pages', 'link'));
 
   const result = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -902,7 +989,18 @@ test('contribution writes reject symlinked ancestors without touching outside by
 
 test('in-flight public reads never resume with a concurrently quarantined revision', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-read-lock-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -937,7 +1035,7 @@ test('in-flight public reads never resume with a concurrently quarantined revisi
       AIBUILDS_DELAY_PUBLIC_READ_MARKER: markerPath,
       AIBUILDS_DELAY_PUBLIC_READ_ARM: armPath,
     },
-  });
+  }, children);
   await fs.writeFile(armPath, 'armed');
   const pendingRead = jsonRequest(server.baseUrl, '/api/world/pages/public.html');
   await waitFor(async () => {
@@ -964,7 +1062,18 @@ test('in-flight public reads never resume with a concurrently quarantined revisi
 test('homepage and pretty routes render public pages when no layout exists', async (t) => {
   // Mutations caught: treating a missing optional layout or an extensionless pretty slug as an unavailable file.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-pretty-fallback-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -975,7 +1084,7 @@ test('homepage and pretty routes render public pages when no layout exists', asy
   await fs.writeFile(path.join(worldDir, 'pages', 'about.html'),
     '<main><h1>Fallback about page</h1></main>');
 
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   const homepage = await fetch(`${server.baseUrl}/world/`);
   const prettyPage = await fetch(`${server.baseUrl}/world/about`);
 
@@ -989,13 +1098,24 @@ test('homepage and pretty routes render public pages when no layout exists', asy
 test('delete records for quarantined targets remain private after a safe recreation', async (t) => {
   // Mutation caught: assigning every delete `published` revives a private delete record with the path.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-private-delete-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
   await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
   await fs.mkdir(dataDir, { recursive: true });
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   const relativePath = 'pages/private-delete.html';
 
   let result = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -1035,7 +1155,18 @@ test('delete records for quarantined targets remain private after a safe recreat
 test('an exact risky approval survives resubmission and restart', async (t) => {
   // Mutation caught: clearing approval in the generic published branch re-quarantines on restart.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-approved-restart-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1044,7 +1175,7 @@ test('an exact risky approval survives resubmission and restart', async (t) => {
   await fs.mkdir(path.join(worldDir, 'pages'), { recursive: true });
   await fs.mkdir(dataDir, { recursive: true });
   await fs.writeFile(path.join(worldDir, relativePath), riskyBytes);
-  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   const listed = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
     headers: { 'X-Admin-Secret': 'test-secret' },
   });
@@ -1069,7 +1200,7 @@ test('an exact risky approval survives resubmission and restart', async (t) => {
   assert.equal(moderationState.moderation.approvedFiles[relativePath], record.content_hash);
   await server.stop();
 
-  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
   const afterRestart = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
     headers: { 'X-Admin-Secret': 'test-secret' },
   });
@@ -1084,7 +1215,18 @@ for (const failureKind of ['moderation', 'state', 'git']) {
   test(`${failureKind} persistence failure rolls back contribution bytes, records, and public counters durably`, async (t) => {
     // Mutations caught: swallowing this failure or omitting compensation leaves the failed edit public/durable.
     const root = await fs.mkdtemp(path.join(os.tmpdir(), `aibuilds-publication-${failureKind}-rollback-`));
-    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+    // root, then remove it.
+    const children = [];
+    t.after(async () => {
+      for (const child of children) {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGTERM');
+          await once(child, 'exit');
+        }
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    });
     const worldDir = path.join(root, 'world');
     const dataDir = path.join(root, 'data');
     const backupDir = path.join(root, 'backups');
@@ -1124,7 +1266,7 @@ for (const failureKind of ['moderation', 'state', 'git']) {
       AIBUILDS_FAILURE_TARGET: path.join(dataDir,
         failureKind === 'moderation' ? 'moderation.json' : 'state.json'),
     };
-    let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+    let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
     if (failureKind === 'git') {
       const hookPath = path.join(worldDir, '.git', 'hooks', 'pre-commit');
       // A core.hooksPath in the developer's global Git config replaces .git/hooks outright, which
@@ -1156,7 +1298,7 @@ for (const failureKind of ['moderation', 'state', 'git']) {
     await fs.rm(armPath, { force: true });
     await server.crash();
 
-    server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+    server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
     assert.equal(await fs.readFile(path.join(worldDir, relativePath), 'utf8'), originalBytes);
     assert.equal((await jsonRequest(server.baseUrl, '/api/history')).body.items
       .some(item => item.agent_name === storedFailedAgentName), false);
@@ -1172,7 +1314,18 @@ for (const failureKind of ['moderation', 'state', 'git']) {
 test('rollback byte-restore failure persists a fail-closed quarantine across restart', async (t) => {
   // Mutation caught: restoring the old public moderation boundary after byte rollback failure exposes risky bytes.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-restore-failure-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1220,7 +1373,7 @@ test('rollback byte-restore failure persists a fail-closed quarantine across res
     AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
     AIBUILDS_WORLD_TARGET: fullPath,
   };
-  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   await fs.writeFile(armPath, 'armed');
   const result = await jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST', headers: await challengeHeaders(server.baseUrl),
@@ -1249,7 +1402,7 @@ test('rollback byte-restore failure persists a fail-closed quarantine across res
   await fs.rm(armPath, { force: true });
   await server.crash();
 
-  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
   listed = await jsonRequest(server.baseUrl, '/api/admin/quarantine', {
     headers: { 'X-Admin-Secret': 'test-secret' },
@@ -1288,7 +1441,18 @@ test('rollback byte-restore failure persists a fail-closed quarantine across res
 test('rollback restores an originally untracked quarantined path without committing private bytes', async (t) => {
   // Mutation caught: forcing tracked=true and adding restored bytes commits the private untracked parent.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-untracked-git-rollback-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1327,7 +1491,7 @@ test('rollback restores an originally untracked quarantined path without committ
     AIBUILDS_FAILURE_ARM: armPath,
     AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
   };
-  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
   await assert.rejects(execFileAsync('git', ['ls-files', '--error-unmatch', '--', relativePath], { cwd: worldDir }));
   await fs.writeFile(armPath, 'armed');
@@ -1350,7 +1514,7 @@ test('rollback restores an originally untracked quarantined path without committ
   await fs.rm(armPath, { force: true });
   await server.crash();
 
-  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
   await assert.rejects(execFileAsync('git', ['ls-files', '--error-unmatch', '--', relativePath], { cwd: worldDir }));
   const correction = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -1381,7 +1545,18 @@ test('rollback restores an originally untracked quarantined path without committ
 test('post-Git state failure is compensated before a later public contribution diff', async (t) => {
   // Mutation caught: omitting the compensating commit makes the next public diff include failed risky bytes.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-git-compensation-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1420,7 +1595,7 @@ test('post-Git state failure is compensated before a later public contribution d
     AIBUILDS_FAILURE_ARM: armPath,
     AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
   };
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   await fs.writeFile(armPath, 'armed');
   let result = await jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST', headers: await challengeHeaders(server.baseUrl),
@@ -1462,7 +1637,18 @@ test('post-Git state failure is compensated before a later public contribution d
 test('successful quarantine sanitizes its Git parent before a later public correction', async (t) => {
   // Mutation caught: retaining the quarantined commit as HEAD exposes its deleted bytes in the correction diff.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-normal-quarantine-git-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1487,7 +1673,7 @@ test('successful quarantine sanitizes its Git parent before a later public corre
   await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
   await execFileAsync('git', ['add', '.'], { cwd: worldDir });
   await execFileAsync('git', ['commit', '-m', 'normal quarantine public baseline'], { cwd: worldDir });
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
 
   const quarantined = await jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST', headers: await challengeHeaders(server.baseUrl),
@@ -1529,7 +1715,18 @@ test('successful quarantine sanitizes its Git parent before a later public corre
 test('rollback restores every pre-existing conflict stage for the canonical path', async (t) => {
   // Mutation caught: restoring only a stage-0 entry removes the original stages 1/2/3.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-conflict-index-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1590,7 +1787,7 @@ test('rollback restores every pre-existing conflict stage for the canonical path
       AIBUILDS_FAILURE_ARM: armPath,
       AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
     },
-  });
+  }, children);
   await fs.writeFile(armPath, 'armed');
 
   const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -1619,7 +1816,18 @@ test('rollback restores every pre-existing conflict stage for the canonical path
 test('rollback restores assume-unchanged and skip-worktree flags with the exact stage-0 entry', async (t) => {
   // Mutation caught: recreating cacheinfo with default flags changes the original `s` index tag to `H`.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-index-flags-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1668,7 +1876,7 @@ test('rollback restores assume-unchanged and skip-worktree flags with the exact 
       AIBUILDS_FAILURE_ARM: armPath,
       AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
     },
-  });
+  }, children);
   await fs.writeFile(armPath, 'armed');
 
   const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -1701,7 +1909,18 @@ test('rollback restores assume-unchanged and skip-worktree flags with the exact 
 test('Git transactions treat wildcard characters in canonical filenames literally', async (t) => {
   // Mutation caught: passing the raw path after `--` lets Git match and publish the staged neighbor.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-literal-pathspec-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1750,7 +1969,7 @@ test('Git transactions treat wildcard characters in canonical filenames literall
       AIBUILDS_FAILURE_ARM: armPath,
       AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
     },
-  });
+  }, children);
 
   const result = await jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST', headers: await challengeHeaders(server.baseUrl),
@@ -1806,7 +2025,18 @@ test('Git transactions treat wildcard characters in canonical filenames literall
 test('failed Git compensation stays repair-required until a safe correction repairs its public parent', async (t) => {
   // Mutations caught: ignoring the repair guard publishes immediately; discarding repair state exposes on restart.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-durable-git-repair-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -1895,7 +2125,7 @@ exec "$AIBUILDS_REAL_GIT" "$@"
     AIBUILDS_GIT_WAL_OBSERVED: walObservedPath,
     AIBUILDS_GIT_COMPENSATION_FAILURE_ARM: gitArmPath,
   };
-  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   await fs.writeFile(stateArmPath, 'armed');
   await fs.writeFile(gitArmPath, 'armed');
 
@@ -1926,7 +2156,7 @@ exec "$AIBUILDS_REAL_GIT" "$@"
   await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify(moderationState, null, 2));
   await fs.writeFile(fullPath, privateBytes);
 
-  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
   assert.equal(await fs.readFile(fullPath, 'utf8'), privateBytes);
   moderationState = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
@@ -1977,7 +2207,18 @@ exec "$AIBUILDS_REAL_GIT" "$@"
 test('a failed repair on path A blocks path B until the global Git parent is sanitized', async (t) => {
   // Mutations caught: a target-only repair barrier lets B commit atop A's private unresolved HEAD.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-global-repair-barrier-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2017,7 +2258,7 @@ exec "$AIBUILDS_REAL_GIT" "$@"
       AIBUILDS_REAL_GIT: realGit,
       AIBUILDS_GIT_COMPENSATION_FAILURE_ARM: compensationArm,
     },
-  });
+  }, children);
   await fs.writeFile(compensationArm, 'armed');
 
   const failedA = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -2084,7 +2325,18 @@ exec "$AIBUILDS_REAL_GIT" "$@"
 test('commit success followed by hash-association failure still sanitizes the advanced HEAD', async (t) => {
   // Mutation caught: compensating only when transaction.gitHash is assigned leaves the private commit as HEAD.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-unknown-commit-outcome-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2125,7 +2377,7 @@ exec "$AIBUILDS_REAL_GIT" "$@"
       AIBUILDS_GIT_LOG_FAILURE_ARM: logFailureArm,
       AIBUILDS_GIT_LOG_FAILURE_OBSERVED: logFailureObserved,
     },
-  });
+  }, children);
   await fs.writeFile(logFailureArm, 'armed');
 
   const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -2171,7 +2423,18 @@ exec "$AIBUILDS_REAL_GIT" "$@"
 test('failed WAL-clear persistence keeps the global barrier armed before path B can commit', async (t) => {
   // Mutation caught: clearing only the in-memory marker before its save lets B bypass durable WAL A.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-durable-clear-barrier-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2247,7 +2510,7 @@ exec "$AIBUILDS_REAL_GIT" "$@"
       AIBUILDS_REPAIR_PATH_B: pathB,
       AIBUILDS_PATH_B_COMMIT_OBSERVED: bCommitObserved,
     },
-  });
+  }, children);
   await fs.writeFile(persistenceArm, 'armed');
 
   const failedA = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -2300,7 +2563,18 @@ exec "$AIBUILDS_REAL_GIT" "$@"
 
 test('WAL integrity hashes the exact non-UTF-8 working-file preimage bytes', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-raw-wal-hash-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2315,7 +2589,7 @@ test('WAL integrity hashes the exact non-UTF-8 working-file preimage bytes', asy
   await execFileAsync('git', ['config', 'user.name', 'Publication Test'], { cwd: worldDir });
   await execFileAsync('git', ['add', '.'], { cwd: worldDir });
   await execFileAsync('git', ['commit', '-m', 'raw byte preimage baseline'], { cwd: worldDir });
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir }, children);
 
   const result = await jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST', headers: await challengeHeaders(server.baseUrl),
@@ -2334,7 +2608,18 @@ test('WAL integrity hashes the exact non-UTF-8 working-file preimage bytes', asy
 
 test('unfinished correction restores its exact pretransaction moderation boundary on restart', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-repair-moderation-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2387,7 +2672,7 @@ exec "$AIBUILDS_REAL_GIT" "$@"
     AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
     AIBUILDS_WAL_SNAPSHOT: walSnapshotPath,
   };
-  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
   await fs.writeFile(armPath, 'armed');
   const failed = await jsonRequest(server.baseUrl, '/api/contribute', {
@@ -2410,7 +2695,7 @@ exec "$AIBUILDS_REAL_GIT" "$@"
   await fs.rm(armPath, { force: true });
   await fs.writeFile(fullPath, safeBytes);
   await fs.writeFile(path.join(dataDir, 'moderation.json'), JSON.stringify(armedState, null, 2));
-  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   assert.equal((await jsonRequest(server.baseUrl, `/api/world/${relativePath}`)).response.status, 404);
   assert.equal(await fs.readFile(fullPath, 'utf8'), riskyBytes);
   const restoredModeration = JSON.parse(
@@ -2423,7 +2708,18 @@ exec "$AIBUILDS_REAL_GIT" "$@"
 
 test('failed repair-preimage persistence cannot discard the exact moderation rollback state', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-preimage-save-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2521,7 +2817,7 @@ test('failed repair-preimage persistence cannot discard the exact moderation rol
       AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
       AIBUILDS_REPAIR_PATH: relativePath,
     },
-  });
+  }, children);
   assert.equal(await fs.readFile(failureObservedPath, 'utf8'), 'failed');
   const unrelatedSave = await jsonRequest(server.baseUrl, '/api/admin/ban', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2551,7 +2847,18 @@ test('failed repair-preimage persistence cannot discard the exact moderation rol
 
 test('restart finalizes a contribution durable before its WAL clear', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-finalize-wal-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2595,7 +2902,7 @@ test('restart finalizes a contribution durable before its WAL clear', async (t) 
     AIBUILDS_MODERATION_TARGET: path.join(dataDir, 'moderation.json'),
     AIBUILDS_REPAIR_PATH: relativePath,
   };
-  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   await fs.writeFile(armPath, 'armed');
   await assert.rejects(jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST', headers: await challengeHeaders(server.baseUrl),
@@ -2614,7 +2921,7 @@ test('restart finalizes a contribution durable before its WAL clear', async (t) 
   assert.equal(armedState.gitRepairs?.[relativePath]?.contributionId, durableRecord.id);
   await fs.rm(armPath, { force: true });
 
-  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   const publicFile = await jsonRequest(server.baseUrl, `/api/world/${relativePath}`);
   assert.equal(publicFile.response.status, 200, server.logs.join(''));
   assert.equal(publicFile.body.content, safeBytes);
@@ -2639,7 +2946,18 @@ test('restart finalizes a contribution durable before its WAL clear', async (t) 
 test('failed contribution restores an unrelated IP evicted at capacity durably', async (t) => {
   // Mutation caught: restoring only the submitter IP cannot reverse recordAgentIp's capacity eviction.
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-ip-rollback-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2684,7 +3002,7 @@ test('failed contribution restores an unrelated IP evicted at capacity durably',
     AIBUILDS_FAILURE_ARM: armPath,
     AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
   };
-  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  let server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   await fs.writeFile(armPath, 'armed');
   const result = await jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST', headers: await challengeHeaders(server.baseUrl),
@@ -2701,7 +3019,7 @@ test('failed contribution restores an unrelated IP evicted at capacity durably',
   await fs.rm(armPath, { force: true });
   await server.crash();
 
-  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   persisted = JSON.parse(await fs.readFile(path.join(dataDir, 'moderation.json'), 'utf8'));
   assert.equal(Object.keys(persisted.agentIps).length, 5000);
   assert.equal(persisted.agentIps.OldestAgent, '198.51.100.1');
@@ -2711,7 +3029,18 @@ test('failed contribution restores an unrelated IP evicted at capacity durably',
 
 test('contribution rollback cannot resurrect an IP removed by a concurrent unban', async (t) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aibuilds-publication-unban-rollback-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Same root-owning hook as above (NEXT_SESSION.md #10): kill every child spawned for this
+  // root, then remove it.
+  const children = [];
+  t.after(async () => {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        await once(child, 'exit');
+      }
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
   const worldDir = path.join(root, 'world');
   const dataDir = path.join(root, 'data');
   const backupDir = path.join(root, 'backups');
@@ -2762,7 +3091,7 @@ test('contribution rollback cannot resurrect an IP removed by a concurrent unban
     AIBUILDS_UNBAN_DELAY_RELEASE: releasePath,
     AIBUILDS_STATE_TARGET: path.join(dataDir, 'state.json'),
   };
-  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv });
+  const server = await startIsolatedServer(t, { worldDir, dataDir, backupDir, extraEnv }, children);
   await fs.writeFile(armPath, 'armed');
   const pendingContribution = jsonRequest(server.baseUrl, '/api/contribute', {
     method: 'POST', headers: await challengeHeaders(server.baseUrl),
