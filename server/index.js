@@ -11,6 +11,7 @@ const { randomUUID } = require('node:crypto');
 const { execFile: execFileCallback, execSync } = require('node:child_process');
 const { promisify } = require('node:util');
 const simpleGit = require('simple-git');
+const { failOnNonZeroExit } = require('./git-errors');
 const moderation = require('./moderation');
 const {
   evaluatePublication,
@@ -138,13 +139,22 @@ function setRobotsHeader(res, publicationMeta) {
 delete process.env.GIT_DIR;
 delete process.env.GIT_WORK_TREE;
 delete process.env.GIT_INDEX_FILE;
+// D4/G4: the remaining Git environment variables a deploy hook or an ambient shell can export.
+// GIT_OBJECT_DIRECTORY/GIT_COMMON_DIR redirect object/ref storage out from under the World repo,
+// GIT_QUARANTINE_PATH forbids ref updates entirely while set (measured: "ref updates forbidden
+// inside quarantine environment"). GIT_ALTERNATE_OBJECT_DIRECTORIES only ADDS lookup stores, so no
+// observable failure can be constructed for it — its delete is defence in depth (R1-F11).
+delete process.env.GIT_OBJECT_DIRECTORY;
+delete process.env.GIT_COMMON_DIR;
+delete process.env.GIT_QUARANTINE_PATH;
+delete process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
 
 const gitBinary = (() => {
   try {
     return execSync('which git', { encoding: 'utf-8' }).trim();
   } catch { return 'git'; }
 })();
-const git = simpleGit(WORLD_DIR, { binary: gitBinary });
+const git = simpleGit(WORLD_DIR, { binary: gitBinary, errors: failOnNonZeroExit });
 const execGitFile = promisify(execFileCallback);
 
 // trust proxy is OFF (D2): req.ip must never parse X-Forwarded-For. Client identity comes from
@@ -2536,6 +2546,10 @@ app.post('/api/admin/moderate', ...adminChain, async (req, res) => {
   const fullPath = resolveWorldPath(WORLD_DIR, relPath);
   const releaseContributionState = await acquireWorldMutation(CONTRIBUTION_STATE_LOCK);
   let releaseMutation;
+  // D1/T3: set only by the delete branch's own commit attempt, after a guard PASS, when the
+  // add/commit itself fails. A guard REFUSAL never sets this — that outcome stays 200/"skipped" as
+  // it always has (R1-F1); only a failed write AFTER a passed guard is now reported honestly.
+  let commitError = null;
   try {
     await repairAllRequiredGitPaths();
     releaseMutation = await acquireWorldMutation(relPath);
@@ -2572,33 +2586,73 @@ app.post('/api/admin/moderate', ...adminChain, async (req, res) => {
       moderation.reject(relPath);
       // Stage ONLY this path (git.add('.') would bundle unrelated concurrent agent writes).
       // `git add <deleted path>` stages the file's removal.
-      try {
-        // Queued like every other index-mutating Git sequence in this file, so no other request can
-        // stage a path between the check and the commit. Holding CONTRIBUTION_STATE_LOCK already
-        // achieves that today because every queueGitOperation caller holds it too, but that is an
-        // invariant stated nowhere; the queue makes the guard's atomicity structural instead of
-        // incidental. One producer stays out of reach at EVERY commit in this file, guarded or
-        // not, and is accepted rather than closed: a pre-commit hook that stages paths itself runs
-        // INSIDE `git commit`, after this check has read the index. Measured: it reaches the
-        // `commit --only` siblings just as well, because git points the hook at the temporary index
-        // a partial commit builds — so the guard is not what leaves this open. The World repo ships
-        // no hooks, installing one is an operator action, and --no-verify would buy this at the
-        // price of every hook that vetoes a bad commit.
-        // The check runs BEFORE the add, so a refusal leaves nothing of ours behind: a guard that
-        // stages its own deletion and only then aborts would make every later pathspec-less commit
-        // refuse too. The unlink above is not undone either way — that is this branch's existing
-        // best-effort semantics, which a failing hook produces just the same.
-        await queueGitOperation(async () => {
+      //
+      // Queued like every other index-mutating Git sequence in this file, so no other request can
+      // stage a path between the check and the commit. Holding CONTRIBUTION_STATE_LOCK already
+      // achieves that today because every queueGitOperation caller holds it too, but that is an
+      // invariant stated nowhere; the queue makes the guard's atomicity structural instead of
+      // incidental. One producer stays out of reach at EVERY commit in this file, guarded or
+      // not, and is accepted rather than closed: a pre-commit hook that stages paths itself runs
+      // INSIDE `git commit`, after this check has read the index. Measured: it reaches the
+      // `commit --only` siblings just as well, because git points the hook at the temporary index
+      // a partial commit builds — so the guard is not what leaves this open. The World repo ships
+      // no hooks, installing one is an operator action, and --no-verify would buy this at the
+      // price of every hook that vetoes a bad commit.
+      // The check runs BEFORE the add, so a refusal leaves nothing of ours behind: a guard that
+      // stages its own deletion and only then aborts would make every later pathspec-less commit
+      // refuse too. The unlink above is not undone either way — that is this branch's existing
+      // best-effort semantics, which a failing hook produces just the same.
+      //
+      // T3: three outcomes, strictly separated. (1) untracked -> no Git operation at all, 200,
+      // logged. (2) guard refusal -> nothing staged, 200, logged exactly as before this change (the
+      // eight confinement tests assert this literally). (3) guard passed but add/commit fails ->
+      // reset the staged deletion, log, and record commitError for an honest 500 below - the ONLY
+      // new externally visible outcome this task adds (D1).
+      const pathspec = literalGitPathspec(relPath);
+      await queueGitOperation(async () => {
+        let tracked = true;
+        try { await git.raw(['ls-files', '--error-unmatch', '--', pathspec]); }
+        catch (e) {
+          tracked = false;
+          // R2-F5/R3-F1: a failing tracked-check must not be silent, and its own cause belongs in
+          // the log, not just the fact that something was skipped.
+          console.warn(`Moderation removal commit skipped: ${relPath} is not tracked (${e.message})`);
+        }
+        if (!tracked) return;
+        try {
           await assertIndexConfinedTo(relPath, 'Moderation removal commit');
-          await git.add(['--', literalGitPathspec(relPath)]);
-          await git.commit(`moderation: remove ${relPath}`);
-        });
-      } catch (e) { console.warn(`Moderation removal commit skipped: ${e.message}`); }
+        } catch (e) {
+          console.warn(`Moderation removal commit skipped: ${e.message}`);
+          return;
+        }
+        try {
+          await git.add(['--', pathspec]);
+          // An own path that was only ever staged as an addition is back to HEAD after the add, and
+          // `git commit` would exit 1 with "nothing to commit" - a deletion that fully succeeded
+          // must not be reported as git_commit_failed.
+          const staged = await git.raw(['diff', '--cached', '--name-only', '--', pathspec]);
+          if (staged.trim()) await git.commit(`moderation: remove ${relPath}`);
+        } catch (e) {
+          try { await git.raw(['reset', '--', pathspec]); } catch { /* retain original error */ }
+          console.error(`Moderation removal commit failed: ${e.message}`);
+          commitError = e;
+        }
+      });
       await saveState(); // delete also mutated history/contributions, which live in state.json
     }
 
     await moderation.save();
     broadcast({ type: 'moderation', data: { action, target: relPath } });
+    if (commitError) {
+      // D1: the file was removed and every other piece of state already saved above - only the Git
+      // commit itself failed. Reporting that honestly is the whole point of this task; it must not
+      // be reached for a guard refusal, which stays 200 via the early `return` above.
+      return res.status(500).json({
+        error: 'Moderation removal commit failed',
+        code: 'git_commit_failed',
+        detail: 'The file was removed and the state saved; the Git commit failed.',
+      });
+    }
     res.json({ success: true, action, target: relPath, hidden: moderation.listHidden() });
   } catch (error) {
     console.error('Legacy moderation error:', error.message);

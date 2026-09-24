@@ -302,7 +302,9 @@ test('a moderation delete never bundles a foreign staged deletion into its commi
   const moderated = await adminPost(world.baseUrl, '/api/admin/moderate',
     { secret: 'operator-secret', action: 'delete', target: doomed });
   // The endpoint keeps its best-effort semantics; whether it should answer 500 instead is a
-  // product decision and deliberately not changed here.
+  // product decision and deliberately not changed here. A commit failure AFTER a passed guard is a
+  // different case and now DOES answer 500 (git-error-detection T3, test/git-error-detection.test.js);
+  // a guard refusal, this test's case, stays 200.
   assert.equal(moderated.response.status, 200, world.logs.join(''));
   assert.equal(await world.headSubject(), subjectBefore, 'no moderation commit may be created');
   assert.equal(await world.inHeadTree(VICTIM), true);

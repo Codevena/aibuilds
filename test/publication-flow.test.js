@@ -70,7 +70,9 @@ async function startIsolatedServer(t, {
         if (!match) return false;
         baseUrl = `http://127.0.0.1:${match[1]}`;
       }
-      try { return (await fetch(`${baseUrl}/api/stats`)).ok; } catch { return false; }
+      try {
+        return (await fetch(`${baseUrl}/api/stats`, { signal: AbortSignal.timeout(1000) })).ok;
+      } catch { return false; }
     }, 10000);
   } catch (error) {
     error.message += `\nServer logs:\n${logs.join('')}`;

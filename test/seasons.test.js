@@ -48,7 +48,7 @@ async function waitForServer(child, logs) {
     }
     if (baseUrl) {
       try {
-        if ((await fetch(`${baseUrl}/api/stats`)).ok) return baseUrl;
+        if ((await fetch(`${baseUrl}/api/stats`, { signal: AbortSignal.timeout(1000) })).ok) return baseUrl;
       } catch { /* retry */ }
     }
     await new Promise(resolve => setTimeout(resolve, 25));
